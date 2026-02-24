@@ -16,6 +16,8 @@ from enum import Enum
 from pathlib import Path
 from typing import Annotated
 
+from alive_progress import alive_bar
+
 import click.core
 import pysam
 import torch
@@ -647,16 +649,24 @@ def load_genomes(
     genomes: dict[str, list] = {}
     raw_abundances: dict[str, float] = {}
 
+    # Pre-scan to count rows for progress bar
     with open(csv_path) as fh:
-        reader = csv.DictReader(fh)
-        for row in reader:
+        rows = list(csv.DictReader(fh))
+    logger.debug("Found %d entries in %s", len(rows), csv_path)
+
+    with alive_bar(
+        len(rows), title="Loading genomes", disable=not rows,
+    ) as bar:
+        for row in rows:
             genome_id = row["genome_id"]
             fasta_path = Path(row["fasta_path"])
             abundance = float(row["abundance"])
 
+            logger.debug("Parsing FASTA %s for genome %s", fasta_path, genome_id)
             records = list(SeqIO.parse(fasta_path, "fasta"))
             if not records:
                 logger.warning("No sequences found in %s", fasta_path)
+                bar()
                 continue
 
             genomes[genome_id] = records
@@ -667,6 +677,14 @@ def load_genomes(
                 len(records),
                 fasta_path,
             )
+            for rec in records:
+                logger.debug(
+                    "  contig %s: %d bp, GC=%.1f%%",
+                    rec.id,
+                    len(rec.seq),
+                    _gc_fraction(str(rec.seq)) * 100,
+                )
+            bar()
 
     # Normalise abundances
     total = sum(raw_abundances.values())
@@ -783,85 +801,118 @@ def sample_fragments(
             total_count=dist_params["total_count"],
             probs=dist_params["probs"],
         )
+        logger.debug(
+            "Fragment length distribution: NegativeBinomial"
+            "(r=%.2f, p=%.4f)",
+            dist_params["total_count"], dist_params["probs"],
+        )
     else:
         frag_dist = Poisson(rate=dist_params["rate"])
+        logger.debug(
+            "Fragment length distribution: Poisson(rate=%.2f)",
+            dist_params["rate"],
+        )
+
+    for gid in genome_ids:
+        logger.debug(
+            "  %s: target %d fragments (abundance=%.4f)",
+            gid, counts[genome_ids.index(gid)].item(), abundances[gid],
+        )
 
     fragments: list[Fragment] = []
 
-    for genome_idx, genome_id in enumerate(genome_ids):
-        n_frags = counts[genome_idx].item()
-        if n_frags == 0:
-            continue
-
-        records = genomes[genome_id]
-        contig_lengths = torch.tensor(
-            [len(r.seq) for r in records], dtype=torch.float64
-        )
-        contig_weights = contig_lengths / contig_lengths.sum()
-
-        accepted = 0
-        max_attempts = n_frags * 20  # safety limit to avoid infinite loops
-        attempts = 0
-
-        while accepted < n_frags and attempts < max_attempts:
-            attempts += 1
-
-            # Pick random contig weighted by length
-            contig_idx = torch.multinomial(
-                contig_weights, 1, generator=rng
-            ).item()
-            record = records[contig_idx]
-            contig_len = len(record.seq)
-
-            # Sample fragment length
-            frag_len = int(frag_dist.sample().clamp(min=1).item())
-            if frag_len > contig_len:
+    with alive_bar(
+        num_fragments, title="Sampling fragments",
+    ) as bar:
+        for genome_idx, genome_id in enumerate(genome_ids):
+            n_frags = counts[genome_idx].item()
+            if n_frags == 0:
                 continue
 
-            # Pick random start position
-            max_start = contig_len - frag_len
-            start = torch.randint(
-                0, max_start + 1, (1,), generator=rng
-            ).item()
-            end = start + frag_len
+            records = genomes[genome_id]
+            contig_lengths = torch.tensor(
+                [len(r.seq) for r in records], dtype=torch.float64
+            )
+            contig_weights = contig_lengths / contig_lengths.sum()
 
-            # Pick random strand
-            strand = "+" if torch.rand(1, generator=rng).item() < 0.5 else "-"
+            accepted = 0
+            rejected = 0
+            max_attempts = n_frags * 20
+            attempts = 0
 
-            # Extract sequence
-            seq_str = str(record.seq[start:end])
-            if strand == "-":
-                seq_str = _reverse_complement(seq_str)
+            while accepted < n_frags and attempts < max_attempts:
+                attempts += 1
 
-            # GC bias accept/reject
-            if gc_bias_strength > 0:
-                gc = _gc_fraction(seq_str)
-                p_keep = math.exp(
-                    -gc_bias_strength * (gc - 0.5) ** 2
-                )
-                if torch.rand(1, generator=rng).item() > p_keep:
+                # Pick random contig weighted by length
+                contig_idx = torch.multinomial(
+                    contig_weights, 1, generator=rng
+                ).item()
+                record = records[contig_idx]
+                contig_len = len(record.seq)
+
+                # Sample fragment length
+                frag_len = int(frag_dist.sample().clamp(min=1).item())
+                if frag_len > contig_len:
+                    rejected += 1
                     continue
 
-            fragments.append(
-                Fragment(
-                    genome_id=genome_id,
-                    contig_id=record.id,
-                    start=start,
-                    end=end,
-                    strand=strand,
-                    sequence=seq_str,
-                )
-            )
-            accepted += 1
+                # Pick random start position
+                max_start = contig_len - frag_len
+                start = torch.randint(
+                    0, max_start + 1, (1,), generator=rng
+                ).item()
+                end = start + frag_len
 
-        if accepted < n_frags:
-            logger.warning(
-                "Only generated %d/%d fragments for %s "
-                "(GC bias may be too strong or contigs too short)",
-                accepted,
-                n_frags,
-                genome_id,
+                # Pick random strand
+                strand = (
+                    "+"
+                    if torch.rand(1, generator=rng).item() < 0.5
+                    else "-"
+                )
+
+                # Extract sequence
+                seq_str = str(record.seq[start:end])
+                if strand == "-":
+                    seq_str = _reverse_complement(seq_str)
+
+                # GC bias accept/reject
+                if gc_bias_strength > 0:
+                    gc = _gc_fraction(seq_str)
+                    p_keep = math.exp(
+                        -gc_bias_strength * (gc - 0.5) ** 2
+                    )
+                    if torch.rand(1, generator=rng).item() > p_keep:
+                        rejected += 1
+                        continue
+
+                fragments.append(
+                    Fragment(
+                        genome_id=genome_id,
+                        contig_id=record.id,
+                        start=start,
+                        end=end,
+                        strand=strand,
+                        sequence=seq_str,
+                    )
+                )
+                accepted += 1
+                bar()
+
+            logger.debug(
+                "  %s: accepted %d/%d fragments (%d rejected, "
+                "%d attempts)",
+                genome_id, accepted, n_frags, rejected, attempts,
             )
+
+            if accepted < n_frags:
+                logger.warning(
+                    "Only generated %d/%d fragments for %s "
+                    "(GC bias may be too strong or contigs too "
+                    "short)",
+                    accepted,
+                    n_frags,
+                    genome_id,
+                )
 
     return fragments
 
@@ -920,22 +971,31 @@ def amplicon_fragments(
 
     # Build fragment list
     fragments: list[Fragment] = []
-    for i, (genome_id, record) in enumerate(amplicons):
-        n = counts[i].item()
-        if n == 0:
-            continue
-        seq_str = str(record.seq)
-        for _ in range(n):
-            fragments.append(
-                Fragment(
-                    genome_id=genome_id,
-                    contig_id=record.id,
-                    start=0,
-                    end=len(record.seq),
-                    strand="+",
-                    sequence=seq_str,
-                )
+    logger.debug("Amplicon allocation:")
+    with alive_bar(
+        num_fragments, title="Building amplicon fragments",
+    ) as bar:
+        for i, (genome_id, record) in enumerate(amplicons):
+            n = counts[i].item()
+            if n == 0:
+                continue
+            logger.debug(
+                "  %s:%s (%d bp) -> %d copies",
+                genome_id, record.id, len(record.seq), n,
             )
+            seq_str = str(record.seq)
+            for _ in range(n):
+                fragments.append(
+                    Fragment(
+                        genome_id=genome_id,
+                        contig_id=record.id,
+                        start=0,
+                        end=len(record.seq),
+                        strand="+",
+                        sequence=seq_str,
+                    )
+                )
+                bar()
 
     # Shuffle so reads aren't grouped by amplicon
     n = len(fragments)
@@ -979,54 +1039,69 @@ def generate_reads(
         read_length_mean, read_length_variance
     )
     read_len_dist = LogNormal(loc=mu_ln, scale=sigma_ln)
+    logger.debug(
+        "Read length distribution: LogNormal(mu=%.4f, sigma=%.4f)",
+        mu_ln, sigma_ln,
+    )
 
+    mode = "paired-end" if paired_end else "single-end"
     se_reads: list[Read] = []
     pe_reads: list[tuple[Read, Read]] = []
 
-    for i, frag in enumerate(fragments):
-        frag_len = len(frag.sequence)
-        sampled_len = int(read_len_dist.sample().clamp(min=1).item())
-        read_len = min(sampled_len, frag_len)
-
-        base_name = (
-            f"{frag.genome_id}:{frag.contig_id}:"
-            f"{frag.start}-{frag.end}:{frag.strand}"
-        )
-
-        if paired_end:
-            r1_len = min(read_len, frag_len)
-            r2_len = min(read_len, frag_len)
-
-            r1_seq = frag.sequence[:r1_len]
-            r2_seq = _reverse_complement(frag.sequence[-r2_len:])
-
-            r1_qual = "I" * len(r1_seq)  # Q40 in Phred+33
-            r2_qual = "I" * len(r2_seq)
-
-            r1 = Read(
-                name=f"{base_name}/1 read_{i}",
-                sequence=r1_seq,
-                quality=r1_qual,
+    with alive_bar(
+        len(fragments), title=f"Generating {mode} reads",
+    ) as bar:
+        for i, frag in enumerate(fragments):
+            frag_len = len(frag.sequence)
+            sampled_len = int(
+                read_len_dist.sample().clamp(min=1).item()
             )
-            r2 = Read(
-                name=f"{base_name}/2 read_{i}",
-                sequence=r2_seq,
-                quality=r2_qual,
+            read_len = min(sampled_len, frag_len)
+
+            base_name = (
+                f"{frag.genome_id}:{frag.contig_id}:"
+                f"{frag.start}-{frag.end}:{frag.strand}"
             )
-            pe_reads.append((r1, r2))
-        else:
-            seq = frag.sequence[:read_len]
-            qual = "I" * len(seq)  # Q40 in Phred+33
-            se_reads.append(
-                Read(
-                    name=f"{base_name} read_{i}",
-                    sequence=seq,
-                    quality=qual,
+
+            if paired_end:
+                r1_len = min(read_len, frag_len)
+                r2_len = min(read_len, frag_len)
+
+                r1_seq = frag.sequence[:r1_len]
+                r2_seq = _reverse_complement(
+                    frag.sequence[-r2_len:]
                 )
-            )
+
+                r1_qual = "I" * len(r1_seq)  # Q40 Phred+33
+                r2_qual = "I" * len(r2_seq)
+
+                r1 = Read(
+                    name=f"{base_name}/1 read_{i}",
+                    sequence=r1_seq,
+                    quality=r1_qual,
+                )
+                r2 = Read(
+                    name=f"{base_name}/2 read_{i}",
+                    sequence=r2_seq,
+                    quality=r2_qual,
+                )
+                pe_reads.append((r1, r2))
+            else:
+                seq = frag.sequence[:read_len]
+                qual = "I" * len(seq)  # Q40 Phred+33
+                se_reads.append(
+                    Read(
+                        name=f"{base_name} read_{i}",
+                        sequence=seq,
+                        quality=qual,
+                    )
+                )
+            bar()
 
     if paired_end:
+        logger.debug("Generated %d read pairs", len(pe_reads))
         return ReadBatch(paired=pe_reads)
+    logger.debug("Generated %d single-end reads", len(se_reads))
     return ReadBatch(single=se_reads)
 
 
@@ -1058,6 +1133,7 @@ def apply_error_model(
 
     """
     if profile is None:
+        logger.debug("No error model; skipping error application")
         return read_batch
 
     logger.info("Applying %s error model...", profile.name)
@@ -1075,22 +1151,47 @@ def apply_error_model(
         flat_reads = list(read_batch.single)
 
     read_lengths = [len(r.sequence) for r in flat_reads]
+    logger.debug(
+        "Sampling HMM quality scores for %d reads "
+        "(max length %d)...",
+        len(read_lengths),
+        max(read_lengths) if read_lengths else 0,
+    )
     all_q_scores = batch_sample_quality_scores(
         profile, read_lengths
     )
+    logger.debug("Quality score sampling complete")
 
     # Apply errors using the pre-sampled quality scores
     modified: list[Read] = []
-    for read, q_scores in zip(flat_reads, all_q_scores):
-        new_seq, new_qual, cigar = apply_errors_to_sequence(
-            read.sequence, q_scores, profile, rng, calibration
+    n_errors_total = 0
+    n_bases_total = 0
+    with alive_bar(
+        len(flat_reads), title="Applying errors",
+    ) as bar:
+        for read, q_scores in zip(flat_reads, all_q_scores):
+            new_seq, new_qual, cigar = apply_errors_to_sequence(
+                read.sequence, q_scores, profile, rng, calibration
+            )
+            n_bases_total += len(read.sequence)
+            n_errors_total += sum(
+                length for op, length in cigar if op != 0
+            )
+            modified.append(Read(
+                name=read.name,
+                sequence=new_seq,
+                quality=new_qual,
+                cigar=cigar,
+            ))
+            bar()
+
+    if n_bases_total > 0:
+        logger.debug(
+            "Error model summary: %d/%d bases affected (%.2f%%)",
+            n_errors_total,
+            n_bases_total,
+            n_errors_total / n_bases_total * 100,
         )
-        modified.append(Read(
-            name=read.name,
-            sequence=new_seq,
-            quality=new_qual,
-            cigar=cigar,
-        ))
 
     # Re-pack into ReadBatch
     if read_batch.is_paired:
@@ -1113,12 +1214,18 @@ def write_fastq(reads: list[Read], output_path: Path) -> None:
         Output FASTQ file path.
 
     """
+    logger.debug("Writing %d reads to %s", len(reads), output_path)
     with open(output_path, "w") as fh:
-        for read in reads:
-            fh.write(f"@{read.name}\n")
-            fh.write(f"{read.sequence}\n")
-            fh.write("+\n")
-            fh.write(f"{read.quality}\n")
+        with alive_bar(
+            len(reads),
+            title=f"Writing {output_path.name}",
+        ) as bar:
+            for read in reads:
+                fh.write(f"@{read.name}\n")
+                fh.write(f"{read.sequence}\n")
+                fh.write("+\n")
+                fh.write(f"{read.quality}\n")
+                bar()
 
     logger.info("Wrote %d reads to %s", len(reads), output_path)
 
@@ -1165,92 +1272,97 @@ def write_bam(
             for name, length in zip(ref_names, ref_lengths)
         ],
     })
+    logger.debug(
+        "BAM header: %d reference sequences", len(ref_names),
+    )
 
     with pysam.AlignmentFile(output_path, "wb", header=header) as bam:
-        for i, frag in enumerate(fragments):
-            ref_name = f"{frag.genome_id}:{frag.contig_id}"
-            ref_id = ref_name_to_idx[ref_name]
+        with alive_bar(
+            len(fragments), title="Writing BAM",
+        ) as bar:
+            for i, frag in enumerate(fragments):
+                ref_name = f"{frag.genome_id}:{frag.contig_id}"
+                ref_id = ref_name_to_idx[ref_name]
 
-            if read_batch.is_paired:
-                assert read_batch.paired is not None
-                r1, r2 = read_batch.paired[i]
-                # Strip /1, /2 suffixes — BAM uses FLAG bits
-                qname = r1.name.split("/")[0]
+                if read_batch.is_paired:
+                    assert read_batch.paired is not None
+                    r1, r2 = read_batch.paired[i]
+                    qname = r1.name.split("/")[0]
 
-                r1_is_reverse = frag.strand == "-"
-                r2_is_reverse = not r1_is_reverse
+                    r1_is_reverse = frag.strand == "-"
+                    r2_is_reverse = not r1_is_reverse
 
-                # R1
-                a1 = pysam.AlignedSegment(header)
-                a1.query_name = qname
-                a1.query_sequence = r1.sequence
-                a1.flag = 0
-                a1.is_paired = True
-                a1.is_proper_pair = True
-                a1.is_read1 = True
-                a1.is_reverse = r1_is_reverse
-                a1.mate_is_reverse = r2_is_reverse
-                a1.reference_id = ref_id
-                a1.reference_start = frag.start
-                a1.cigar = (
-                    r1.cigar if r1.cigar is not None
-                    else [(0, len(r1.sequence))]
-                )
-                a1.mapping_quality = 255
-                a1.query_qualities = pysam.qualitystring_to_array(
-                    r1.quality
-                )
-                a1.next_reference_id = ref_id
-                # R2 aligns at end of fragment minus its length
-                r2_start = frag.end - len(r2.sequence)
-                a1.next_reference_start = r2_start
-                a1.template_length = frag.end - frag.start
+                    # R1
+                    a1 = pysam.AlignedSegment(header)
+                    a1.query_name = qname
+                    a1.query_sequence = r1.sequence
+                    a1.flag = 0
+                    a1.is_paired = True
+                    a1.is_proper_pair = True
+                    a1.is_read1 = True
+                    a1.is_reverse = r1_is_reverse
+                    a1.mate_is_reverse = r2_is_reverse
+                    a1.reference_id = ref_id
+                    a1.reference_start = frag.start
+                    a1.cigar = (
+                        r1.cigar if r1.cigar is not None
+                        else [(0, len(r1.sequence))]
+                    )
+                    a1.mapping_quality = 255
+                    a1.query_qualities = (
+                        pysam.qualitystring_to_array(r1.quality)
+                    )
+                    a1.next_reference_id = ref_id
+                    r2_start = frag.end - len(r2.sequence)
+                    a1.next_reference_start = r2_start
+                    a1.template_length = frag.end - frag.start
 
-                # R2
-                a2 = pysam.AlignedSegment(header)
-                a2.query_name = qname
-                a2.query_sequence = r2.sequence
-                a2.flag = 0
-                a2.is_paired = True
-                a2.is_proper_pair = True
-                a2.is_read2 = True
-                a2.is_reverse = r2_is_reverse
-                a2.mate_is_reverse = r1_is_reverse
-                a2.reference_id = ref_id
-                a2.reference_start = r2_start
-                a2.cigar = (
-                    r2.cigar if r2.cigar is not None
-                    else [(0, len(r2.sequence))]
-                )
-                a2.mapping_quality = 255
-                a2.query_qualities = pysam.qualitystring_to_array(
-                    r2.quality
-                )
-                a2.next_reference_id = ref_id
-                a2.next_reference_start = frag.start
-                a2.template_length = -(frag.end - frag.start)
+                    # R2
+                    a2 = pysam.AlignedSegment(header)
+                    a2.query_name = qname
+                    a2.query_sequence = r2.sequence
+                    a2.flag = 0
+                    a2.is_paired = True
+                    a2.is_proper_pair = True
+                    a2.is_read2 = True
+                    a2.is_reverse = r2_is_reverse
+                    a2.mate_is_reverse = r1_is_reverse
+                    a2.reference_id = ref_id
+                    a2.reference_start = r2_start
+                    a2.cigar = (
+                        r2.cigar if r2.cigar is not None
+                        else [(0, len(r2.sequence))]
+                    )
+                    a2.mapping_quality = 255
+                    a2.query_qualities = (
+                        pysam.qualitystring_to_array(r2.quality)
+                    )
+                    a2.next_reference_id = ref_id
+                    a2.next_reference_start = frag.start
+                    a2.template_length = -(frag.end - frag.start)
 
-                bam.write(a1)
-                bam.write(a2)
-            else:
-                assert read_batch.single is not None
-                read = read_batch.single[i]
-                a = pysam.AlignedSegment(header)
-                a.query_name = read.name
-                a.query_sequence = read.sequence
-                a.flag = 0
-                a.is_reverse = frag.strand == "-"
-                a.reference_id = ref_id
-                a.reference_start = frag.start
-                a.cigar = (
-                    read.cigar if read.cigar is not None
-                    else [(0, len(read.sequence))]
-                )
-                a.mapping_quality = 255
-                a.query_qualities = pysam.qualitystring_to_array(
-                    read.quality
-                )
-                bam.write(a)
+                    bam.write(a1)
+                    bam.write(a2)
+                else:
+                    assert read_batch.single is not None
+                    read = read_batch.single[i]
+                    a = pysam.AlignedSegment(header)
+                    a.query_name = read.name
+                    a.query_sequence = read.sequence
+                    a.flag = 0
+                    a.is_reverse = frag.strand == "-"
+                    a.reference_id = ref_id
+                    a.reference_start = frag.start
+                    a.cigar = (
+                        read.cigar if read.cigar is not None
+                        else [(0, len(read.sequence))]
+                    )
+                    a.mapping_quality = 255
+                    a.query_qualities = (
+                        pysam.qualitystring_to_array(read.quality)
+                    )
+                    bam.write(a)
+                bar()
 
     logger.info("Wrote ground-truth BAM to %s", output_path)
 
@@ -1261,6 +1373,10 @@ def main(
     config: Annotated[Path | None, typer.Option(
         help="YAML config file (CLI options override config values)",
     )] = None,
+    verbose: Annotated[bool, typer.Option(
+        "--verbose/--no-verbose",
+        help="Enable verbose (DEBUG) logging",
+    )] = False,
     input_csv: Annotated[Path | None, typer.Option(
         help="CSV with columns: genome_id, fasta_path, abundance",
     )] = None,
@@ -1366,9 +1482,26 @@ def main(
         raise typer.BadParameter("--output-prefix is required (via CLI or config)")
 
     logging.basicConfig(
-        level=logging.INFO,
+        level=logging.DEBUG if verbose else logging.INFO,
         format="%(asctime)s %(levelname)s %(message)s",
     )
+    logger.debug("Verbose logging enabled")
+
+    # Log resolved parameters
+    logger.debug("Parameters:")
+    logger.debug("  input_csv       = %s", input_csv)
+    logger.debug("  num_reads       = %d", num_reads)
+    logger.debug("  output_prefix   = %s", output_prefix)
+    logger.debug("  fragment_mean   = %.1f", fragment_mean)
+    logger.debug("  fragment_var    = %.1f", fragment_variance)
+    logger.debug("  read_len_mean   = %.1f", read_length_mean)
+    logger.debug("  read_len_var    = %.1f", read_length_variance)
+    logger.debug("  gc_bias         = %.2f", gc_bias_strength)
+    logger.debug("  paired_end      = %s", paired_end)
+    logger.debug("  amplicon        = %s", amplicon)
+    logger.debug("  error_model     = %s", error_model.value)
+    logger.debug("  quality_cal     = %s", quality_calibration_model.value)
+    logger.debug("  seed            = %s", seed)
 
     # Set up RNG
     rng = torch.Generator()
@@ -1388,6 +1521,14 @@ def main(
     }
     error_model_str = error_model.value
     profile = profile_map[error_model_str]() if error_model_str != "none" else None
+    if profile is not None:
+        logger.debug(
+            "Error profile: %d HMM states, sub=%.0f%% ins=%.0f%% del=%.0f%%",
+            profile.num_states,
+            profile.substitution_ratio * 100,
+            profile.insertion_ratio * 100,
+            profile.deletion_ratio * 100,
+        )
 
     # Build quality calibration model
     calibration = build_quality_calibration(
@@ -1405,6 +1546,12 @@ def main(
     # Load genomes
     genomes, abundances = load_genomes(input_csv)
     logger.info("Loaded %d genomes", len(genomes))
+    for gid, abd in abundances.items():
+        total_bp = sum(len(r.seq) for r in genomes[gid])
+        logger.debug(
+            "  %s: abundance=%.4f, %d contigs, %d bp total",
+            gid, abd, len(genomes[gid]), total_bp,
+        )
 
     # For paired-end, each pair counts as 2 reads towards num_reads,
     # so we need num_reads // 2 fragments for PE, num_reads for SE
