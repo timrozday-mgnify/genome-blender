@@ -4,7 +4,17 @@
       "WebSearch",
       "Bash(tail:*)",
       "Bash(python:*)",
-      "Bash(samtools quickcheck:*)"
+      "Bash(samtools quickcheck:*)",
+      "WebFetch(domain:github.com)",
+      "WebFetch(domain:raw.githubusercontent.com)",
+      "WebFetch(domain:pyro.ai)",
+      "WebFetch(domain:docs.pyro.ai)",
+      "WebFetch(domain:fehiepsi.github.io)",
+      "Bash(python3:*)",
+      "Bash(grep:*)",
+      "Bash(head:*)",
+      "Bash(pip3 show:*)",
+      "Bash(conda run:*)"
     ]
   }
 }

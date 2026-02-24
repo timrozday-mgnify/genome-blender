@@ -4,7 +4,7 @@ A toolkit for generating synthetic whole genome sequencing (WGS) data from refer
 
 ## Project overview
 
-genome-blender takes reference genome(s) as input and produces realistic simulated sequencing data (FASTQ). The pipeline has several stages:
+genome-blender takes reference genome(s) as input and produces realistic simulated sequencing data (FASTQ) alongside a ground-truth BAM recording the true genomic origin of each read. The pipeline has several stages:
 
 1. **Genome modification** -- optionally apply biological variation to input genomes (mutations, rearrangements, HGT)
 2. **Fragment generation** -- shear genomes into DNA fragments with configurable size distributions and optional GC bias
@@ -65,7 +65,13 @@ These terms appear throughout the codebase. Use them consistently.
 
 - Input genomes: FASTA (.fa, .fasta, .fna), optionally gzipped
 - Output reads: FASTQ (.fq, .fastq), optionally gzipped
-- Ground truth: BED or custom TSV for variant locations; SAM/BAM for read alignments to the original reference
+- Ground-truth BAM: `{output_prefix}.bam` produced alongside FASTQ by `generate_reads.py`; records each read's true alignment to its source fragment
+  - Reference names use `{genome_id}:{contig_id}` format
+  - CIGAR reflects the error model: all-match (`M`) when no error model is applied; mix of `M`/`I`/`D` ops when errors are introduced
+  - MAPQ 255 (ground truth)
+  - Paired-end reads have proper FLAG bits (`is_paired`, `is_proper_pair`, `is_read1`/`is_read2`), mate positions, and template length
+  - Written unsorted; user can `samtools sort` if needed
+- Ground truth (variants): BED or custom TSV for variant locations (not yet implemented)
 - Input CSV table for `generate_reads.py`: columns `genome_id,fasta_path,abundance` -- abundances are relative and will be normalised to sum to 1
 
 ## Performance considerations

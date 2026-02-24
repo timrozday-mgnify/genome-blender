@@ -37,23 +37,54 @@ Generate sequencing reads from fragments:
 
 ### Sequencing error models
 
-Apply platform-appropriate error profiles:
+HMM-based error models produce correlated quality score patterns along reads (inspired by pbsim2). Errors (substitutions, insertions, deletions) are then sampled from those quality scores. Built-in profiles:
 
-- Position-dependent substitution errors for short reads
-- Indel-dominated error profiles for long reads
-- Realistic quality scores in Phred+33 encoding
+- **Illumina** -- high quality (Q30--Q37), predominantly substitution errors (~80%)
+- **PacBio** -- moderate quality (Q10--Q20), indel-dominated errors (~85%)
+- **Oxford Nanopore** -- lower quality (Q7--Q15), indel-dominated errors (~80%)
+
+Select a profile with `--error-model illumina|pacbio|nanopore` or omit for no errors.
 
 ### Output
 
 - FASTQ files with quality scores reflecting the applied error model
-- Ground-truth files recording the true origin of each read and all introduced variants
+- Ground-truth BAM recording the true genomic origin of each read with accurate CIGAR strings
+
+## Usage
+
+Prepare an input CSV with columns `genome_id`, `fasta_path`, `abundance`:
+
+```csv
+genome_id,fasta_path,abundance
+ecoli,/path/to/ecoli.fasta,0.7
+staph,/path/to/staph.fasta,0.3
+```
+
+Generate reads:
+
+```bash
+# Single-end, no error model
+python generate_reads.py --input-csv genomes.csv --num-reads 1000 --output-prefix out --seed 42
+
+# Paired-end with Illumina error model
+python generate_reads.py --input-csv genomes.csv --num-reads 1000 --output-prefix out \
+    --paired-end --error-model illumina --seed 42
+
+# Long reads with Nanopore error model
+python generate_reads.py --input-csv genomes.csv --num-reads 500 --output-prefix out \
+    --read-length-mean 5000 --read-length-variance 4000000 \
+    --fragment-mean 8000 --fragment-variance 4000000 \
+    --error-model nanopore --seed 42
+```
 
 ## Requirements
 
 - Python 3.10+
-- numpy
+- PyTorch
+- Pyro-PPL
 - pysam
 - Biopython
+- Click
 
 ## License
 

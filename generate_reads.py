@@ -19,7 +19,9 @@ import pysam
 import torch
 from Bio import SeqIO
 from Bio.Seq import Seq
+from pyro.distributions import Categorical as PyroCategorical
 from pyro.distributions import LogNormal, NegativeBinomial, Poisson
+from pyro.distributions.hmm import DiscreteHMM
 
 logger = logging.getLogger(__name__)
 
@@ -43,6 +45,317 @@ class Read:
     name: str
     sequence: str
     quality: str
+    cigar: list[tuple[int, int]] | None = None  # pysam-style CIGAR tuples
+
+
+@dataclass
+class ErrorModelProfile:
+    """HMM-based sequencing error model parameters."""
+
+    name: str
+    num_states: int
+    initial_logits: torch.Tensor  # (num_states,)
+    transition_logits: torch.Tensor  # (num_states, num_states)
+    emission_logits: torch.Tensor  # (num_states, num_quality_values)
+    substitution_ratio: float  # fraction of errors that are substitutions
+    insertion_ratio: float  # fraction of errors that are insertions
+    deletion_ratio: float  # fraction of errors that are deletions
+
+
+def _build_emission_logits(
+    num_states: int,
+    quality_peaks: list[float],
+    quality_spreads: list[float],
+    num_quality_values: int = 94,
+) -> torch.Tensor:
+    """Build emission logits for HMM states.
+
+    Each state emits quality scores centred around a peak value with
+    a Gaussian-shaped distribution over the quality range.
+
+    Parameters
+    ----------
+    num_states : int
+    quality_peaks : list of float
+        Centre quality value for each state.
+    quality_spreads : list of float
+        Standard deviation of emission distribution for each state.
+    num_quality_values : int
+        Number of possible quality values (0 to num_quality_values-1).
+
+    Returns
+    -------
+    torch.Tensor of shape (num_states, num_quality_values)
+
+    """
+    q_values = torch.arange(num_quality_values, dtype=torch.float64)
+    logits = torch.zeros(num_states, num_quality_values, dtype=torch.float64)
+    for s in range(num_states):
+        logits[s] = -0.5 * ((q_values - quality_peaks[s]) / quality_spreads[s]) ** 2
+    return logits
+
+
+def _build_sticky_transitions(
+    num_states: int,
+    self_logit: float = 3.0,
+    neighbour_logit: float = 0.5,
+) -> torch.Tensor:
+    """Build transition logits favouring self-transitions and nearby states.
+
+    Parameters
+    ----------
+    num_states : int
+    self_logit : float
+        Logit for staying in the same state.
+    neighbour_logit : float
+        Logit for transitioning to adjacent states.
+
+    Returns
+    -------
+    torch.Tensor of shape (num_states, num_states)
+
+    """
+    # Start with a low baseline
+    logits = torch.full(
+        (num_states, num_states), -2.0, dtype=torch.float64
+    )
+    for s in range(num_states):
+        logits[s, s] = self_logit
+        if s > 0:
+            logits[s, s - 1] = neighbour_logit
+        if s < num_states - 1:
+            logits[s, s + 1] = neighbour_logit
+    return logits
+
+
+def default_illumina_profile() -> ErrorModelProfile:
+    """Return a default Illumina-like error model profile.
+
+    States represent quality zones: very-high (Q37), high (Q33),
+    medium (Q25), low (Q15), very-low (Q5). Errors are predominantly
+    substitutions (~80%).
+    """
+    num_states = 5
+    quality_peaks = [37.0, 33.0, 25.0, 15.0, 5.0]
+    quality_spreads = [3.0, 3.0, 4.0, 4.0, 3.0]
+
+    # Initial state: start in high-quality zone
+    initial_logits = torch.tensor(
+        [2.0, 1.0, -1.0, -3.0, -5.0], dtype=torch.float64
+    )
+
+    transition_logits = _build_sticky_transitions(
+        num_states, self_logit=3.5, neighbour_logit=0.5
+    )
+    emission_logits = _build_emission_logits(
+        num_states, quality_peaks, quality_spreads
+    )
+
+    return ErrorModelProfile(
+        name="illumina",
+        num_states=num_states,
+        initial_logits=initial_logits,
+        transition_logits=transition_logits,
+        emission_logits=emission_logits,
+        substitution_ratio=0.80,
+        insertion_ratio=0.10,
+        deletion_ratio=0.10,
+    )
+
+
+def default_pacbio_profile() -> ErrorModelProfile:
+    """Return a default PacBio-like error model profile.
+
+    States represent quality zones centred around Q10-Q20. Errors
+    are predominantly insertions and deletions (~85%).
+    """
+    num_states = 5
+    quality_peaks = [20.0, 15.0, 10.0, 7.0, 3.0]
+    quality_spreads = [3.0, 3.0, 3.0, 3.0, 2.0]
+
+    initial_logits = torch.tensor(
+        [1.0, 2.0, 1.0, -1.0, -3.0], dtype=torch.float64
+    )
+
+    transition_logits = _build_sticky_transitions(
+        num_states, self_logit=3.0, neighbour_logit=0.8
+    )
+    emission_logits = _build_emission_logits(
+        num_states, quality_peaks, quality_spreads
+    )
+
+    return ErrorModelProfile(
+        name="pacbio",
+        num_states=num_states,
+        initial_logits=initial_logits,
+        transition_logits=transition_logits,
+        emission_logits=emission_logits,
+        substitution_ratio=0.15,
+        insertion_ratio=0.40,
+        deletion_ratio=0.45,
+    )
+
+
+def default_nanopore_profile() -> ErrorModelProfile:
+    """Return a default Oxford Nanopore-like error model profile.
+
+    States represent quality zones centred around Q7-Q15. Errors
+    are predominantly insertions and deletions (~80%).
+    """
+    num_states = 5
+    quality_peaks = [15.0, 12.0, 9.0, 6.0, 3.0]
+    quality_spreads = [3.0, 3.0, 3.0, 3.0, 2.0]
+
+    initial_logits = torch.tensor(
+        [0.5, 1.5, 1.0, -0.5, -2.0], dtype=torch.float64
+    )
+
+    transition_logits = _build_sticky_transitions(
+        num_states, self_logit=2.5, neighbour_logit=1.0
+    )
+    emission_logits = _build_emission_logits(
+        num_states, quality_peaks, quality_spreads
+    )
+
+    return ErrorModelProfile(
+        name="nanopore",
+        num_states=num_states,
+        initial_logits=initial_logits,
+        transition_logits=transition_logits,
+        emission_logits=emission_logits,
+        substitution_ratio=0.20,
+        insertion_ratio=0.35,
+        deletion_ratio=0.45,
+    )
+
+
+def sample_quality_scores(
+    profile: ErrorModelProfile,
+    read_length: int,
+) -> torch.Tensor:
+    """Sample a sequence of quality scores from the HMM error model.
+
+    Parameters
+    ----------
+    profile : ErrorModelProfile
+        HMM parameters and error ratios.
+    read_length : int
+        Number of quality scores to generate.
+
+    Returns
+    -------
+    torch.Tensor of shape (read_length,) with integer quality values.
+
+    """
+    hmm = DiscreteHMM(
+        initial_logits=profile.initial_logits,
+        transition_logits=profile.transition_logits,
+        observation_dist=PyroCategorical(logits=profile.emission_logits),
+        duration=read_length,
+    )
+    return hmm.sample()
+
+
+_BASES = "ACGT"
+
+
+def apply_errors_to_sequence(
+    sequence: str,
+    quality_scores: torch.Tensor,
+    profile: ErrorModelProfile,
+    rng: torch.Generator,
+) -> tuple[str, str, list[tuple[int, int]]]:
+    """Apply errors to a sequence based on quality scores.
+
+    Parameters
+    ----------
+    sequence : str
+        Original read sequence.
+    quality_scores : torch.Tensor
+        Quality scores (one per reference position).
+    profile : ErrorModelProfile
+        Error type ratios.
+    rng : torch.Generator
+        Random number generator.
+
+    Returns
+    -------
+    modified_sequence : str
+    quality_string : str
+        Phred+33 encoded quality string for the modified sequence.
+    cigar_tuples : list of (op, length)
+        pysam-style CIGAR tuples.
+
+    """
+    error_type_weights = torch.tensor(
+        [profile.substitution_ratio, profile.insertion_ratio, profile.deletion_ratio],
+        dtype=torch.float64,
+    )
+
+    modified_bases: list[str] = []
+    qual_chars: list[str] = []
+    cigar_ops: list[int] = []  # per-base ops before run-length encoding
+
+    ref_len = len(sequence)
+    q_scores = quality_scores[:ref_len]
+
+    for pos in range(ref_len):
+        q = q_scores[pos].item()
+        p_error = 10.0 ** (-q / 10.0)
+
+        is_error = torch.rand(1, generator=rng).item() < p_error
+
+        if not is_error:
+            # Correct base
+            modified_bases.append(sequence[pos])
+            qual_chars.append(chr(int(q) + 33))
+            cigar_ops.append(0)  # M
+        else:
+            # Determine error type
+            error_type = torch.multinomial(
+                error_type_weights, 1, generator=rng
+            ).item()
+
+            if error_type == 0:
+                # Substitution: replace with a different base
+                original = sequence[pos].upper()
+                alternatives = [b for b in _BASES if b != original]
+                idx = torch.randint(0, len(alternatives), (1,), generator=rng).item()
+                modified_bases.append(alternatives[idx])
+                qual_chars.append(chr(int(q) + 33))
+                cigar_ops.append(0)  # M (substitutions are alignment matches)
+            elif error_type == 1:
+                # Insertion: insert a random base, then emit the current base
+                ins_idx = torch.randint(0, 4, (1,), generator=rng).item()
+                modified_bases.append(_BASES[ins_idx])
+                qual_chars.append(chr(int(q) + 33))
+                cigar_ops.append(1)  # I
+                # Also emit the current reference base
+                modified_bases.append(sequence[pos])
+                qual_chars.append(chr(int(q) + 33))
+                cigar_ops.append(0)  # M
+            else:
+                # Deletion: skip this reference base
+                cigar_ops.append(2)  # D
+
+    # Run-length encode CIGAR ops
+    cigar_tuples: list[tuple[int, int]] = []
+    if cigar_ops:
+        current_op = cigar_ops[0]
+        current_len = 1
+        for op in cigar_ops[1:]:
+            if op == current_op:
+                current_len += 1
+            else:
+                cigar_tuples.append((current_op, current_len))
+                current_op = op
+                current_len = 1
+        cigar_tuples.append((current_op, current_len))
+
+    modified_sequence = "".join(modified_bases)
+    quality_string = "".join(qual_chars)
+
+    return modified_sequence, quality_string, cigar_tuples
 
 
 def load_genomes(
@@ -370,12 +683,58 @@ def generate_reads(
 
 def apply_error_model(
     reads: list[Read] | list[tuple[Read, Read]],
+    fragments: list[Fragment],
+    profile: ErrorModelProfile | None,
+    paired_end: bool,
+    rng: torch.Generator,
 ) -> list[Read] | list[tuple[Read, Read]]:
-    """Apply sequencing error model (placeholder).
+    """Apply HMM-based sequencing error model to reads.
 
-    Currently a no-op: returns reads unchanged with Q40 quality scores.
+    If profile is None, returns reads unchanged (backwards compatible).
+    Otherwise, samples quality scores from the HMM and applies errors
+    (substitutions, insertions, deletions) based on those quality scores.
+
+    Parameters
+    ----------
+    reads : list of Read (SE) or list of (Read, Read) tuples (PE)
+    fragments : list of Fragment
+        Source fragments for the reads.
+    profile : ErrorModelProfile or None
+        Error model parameters. None means no errors applied.
+    paired_end : bool
+        Whether reads are paired-end.
+    rng : torch.Generator
+        Random number generator.
+
+    Returns
+    -------
+    list of Read (SE) or list of (Read, Read) tuples (PE)
+
     """
-    return reads
+    if profile is None:
+        return reads
+
+    logger.info("Applying %s error model...", profile.name)
+
+    def _apply_to_read(read: Read) -> Read:
+        q_scores = sample_quality_scores(profile, len(read.sequence))
+        new_seq, new_qual, cigar = apply_errors_to_sequence(
+            read.sequence, q_scores, profile, rng
+        )
+        return Read(
+            name=read.name,
+            sequence=new_seq,
+            quality=new_qual,
+            cigar=cigar,
+        )
+
+    if paired_end:
+        result_pe: list[tuple[Read, Read]] = []
+        for r1, r2 in reads:  # type: ignore[misc]
+            result_pe.append((_apply_to_read(r1), _apply_to_read(r2)))
+        return result_pe
+    else:
+        return [_apply_to_read(r) for r in reads]  # type: ignore[union-attr]
 
 
 def write_fastq(reads: list[Read], output_path: Path) -> None:
@@ -468,7 +827,7 @@ def write_bam(
                 a1.mate_is_reverse = r2_is_reverse
                 a1.reference_id = ref_id
                 a1.reference_start = frag.start
-                a1.cigar = [(0, len(r1.sequence))]
+                a1.cigar = r1.cigar if r1.cigar is not None else [(0, len(r1.sequence))]
                 a1.mapping_quality = 255
                 a1.query_qualities = pysam.qualitystring_to_array(r1.quality)
                 a1.next_reference_id = ref_id
@@ -489,7 +848,7 @@ def write_bam(
                 a2.mate_is_reverse = r1_is_reverse
                 a2.reference_id = ref_id
                 a2.reference_start = r2_start
-                a2.cigar = [(0, len(r2.sequence))]
+                a2.cigar = r2.cigar if r2.cigar is not None else [(0, len(r2.sequence))]
                 a2.mapping_quality = 255
                 a2.query_qualities = pysam.qualitystring_to_array(r2.quality)
                 a2.next_reference_id = ref_id
@@ -507,7 +866,7 @@ def write_bam(
                 a.is_reverse = frag.strand == "-"
                 a.reference_id = ref_id
                 a.reference_start = frag.start
-                a.cigar = [(0, len(read.sequence))]
+                a.cigar = read.cigar if read.cigar is not None else [(0, len(read.sequence))]
                 a.mapping_quality = 255
                 a.query_qualities = pysam.qualitystring_to_array(read.quality)
                 bam.write(a)
@@ -575,6 +934,12 @@ def write_bam(
     type=int,
     help="Random seed for reproducibility",
 )
+@click.option(
+    "--error-model",
+    type=click.Choice(["none", "illumina", "pacbio", "nanopore"], case_sensitive=False),
+    default="none",
+    help="Sequencing error model profile",
+)
 def main(
     input_csv: Path,
     num_reads: int,
@@ -586,6 +951,7 @@ def main(
     paired_end: bool,
     output_prefix: str,
     seed: int | None,
+    error_model: str,
 ) -> None:
     """Generate simulated WGS reads from reference genomes."""
     logging.basicConfig(
@@ -602,6 +968,14 @@ def main(
     else:
         rng.seed()
         logger.info("Using random seed")
+
+    # Resolve error model profile
+    profile_map = {
+        "illumina": default_illumina_profile,
+        "pacbio": default_pacbio_profile,
+        "nanopore": default_nanopore_profile,
+    }
+    profile = profile_map[error_model]() if error_model != "none" else None
 
     # Load genomes
     genomes, abundances = load_genomes(input_csv)
@@ -634,6 +1008,9 @@ def main(
             paired_end=True,
             rng=rng,
         )
+        pe_reads = apply_error_model(
+            pe_reads, fragments, profile, paired_end=True, rng=rng
+        )
         # pe_reads is list[tuple[Read, Read]]
         r1_path = Path(f"{output_prefix}_R1.fastq")
         r2_path = Path(f"{output_prefix}_R2.fastq")
@@ -650,6 +1027,9 @@ def main(
             read_length_variance=read_length_variance,
             paired_end=False,
             rng=rng,
+        )
+        se_reads = apply_error_model(
+            se_reads, fragments, profile, paired_end=False, rng=rng
         )
         # se_reads is list[Read]
         out_path = Path(f"{output_prefix}.fastq")
