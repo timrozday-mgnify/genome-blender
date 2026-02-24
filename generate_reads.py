@@ -14,8 +14,11 @@ import math
 from dataclasses import dataclass
 from pathlib import Path
 
-import click
+from enum import Enum
+from typing import Annotated
+
 import pysam
+import typer
 import torch
 from Bio import SeqIO
 from Bio.Seq import Seq
@@ -24,6 +27,21 @@ from pyro.distributions import LogNormal, NegativeBinomial, Poisson
 from pyro.distributions.hmm import DiscreteHMM
 
 logger = logging.getLogger(__name__)
+
+app = typer.Typer()
+
+
+class ErrorModel(str, Enum):
+    none = "none"
+    illumina = "illumina"
+    pacbio = "pacbio"
+    nanopore = "nanopore"
+
+
+class QualityCalibrationModel(str, Enum):
+    phred = "phred"
+    log_linear = "log-linear"
+    sigmoid = "sigmoid"
 
 
 @dataclass
@@ -1173,146 +1191,66 @@ def write_bam(
     logger.info("Wrote ground-truth BAM to %s", output_path)
 
 
-@click.command()
-@click.option(
-    "--input-csv",
-    required=True,
-    type=click.Path(exists=True, path_type=Path),
-    help="CSV with columns: genome_id, fasta_path, abundance",
-)
-@click.option(
-    "--num-reads",
-    required=True,
-    type=int,
-    help="Total number of reads to generate",
-)
-@click.option(
-    "--fragment-mean",
-    default=300.0,
-    type=float,
-    help="Mean fragment length",
-)
-@click.option(
-    "--fragment-variance",
-    default=300.0,
-    type=float,
-    help="Variance of fragment length (Negative Binomial)",
-)
-@click.option(
-    "--read-length-mean",
-    default=150.0,
-    type=float,
-    help="Mean read length (LogNormal)",
-)
-@click.option(
-    "--read-length-variance",
-    default=10.0,
-    type=float,
-    help="Variance of read length (LogNormal)",
-)
-@click.option(
-    "--gc-bias-strength",
-    default=0.0,
-    type=float,
-    help="GC bias strength; 0 = no bias",
-)
-@click.option(
-    "--paired-end/--single-end",
-    default=False,
-    help="Generate paired-end or single-end reads (default: single-end)",
-)
-@click.option(
-    "--output-prefix",
-    required=True,
-    type=str,
-    help="Output file prefix",
-)
-@click.option(
-    "--seed",
-    default=None,
-    type=int,
-    help="Random seed for reproducibility",
-)
-@click.option(
-    "--error-model",
-    type=click.Choice(["none", "illumina", "pacbio", "nanopore"], case_sensitive=False),
-    default="none",
-    help="Sequencing error model profile",
-)
-@click.option(
-    "--quality-calibration-model",
-    type=click.Choice(["phred", "log-linear", "sigmoid"], case_sensitive=False),
-    default="phred",
-    help="Quality-score-to-error-rate calibration model",
-)
-@click.option(
-    "--qcal-variability",
-    default=0.0,
-    type=float,
-    help="Per-run noise multiplier for calibration parameters; 0 = no noise",
-)
-@click.option(
-    "--qcal-intercept",
-    default=-0.3,
-    type=float,
-    help="Log-linear model intercept (log10 scale)",
-)
-@click.option(
-    "--qcal-slope",
-    default=-0.08,
-    type=float,
-    help="Log-linear model slope",
-)
-@click.option(
-    "--qcal-floor",
-    default=1e-7,
-    type=float,
-    help="Minimum error probability (log-linear and sigmoid)",
-)
-@click.option(
-    "--qcal-ceiling",
-    default=0.5,
-    type=float,
-    help="Maximum error probability (log-linear and sigmoid)",
-)
-@click.option(
-    "--qcal-steepness",
-    default=0.25,
-    type=float,
-    help="Sigmoid model steepness",
-)
-@click.option(
-    "--qcal-midpoint",
-    default=15.0,
-    type=float,
-    help="Sigmoid model midpoint (Q-score at inflection)",
-)
-@click.option(
-    "--amplicon/--no-amplicon",
-    default=False,
-    help="Treat input sequences as amplicons (no shearing); replicate proportionally to abundance",
-)
+@app.command()
 def main(
-    input_csv: Path,
-    num_reads: int,
-    fragment_mean: float,
-    fragment_variance: float,
-    read_length_mean: float,
-    read_length_variance: float,
-    gc_bias_strength: float,
-    paired_end: bool,
-    output_prefix: str,
-    seed: int | None,
-    error_model: str,
-    quality_calibration_model: str,
-    qcal_variability: float,
-    qcal_intercept: float,
-    qcal_slope: float,
-    qcal_floor: float,
-    qcal_ceiling: float,
-    qcal_steepness: float,
-    qcal_midpoint: float,
-    amplicon: bool,
+    input_csv: Annotated[Path, typer.Option(
+        help="CSV with columns: genome_id, fasta_path, abundance",
+    )],
+    num_reads: Annotated[int, typer.Option(help="Total number of reads to generate")],
+    output_prefix: Annotated[str, typer.Option(help="Output file prefix")],
+    fragment_mean: Annotated[float, typer.Option(help="Mean fragment length")] = 300.0,
+    fragment_variance: Annotated[float, typer.Option(
+        help="Variance of fragment length (Negative Binomial)",
+    )] = 300.0,
+    read_length_mean: Annotated[float, typer.Option(
+        help="Mean read length (LogNormal)",
+    )] = 150.0,
+    read_length_variance: Annotated[float, typer.Option(
+        help="Variance of read length (LogNormal)",
+    )] = 10.0,
+    gc_bias_strength: Annotated[float, typer.Option(
+        help="GC bias strength; 0 = no bias",
+    )] = 0.0,
+    paired_end: Annotated[bool, typer.Option(
+        "--paired-end/--single-end",
+        help="Generate paired-end or single-end reads (default: single-end)",
+    )] = False,
+    seed: Annotated[int | None, typer.Option(
+        help="Random seed for reproducibility",
+    )] = None,
+    error_model: Annotated[ErrorModel, typer.Option(
+        help="Sequencing error model profile",
+        case_sensitive=False,
+    )] = ErrorModel.none,
+    quality_calibration_model: Annotated[QualityCalibrationModel, typer.Option(
+        help="Quality-score-to-error-rate calibration model",
+        case_sensitive=False,
+    )] = QualityCalibrationModel.phred,
+    qcal_variability: Annotated[float, typer.Option(
+        help="Per-run noise multiplier for calibration parameters; 0 = no noise",
+    )] = 0.0,
+    qcal_intercept: Annotated[float, typer.Option(
+        help="Log-linear model intercept (log10 scale)",
+    )] = -0.3,
+    qcal_slope: Annotated[float, typer.Option(
+        help="Log-linear model slope",
+    )] = -0.08,
+    qcal_floor: Annotated[float, typer.Option(
+        help="Minimum error probability (log-linear and sigmoid)",
+    )] = 1e-7,
+    qcal_ceiling: Annotated[float, typer.Option(
+        help="Maximum error probability (log-linear and sigmoid)",
+    )] = 0.5,
+    qcal_steepness: Annotated[float, typer.Option(
+        help="Sigmoid model steepness",
+    )] = 0.25,
+    qcal_midpoint: Annotated[float, typer.Option(
+        help="Sigmoid model midpoint (Q-score at inflection)",
+    )] = 15.0,
+    amplicon: Annotated[bool, typer.Option(
+        "--amplicon/--no-amplicon",
+        help="Treat input sequences as amplicons (no shearing); replicate proportionally to abundance",
+    )] = False,
 ) -> None:
     """Generate simulated WGS reads from reference genomes."""
     logging.basicConfig(
@@ -1336,11 +1274,12 @@ def main(
         "pacbio": default_pacbio_profile,
         "nanopore": default_nanopore_profile,
     }
-    profile = profile_map[error_model]() if error_model != "none" else None
+    error_model_str = error_model.value
+    profile = profile_map[error_model_str]() if error_model_str != "none" else None
 
     # Build quality calibration model
     calibration = build_quality_calibration(
-        model_name=quality_calibration_model,
+        model_name=quality_calibration_model.value,
         variability=qcal_variability,
         rng=rng,
         intercept=qcal_intercept,
@@ -1417,4 +1356,4 @@ def main(
 
 
 if __name__ == "__main__":
-    main()
+    app()
