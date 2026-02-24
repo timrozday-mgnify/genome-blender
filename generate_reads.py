@@ -49,6 +49,22 @@ class Read:
 
 
 @dataclass
+class ReadBatch:
+    """Container for generated reads, either single-end or paired-end.
+
+    Exactly one of ``single`` or ``paired`` is set; the other is ``None``.
+    """
+
+    single: list[Read] | None = None
+    paired: list[tuple[Read, Read]] | None = None
+
+    @property
+    def is_paired(self) -> bool:
+        """Return True if this batch contains paired-end reads."""
+        return self.paired is not None
+
+
+@dataclass
 class ErrorModelProfile:
     """HMM-based sequencing error model parameters."""
 
@@ -229,31 +245,51 @@ def default_nanopore_profile() -> ErrorModelProfile:
     )
 
 
-def sample_quality_scores(
+def batch_sample_quality_scores(
     profile: ErrorModelProfile,
-    read_length: int,
-) -> torch.Tensor:
-    """Sample a sequence of quality scores from the HMM error model.
+    read_lengths: list[int],
+) -> list[torch.Tensor]:
+    """Sample quality scores for a batch of reads from the HMM.
+
+    Constructs a single DiscreteHMM at the maximum read length and
+    samples all sequences in one call, then truncates each to its
+    actual length.
 
     Parameters
     ----------
     profile : ErrorModelProfile
         HMM parameters and error ratios.
-    read_length : int
-        Number of quality scores to generate.
+    read_lengths : list of int
+        Length of each read to generate quality scores for.
 
     Returns
     -------
-    torch.Tensor of shape (read_length,) with integer quality values.
+    list of torch.Tensor, each of shape (read_length,) with integer
+    quality values.
 
     """
+    if not read_lengths:
+        return []
+
+    max_len = max(read_lengths)
+    batch_size = len(read_lengths)
+
     hmm = DiscreteHMM(
         initial_logits=profile.initial_logits,
         transition_logits=profile.transition_logits,
-        observation_dist=PyroCategorical(logits=profile.emission_logits),
-        duration=read_length,
+        observation_dist=PyroCategorical(
+            logits=profile.emission_logits
+        ),
+        duration=max_len,
     )
-    return hmm.sample()
+
+    # Shape: (batch_size, max_len)
+    all_scores = hmm.sample(sample_shape=(batch_size,))
+
+    return [
+        all_scores[i, :length]
+        for i, length in enumerate(read_lengths)
+    ]
 
 
 _BASES = "ACGT"
@@ -266,6 +302,11 @@ def apply_errors_to_sequence(
     rng: torch.Generator,
 ) -> tuple[str, str, list[tuple[int, int]]]:
     """Apply errors to a sequence based on quality scores.
+
+    All random draws (error coin flips, error type selection,
+    substitution/insertion base choices) are made in vectorised
+    batches up front.  Only the sequential assembly of the output
+    sequence and CIGAR string loops over reference positions.
 
     Parameters
     ----------
@@ -287,55 +328,71 @@ def apply_errors_to_sequence(
         pysam-style CIGAR tuples.
 
     """
-    error_type_weights = torch.tensor(
-        [profile.substitution_ratio, profile.insertion_ratio, profile.deletion_ratio],
-        dtype=torch.float64,
-    )
-
-    modified_bases: list[str] = []
-    qual_chars: list[str] = []
-    cigar_ops: list[int] = []  # per-base ops before run-length encoding
-
     ref_len = len(sequence)
     q_scores = quality_scores[:ref_len]
 
+    # --- Vectorised random draws ---
+    p_error = 10.0 ** (-q_scores.float() / 10.0)
+    is_error = torch.rand(ref_len, generator=rng) < p_error
+
+    error_type_weights = torch.tensor(
+        [profile.substitution_ratio,
+         profile.insertion_ratio,
+         profile.deletion_ratio],
+        dtype=torch.float64,
+    )
+    error_types = torch.multinomial(
+        error_type_weights.expand(ref_len, -1), 1,
+        generator=rng,
+    ).squeeze(-1)
+
+    # Pre-draw random bases for substitutions (index into 3
+    # alternatives) and insertions (index into all 4 bases)
+    sub_choices = torch.randint(
+        0, 3, (ref_len,), generator=rng
+    )
+    ins_bases = torch.randint(
+        0, 4, (ref_len,), generator=rng
+    )
+
+    # Move to Python lists once for the assembly loop
+    is_error_list = is_error.tolist()
+    error_types_list = error_types.tolist()
+    sub_choices_list = sub_choices.tolist()
+    ins_bases_list = ins_bases.tolist()
+    q_int = q_scores.to(torch.int64).tolist()
+
+    # --- Sequential assembly (insertions/deletions shift positions) ---
+    modified_bases: list[str] = []
+    qual_chars: list[str] = []
+    cigar_ops: list[int] = []
+
     for pos in range(ref_len):
-        q = q_scores[pos].item()
-        p_error = 10.0 ** (-q / 10.0)
+        q_char = chr(q_int[pos] + 33)
 
-        is_error = torch.rand(1, generator=rng).item() < p_error
-
-        if not is_error:
-            # Correct base
+        if not is_error_list[pos]:
             modified_bases.append(sequence[pos])
-            qual_chars.append(chr(int(q) + 33))
+            qual_chars.append(q_char)
             cigar_ops.append(0)  # M
         else:
-            # Determine error type
-            error_type = torch.multinomial(
-                error_type_weights, 1, generator=rng
-            ).item()
-
-            if error_type == 0:
-                # Substitution: replace with a different base
+            etype = error_types_list[pos]
+            if etype == 0:
+                # Substitution
                 original = sequence[pos].upper()
-                alternatives = [b for b in _BASES if b != original]
-                idx = torch.randint(0, len(alternatives), (1,), generator=rng).item()
-                modified_bases.append(alternatives[idx])
-                qual_chars.append(chr(int(q) + 33))
-                cigar_ops.append(0)  # M (substitutions are alignment matches)
-            elif error_type == 1:
-                # Insertion: insert a random base, then emit the current base
-                ins_idx = torch.randint(0, 4, (1,), generator=rng).item()
-                modified_bases.append(_BASES[ins_idx])
-                qual_chars.append(chr(int(q) + 33))
+                alts = [b for b in _BASES if b != original]
+                modified_bases.append(alts[sub_choices_list[pos]])
+                qual_chars.append(q_char)
+                cigar_ops.append(0)  # M
+            elif etype == 1:
+                # Insertion then current base
+                modified_bases.append(_BASES[ins_bases_list[pos]])
+                qual_chars.append(q_char)
                 cigar_ops.append(1)  # I
-                # Also emit the current reference base
                 modified_bases.append(sequence[pos])
-                qual_chars.append(chr(int(q) + 33))
+                qual_chars.append(q_char)
                 cigar_ops.append(0)  # M
             else:
-                # Deletion: skip this reference base
+                # Deletion
                 cigar_ops.append(2)  # D
 
     # Run-length encode CIGAR ops
@@ -352,10 +409,7 @@ def apply_errors_to_sequence(
                 current_len = 1
         cigar_tuples.append((current_op, current_len))
 
-    modified_sequence = "".join(modified_bases)
-    quality_string = "".join(qual_chars)
-
-    return modified_sequence, quality_string, cigar_tuples
+    return "".join(modified_bases), "".join(qual_chars), cigar_tuples
 
 
 def load_genomes(
@@ -602,7 +656,7 @@ def generate_reads(
     read_length_variance: float,
     paired_end: bool,
     rng: torch.Generator,
-) -> list[Read] | list[tuple[Read, Read]]:  # noqa: E501
+) -> ReadBatch:
     """Generate reads from fragments.
 
     Parameters
@@ -619,7 +673,7 @@ def generate_reads(
 
     Returns
     -------
-    list of Read (single-end) or list of (Read, Read) tuples (paired-end)
+    ReadBatch
 
     """
     # rng is accepted for API consistency; torch uses global RNG state
@@ -677,64 +731,80 @@ def generate_reads(
             )
 
     if paired_end:
-        return pe_reads
-    return se_reads
+        return ReadBatch(paired=pe_reads)
+    return ReadBatch(single=se_reads)
 
 
 def apply_error_model(
-    reads: list[Read] | list[tuple[Read, Read]],
-    fragments: list[Fragment],
+    read_batch: ReadBatch,
     profile: ErrorModelProfile | None,
-    paired_end: bool,
     rng: torch.Generator,
-) -> list[Read] | list[tuple[Read, Read]]:
+) -> ReadBatch:
     """Apply HMM-based sequencing error model to reads.
 
     If profile is None, returns reads unchanged (backwards compatible).
-    Otherwise, samples quality scores from the HMM and applies errors
-    (substitutions, insertions, deletions) based on those quality scores.
+    Otherwise, samples quality scores from the HMM in a single batch
+    and applies errors (substitutions, insertions, deletions) based on
+    those quality scores.
 
     Parameters
     ----------
-    reads : list of Read (SE) or list of (Read, Read) tuples (PE)
-    fragments : list of Fragment
-        Source fragments for the reads.
+    read_batch : ReadBatch
+        Generated reads (single-end or paired-end).
     profile : ErrorModelProfile or None
         Error model parameters. None means no errors applied.
-    paired_end : bool
-        Whether reads are paired-end.
     rng : torch.Generator
         Random number generator.
 
     Returns
     -------
-    list of Read (SE) or list of (Read, Read) tuples (PE)
+    ReadBatch
 
     """
     if profile is None:
-        return reads
+        return read_batch
 
     logger.info("Applying %s error model...", profile.name)
 
-    def _apply_to_read(read: Read) -> Read:
-        q_scores = sample_quality_scores(profile, len(read.sequence))
+    # Collect all individual reads and their lengths for batch
+    # quality score sampling
+    flat_reads: list[Read] = []
+    if read_batch.is_paired:
+        assert read_batch.paired is not None
+        for r1, r2 in read_batch.paired:
+            flat_reads.append(r1)
+            flat_reads.append(r2)
+    else:
+        assert read_batch.single is not None
+        flat_reads = list(read_batch.single)
+
+    read_lengths = [len(r.sequence) for r in flat_reads]
+    all_q_scores = batch_sample_quality_scores(
+        profile, read_lengths
+    )
+
+    # Apply errors using the pre-sampled quality scores
+    modified: list[Read] = []
+    for read, q_scores in zip(flat_reads, all_q_scores):
         new_seq, new_qual, cigar = apply_errors_to_sequence(
             read.sequence, q_scores, profile, rng
         )
-        return Read(
+        modified.append(Read(
             name=read.name,
             sequence=new_seq,
             quality=new_qual,
             cigar=cigar,
-        )
+        ))
 
-    if paired_end:
-        result_pe: list[tuple[Read, Read]] = []
-        for r1, r2 in reads:  # type: ignore[misc]
-            result_pe.append((_apply_to_read(r1), _apply_to_read(r2)))
-        return result_pe
-    else:
-        return [_apply_to_read(r) for r in reads]  # type: ignore[union-attr]
+    # Re-pack into ReadBatch
+    if read_batch.is_paired:
+        pairs = [
+            (modified[i], modified[i + 1])
+            for i in range(0, len(modified), 2)
+        ]
+        return ReadBatch(paired=pairs)
+
+    return ReadBatch(single=modified)
 
 
 def write_fastq(reads: list[Read], output_path: Path) -> None:
@@ -759,8 +829,7 @@ def write_fastq(reads: list[Read], output_path: Path) -> None:
 
 def write_bam(
     fragments: list[Fragment],
-    reads: list[Read] | list[tuple[Read, Read]],
-    paired_end: bool,
+    read_batch: ReadBatch,
     genomes: dict[str, list],
     output_path: Path,
 ) -> None:
@@ -773,9 +842,8 @@ def write_bam(
     ----------
     fragments : list of Fragment
         Source fragments (one per read or read-pair).
-    reads : list of Read (SE) or list of (Read, Read) tuples (PE)
-    paired_end : bool
-        Whether reads are paired-end.
+    read_batch : ReadBatch
+        Generated reads (single-end or paired-end).
     genomes : dict mapping genome_id to list of Bio.SeqRecord
         Used to build the BAM header with contig lengths.
     output_path : Path
@@ -807,8 +875,9 @@ def write_bam(
             ref_name = f"{frag.genome_id}:{frag.contig_id}"
             ref_id = ref_name_to_idx[ref_name]
 
-            if paired_end:
-                r1, r2 = reads[i]  # type: ignore[misc]
+            if read_batch.is_paired:
+                assert read_batch.paired is not None
+                r1, r2 = read_batch.paired[i]
                 # Strip /1, /2 suffixes — BAM uses FLAG bits
                 qname = r1.name.split("/")[0]
 
@@ -827,9 +896,14 @@ def write_bam(
                 a1.mate_is_reverse = r2_is_reverse
                 a1.reference_id = ref_id
                 a1.reference_start = frag.start
-                a1.cigar = r1.cigar if r1.cigar is not None else [(0, len(r1.sequence))]
+                a1.cigar = (
+                    r1.cigar if r1.cigar is not None
+                    else [(0, len(r1.sequence))]
+                )
                 a1.mapping_quality = 255
-                a1.query_qualities = pysam.qualitystring_to_array(r1.quality)
+                a1.query_qualities = pysam.qualitystring_to_array(
+                    r1.quality
+                )
                 a1.next_reference_id = ref_id
                 # R2 aligns at end of fragment minus its length
                 r2_start = frag.end - len(r2.sequence)
@@ -848,9 +922,14 @@ def write_bam(
                 a2.mate_is_reverse = r1_is_reverse
                 a2.reference_id = ref_id
                 a2.reference_start = r2_start
-                a2.cigar = r2.cigar if r2.cigar is not None else [(0, len(r2.sequence))]
+                a2.cigar = (
+                    r2.cigar if r2.cigar is not None
+                    else [(0, len(r2.sequence))]
+                )
                 a2.mapping_quality = 255
-                a2.query_qualities = pysam.qualitystring_to_array(r2.quality)
+                a2.query_qualities = pysam.qualitystring_to_array(
+                    r2.quality
+                )
                 a2.next_reference_id = ref_id
                 a2.next_reference_start = frag.start
                 a2.template_length = -(frag.end - frag.start)
@@ -858,7 +937,8 @@ def write_bam(
                 bam.write(a1)
                 bam.write(a2)
             else:
-                read = reads[i]  # type: ignore[assignment]
+                assert read_batch.single is not None
+                read = read_batch.single[i]
                 a = pysam.AlignedSegment(header)
                 a.query_name = read.name
                 a.query_sequence = read.sequence
@@ -866,9 +946,14 @@ def write_bam(
                 a.is_reverse = frag.strand == "-"
                 a.reference_id = ref_id
                 a.reference_start = frag.start
-                a.cigar = read.cigar if read.cigar is not None else [(0, len(read.sequence))]
+                a.cigar = (
+                    read.cigar if read.cigar is not None
+                    else [(0, len(read.sequence))]
+                )
                 a.mapping_quality = 255
-                a.query_qualities = pysam.qualitystring_to_array(read.quality)
+                a.query_qualities = pysam.qualitystring_to_array(
+                    read.quality
+                )
                 bam.write(a)
 
     logger.info("Wrote ground-truth BAM to %s", output_path)
@@ -1000,42 +1085,31 @@ def main(
 
     # Generate reads and write output
     logger.info("Generating reads (paired_end=%s)...", paired_end)
-    if paired_end:
-        pe_reads = generate_reads(
-            fragments=fragments,
-            read_length_mean=read_length_mean,
-            read_length_variance=read_length_variance,
-            paired_end=True,
-            rng=rng,
-        )
-        pe_reads = apply_error_model(
-            pe_reads, fragments, profile, paired_end=True, rng=rng
-        )
-        # pe_reads is list[tuple[Read, Read]]
+    read_batch = generate_reads(
+        fragments=fragments,
+        read_length_mean=read_length_mean,
+        read_length_variance=read_length_variance,
+        paired_end=paired_end,
+        rng=rng,
+    )
+    read_batch = apply_error_model(read_batch, profile, rng)
+
+    if read_batch.is_paired:
+        assert read_batch.paired is not None
         r1_path = Path(f"{output_prefix}_R1.fastq")
         r2_path = Path(f"{output_prefix}_R2.fastq")
-        r1_reads = [pair[0] for pair in pe_reads]  # type: ignore[union-attr]
-        r2_reads = [pair[1] for pair in pe_reads]  # type: ignore[union-attr]
+        r1_reads = [pair[0] for pair in read_batch.paired]
+        r2_reads = [pair[1] for pair in read_batch.paired]
         write_fastq(r1_reads, r1_path)
         write_fastq(r2_reads, r2_path)
-        bam_path = Path(f"{output_prefix}.bam")
-        write_bam(fragments, pe_reads, paired_end=True, genomes=genomes, output_path=bam_path)
     else:
-        se_reads = generate_reads(
-            fragments=fragments,
-            read_length_mean=read_length_mean,
-            read_length_variance=read_length_variance,
-            paired_end=False,
-            rng=rng,
-        )
-        se_reads = apply_error_model(
-            se_reads, fragments, profile, paired_end=False, rng=rng
-        )
-        # se_reads is list[Read]
+        assert read_batch.single is not None
         out_path = Path(f"{output_prefix}.fastq")
-        write_fastq(se_reads, out_path)  # type: ignore[arg-type]
-        bam_path = Path(f"{output_prefix}.bam")
-        write_bam(fragments, se_reads, paired_end=False, genomes=genomes, output_path=bam_path)
+        write_fastq(read_batch.single, out_path)
+
+    bam_path = Path(f"{output_prefix}.bam")
+    write_bam(fragments, read_batch, genomes=genomes,
+              output_path=bam_path)
 
     logger.info("Done.")
 

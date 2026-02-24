@@ -14,7 +14,11 @@
       "Bash(grep:*)",
       "Bash(head:*)",
       "Bash(pip3 show:*)",
-      "Bash(conda run:*)"
+      "Bash(conda run:*)",
+      "WebFetch(domain:num.pyro.ai)",
+      "WebFetch(domain:forum.pyro.ai)",
+      "WebFetch(domain:news.ycombinator.com)",
+      "WebFetch(domain:medium.com)"
     ]
   }
 }
