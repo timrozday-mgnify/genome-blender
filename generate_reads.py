@@ -784,6 +784,85 @@ def sample_fragments(
     return fragments
 
 
+def amplicon_fragments(
+    genomes: dict[str, list],
+    abundances: dict[str, float],
+    num_fragments: int,
+    rng: torch.Generator,
+) -> list[Fragment]:
+    """Create fragments from input sequences treated as amplicons.
+
+    Each sequence record is used directly as a fragment (no shearing).
+    Fragments are replicated proportionally to genome abundance to reach
+    the requested total, modelling PCR amplification.
+
+    Parameters
+    ----------
+    genomes : dict mapping genome_id to list of SeqRecord
+    abundances : dict mapping genome_id to normalised abundance
+    num_fragments : int
+        Total number of fragments to produce.
+    rng : torch.Generator
+        Seeded random number generator (used for shuffling).
+
+    Returns
+    -------
+    list of Fragment
+
+    """
+    # Build flat list of (genome_id, record) pairs with per-amplicon weights
+    amplicons: list[tuple[str, any]] = []
+    weights: list[float] = []
+    for genome_id, records in genomes.items():
+        for record in records:
+            amplicons.append((genome_id, record))
+            weights.append(abundances[genome_id])
+
+    if not amplicons:
+        return []
+
+    # Normalise weights (they should already sum to ~1 across genomes,
+    # but a genome with multiple records splits its weight evenly here)
+    weight_tensor = torch.tensor(weights, dtype=torch.float64)
+    weight_tensor = weight_tensor / weight_tensor.sum()
+
+    # Largest-remainder allocation
+    counts_float = weight_tensor * num_fragments
+    counts = counts_float.floor().long()
+    remainder = num_fragments - counts.sum().item()
+    if remainder > 0:
+        fractional = counts_float - counts.float()
+        _, top_idx = fractional.topk(int(remainder))
+        for idx in top_idx:
+            counts[idx] += 1
+
+    # Build fragment list
+    fragments: list[Fragment] = []
+    for i, (genome_id, record) in enumerate(amplicons):
+        n = counts[i].item()
+        if n == 0:
+            continue
+        seq_str = str(record.seq)
+        for _ in range(n):
+            fragments.append(
+                Fragment(
+                    genome_id=genome_id,
+                    contig_id=record.id,
+                    start=0,
+                    end=len(record.seq),
+                    strand="+",
+                    sequence=seq_str,
+                )
+            )
+
+    # Shuffle so reads aren't grouped by amplicon
+    n = len(fragments)
+    indices = torch.randperm(n, generator=rng).tolist()
+    fragments = [fragments[i] for i in indices]
+
+    return fragments
+
+
 def generate_reads(
     fragments: list[Fragment],
     read_length_mean: float,
@@ -1208,6 +1287,11 @@ def write_bam(
     type=float,
     help="Sigmoid model midpoint (Q-score at inflection)",
 )
+@click.option(
+    "--amplicon/--no-amplicon",
+    default=False,
+    help="Treat input sequences as amplicons (no shearing); replicate proportionally to abundance",
+)
 def main(
     input_csv: Path,
     num_reads: int,
@@ -1228,6 +1312,7 @@ def main(
     qcal_ceiling: float,
     qcal_steepness: float,
     qcal_midpoint: float,
+    amplicon: bool,
 ) -> None:
     """Generate simulated WGS reads from reference genomes."""
     logging.basicConfig(
@@ -1274,17 +1359,30 @@ def main(
     # so we need num_reads // 2 fragments for PE, num_reads for SE
     num_fragments = num_reads // 2 if paired_end else num_reads
 
-    # Sample fragments
-    logger.info("Sampling %d fragments...", num_fragments)
-    fragments = sample_fragments(
-        genomes=genomes,
-        abundances=abundances,
-        num_fragments=num_fragments,
-        fragment_mean=fragment_mean,
-        fragment_variance=fragment_variance,
-        gc_bias_strength=gc_bias_strength,
-        rng=rng,
-    )
+    # Generate fragments
+    if amplicon:
+        logger.info(
+            "Amplicon mode: replicating %d input sequences to %d fragments...",
+            sum(len(recs) for recs in genomes.values()),
+            num_fragments,
+        )
+        fragments = amplicon_fragments(
+            genomes=genomes,
+            abundances=abundances,
+            num_fragments=num_fragments,
+            rng=rng,
+        )
+    else:
+        logger.info("Sampling %d fragments...", num_fragments)
+        fragments = sample_fragments(
+            genomes=genomes,
+            abundances=abundances,
+            num_fragments=num_fragments,
+            fragment_mean=fragment_mean,
+            fragment_variance=fragment_variance,
+            gc_bias_strength=gc_bias_strength,
+            rng=rng,
+        )
     logger.info("Generated %d fragments", len(fragments))
 
     # Generate reads and write output
