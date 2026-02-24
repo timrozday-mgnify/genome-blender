@@ -65,6 +65,136 @@ class ReadBatch:
 
 
 @dataclass
+class QualityCalibration:
+    """Base for quality-score-to-error-rate calibration models."""
+
+    name: str
+
+    def __call__(self, q_scores: torch.Tensor) -> torch.Tensor:
+        raise NotImplementedError
+
+
+@dataclass
+class PhredCalibration(QualityCalibration):
+    """Theoretical Phred: P = 10^(-Q/10)."""
+
+    name: str = "phred"
+
+    def __call__(self, q_scores: torch.Tensor) -> torch.Tensor:
+        return 10.0 ** (-q_scores.float() / 10.0)
+
+
+@dataclass
+class LogLinearCalibration(QualityCalibration):
+    """DADA2-style: P = clamp(10^(intercept + slope*Q), floor, ceiling)."""
+
+    name: str = "log-linear"
+    intercept: float = -0.3
+    slope: float = -0.08
+    floor: float = 1e-7
+    ceiling: float = 0.5
+
+    def __call__(self, q_scores: torch.Tensor) -> torch.Tensor:
+        log10_p = self.intercept + self.slope * q_scores.float()
+        return (10.0 ** log10_p).clamp(min=self.floor, max=self.ceiling)
+
+
+@dataclass
+class SigmoidCalibration(QualityCalibration):
+    """Logistic sigmoid: P = floor + (ceiling-floor) * sigma(-k*(Q-mid))."""
+
+    name: str = "sigmoid"
+    steepness: float = 0.25
+    midpoint: float = 15.0
+    floor: float = 1e-6
+    ceiling: float = 0.5
+
+    def __call__(self, q_scores: torch.Tensor) -> torch.Tensor:
+        x = -self.steepness * (q_scores.float() - self.midpoint)
+        return self.floor + (self.ceiling - self.floor) * torch.sigmoid(x)
+
+
+# Noise scales for per-run variability perturbation of calibration parameters
+_QCAL_NOISE_SCALES: dict[str, float] = {
+    "intercept": 0.15,
+    "slope": 0.01,
+    "steepness": 0.05,
+    "midpoint": 2.0,
+}
+
+
+def build_quality_calibration(
+    model_name: str,
+    variability: float,
+    rng: torch.Generator,
+    *,
+    intercept: float = -0.3,
+    slope: float = -0.08,
+    floor: float = 1e-7,
+    ceiling: float = 0.5,
+    steepness: float = 0.25,
+    midpoint: float = 15.0,
+) -> QualityCalibration:
+    """Build a quality-calibration model, optionally with per-run noise.
+
+    Parameters
+    ----------
+    model_name : str
+        One of ``"phred"``, ``"log-linear"``, ``"sigmoid"``.
+    variability : float
+        Multiplier for per-run parameter noise. 0 means no perturbation.
+    rng : torch.Generator
+        Random number generator for reproducible noise.
+    intercept, slope : float
+        Parameters for the log-linear model.
+    floor, ceiling : float
+        Hard bounds on predicted error probability (log-linear and sigmoid).
+    steepness, midpoint : float
+        Parameters for the sigmoid model.
+
+    Returns
+    -------
+    QualityCalibration
+
+    """
+    if variability > 0:
+        noise = torch.randn(4, generator=rng)
+        intercept += variability * _QCAL_NOISE_SCALES["intercept"] * noise[0].item()
+        slope += variability * _QCAL_NOISE_SCALES["slope"] * noise[1].item()
+        steepness += variability * _QCAL_NOISE_SCALES["steepness"] * noise[2].item()
+        midpoint += variability * _QCAL_NOISE_SCALES["midpoint"] * noise[3].item()
+
+    if model_name == "phred":
+        cal = PhredCalibration()
+        logger.info("Quality calibration: phred (theoretical)")
+        return cal
+
+    if model_name == "log-linear":
+        cal = LogLinearCalibration(
+            intercept=intercept, slope=slope, floor=floor, ceiling=ceiling,
+        )
+        logger.info(
+            "Quality calibration: log-linear (intercept=%.4f, slope=%.4f, "
+            "floor=%.1e, ceiling=%.2f)",
+            intercept, slope, floor, ceiling,
+        )
+        return cal
+
+    if model_name == "sigmoid":
+        cal = SigmoidCalibration(
+            steepness=steepness, midpoint=midpoint, floor=floor, ceiling=ceiling,
+        )
+        logger.info(
+            "Quality calibration: sigmoid (steepness=%.4f, midpoint=%.2f, "
+            "floor=%.1e, ceiling=%.2f)",
+            steepness, midpoint, floor, ceiling,
+        )
+        return cal
+
+    raise ValueError(f"Unknown quality calibration model: {model_name!r}")
+
+
+@dataclass
 class ErrorModelProfile:
     """HMM-based sequencing error model parameters."""
 
@@ -300,6 +430,7 @@ def apply_errors_to_sequence(
     quality_scores: torch.Tensor,
     profile: ErrorModelProfile,
     rng: torch.Generator,
+    calibration: QualityCalibration | None = None,
 ) -> tuple[str, str, list[tuple[int, int]]]:
     """Apply errors to a sequence based on quality scores.
 
@@ -332,7 +463,10 @@ def apply_errors_to_sequence(
     q_scores = quality_scores[:ref_len]
 
     # --- Vectorised random draws ---
-    p_error = 10.0 ** (-q_scores.float() / 10.0)
+    if calibration is not None:
+        p_error = calibration(q_scores)
+    else:
+        p_error = 10.0 ** (-q_scores.float() / 10.0)
     is_error = torch.rand(ref_len, generator=rng) < p_error
 
     error_type_weights = torch.tensor(
@@ -739,6 +873,7 @@ def apply_error_model(
     read_batch: ReadBatch,
     profile: ErrorModelProfile | None,
     rng: torch.Generator,
+    calibration: QualityCalibration | None = None,
 ) -> ReadBatch:
     """Apply HMM-based sequencing error model to reads.
 
@@ -787,7 +922,7 @@ def apply_error_model(
     modified: list[Read] = []
     for read, q_scores in zip(flat_reads, all_q_scores):
         new_seq, new_qual, cigar = apply_errors_to_sequence(
-            read.sequence, q_scores, profile, rng
+            read.sequence, q_scores, profile, rng, calibration
         )
         modified.append(Read(
             name=read.name,
@@ -1025,6 +1160,54 @@ def write_bam(
     default="none",
     help="Sequencing error model profile",
 )
+@click.option(
+    "--quality-calibration-model",
+    type=click.Choice(["phred", "log-linear", "sigmoid"], case_sensitive=False),
+    default="phred",
+    help="Quality-score-to-error-rate calibration model",
+)
+@click.option(
+    "--qcal-variability",
+    default=0.0,
+    type=float,
+    help="Per-run noise multiplier for calibration parameters; 0 = no noise",
+)
+@click.option(
+    "--qcal-intercept",
+    default=-0.3,
+    type=float,
+    help="Log-linear model intercept (log10 scale)",
+)
+@click.option(
+    "--qcal-slope",
+    default=-0.08,
+    type=float,
+    help="Log-linear model slope",
+)
+@click.option(
+    "--qcal-floor",
+    default=1e-7,
+    type=float,
+    help="Minimum error probability (log-linear and sigmoid)",
+)
+@click.option(
+    "--qcal-ceiling",
+    default=0.5,
+    type=float,
+    help="Maximum error probability (log-linear and sigmoid)",
+)
+@click.option(
+    "--qcal-steepness",
+    default=0.25,
+    type=float,
+    help="Sigmoid model steepness",
+)
+@click.option(
+    "--qcal-midpoint",
+    default=15.0,
+    type=float,
+    help="Sigmoid model midpoint (Q-score at inflection)",
+)
 def main(
     input_csv: Path,
     num_reads: int,
@@ -1037,6 +1220,14 @@ def main(
     output_prefix: str,
     seed: int | None,
     error_model: str,
+    quality_calibration_model: str,
+    qcal_variability: float,
+    qcal_intercept: float,
+    qcal_slope: float,
+    qcal_floor: float,
+    qcal_ceiling: float,
+    qcal_steepness: float,
+    qcal_midpoint: float,
 ) -> None:
     """Generate simulated WGS reads from reference genomes."""
     logging.basicConfig(
@@ -1061,6 +1252,19 @@ def main(
         "nanopore": default_nanopore_profile,
     }
     profile = profile_map[error_model]() if error_model != "none" else None
+
+    # Build quality calibration model
+    calibration = build_quality_calibration(
+        model_name=quality_calibration_model,
+        variability=qcal_variability,
+        rng=rng,
+        intercept=qcal_intercept,
+        slope=qcal_slope,
+        floor=qcal_floor,
+        ceiling=qcal_ceiling,
+        steepness=qcal_steepness,
+        midpoint=qcal_midpoint,
+    )
 
     # Load genomes
     genomes, abundances = load_genomes(input_csv)
@@ -1092,7 +1296,7 @@ def main(
         paired_end=paired_end,
         rng=rng,
     )
-    read_batch = apply_error_model(read_batch, profile, rng)
+    read_batch = apply_error_model(read_batch, profile, rng, calibration)
 
     if read_batch.is_paired:
         assert read_batch.paired is not None
