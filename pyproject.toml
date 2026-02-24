@@ -1,0 +1,22 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "genome-blender"
+version = "0.1.0"
+description = "Synthetic whole genome sequencing data generator for benchmarking bioinformatics pipelines"
+requires-python = ">=3.10"
+dependencies = [
+    "click",
+    "biopython",
+    "pysam",
+    "torch",
+    "pyro-ppl",
+]
+
+[project.optional-dependencies]
+dev = ["pytest"]
+
+[project.scripts]
+generate-reads = "generate_reads:main"
