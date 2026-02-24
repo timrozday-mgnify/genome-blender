@@ -17,7 +17,7 @@ A ground-truth record of all introduced variants and the true origin of each rea
 
 - Primary language: **Python** (3.10+)
 - Performance-critical components may be rewritten in **Rust** with Python bindings (via PyO3/maturin)
-- CLI framework: **Typer** (with `Annotated` type hints for options)
+- CLI framework: **Typer** (with `Annotated` type hints for options); supports `--config` YAML files via **PyYAML**
 - Probability distributions: **pyro.distributions** (wraps torch.distributions) -- use `pyro.distributions.NegativeBinomial`, `LogNormal`, etc.
 - Use **torch** for random number generation and tensor operations
 - Use **numpy** for numerical work where torch is not needed

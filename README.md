@@ -60,7 +60,9 @@ ecoli,/path/to/ecoli.fasta,0.7
 staph,/path/to/staph.fasta,0.3
 ```
 
-Generate reads:
+### Command-line options
+
+Generate reads by passing options directly:
 
 ```bash
 # Single-end, no error model
@@ -77,6 +79,62 @@ python generate_reads.py --input-csv genomes.csv --num-reads 500 --output-prefix
     --error-model nanopore --seed 42
 ```
 
+### YAML configuration file
+
+Instead of specifying every option on the command line, you can provide a YAML config file with `--config`. Keys use the same names as CLI options (hyphens or underscores both work). Any option passed on the command line takes precedence over the config file value.
+
+```bash
+# Run entirely from a config file
+python generate_reads.py --config my_config.yaml
+
+# Config file with CLI overrides
+python generate_reads.py --config my_config.yaml --num-reads 5000 --seed 99
+```
+
+An example config file is provided at [`example_config.yaml`](example_config.yaml):
+
+```yaml
+# --- Required --------------------------------------------------------
+input_csv: genomes.csv
+num_reads: 10000
+output_prefix: output/sim_reads
+
+# --- Fragment generation ---------------------------------------------
+fragment_mean: 300.0
+fragment_variance: 300.0
+
+# --- Read generation -------------------------------------------------
+read_length_mean: 150.0
+read_length_variance: 10.0
+paired_end: true
+
+# --- GC bias ---------------------------------------------------------
+gc_bias_strength: 0.0  # 0 = no bias
+
+# --- Amplicon mode ---------------------------------------------------
+amplicon: false  # set true to skip shearing and replicate input sequences
+
+# --- Error model -----------------------------------------------------
+# Options: none, illumina, pacbio, nanopore
+error_model: illumina
+
+# --- Quality calibration ---------------------------------------------
+# Options: phred, log-linear, sigmoid
+quality_calibration_model: phred
+qcal_variability: 0.0
+qcal_intercept: -0.3
+qcal_slope: -0.08
+qcal_floor: 1.0e-7
+qcal_ceiling: 0.5
+qcal_steepness: 0.25
+qcal_midpoint: 15.0
+
+# --- Reproducibility -------------------------------------------------
+seed: 42
+```
+
+The three required parameters (`input_csv`, `num_reads`, `output_prefix`) must be provided either in the config file or on the command line.
+
 ## Requirements
 
 - Python 3.10+
@@ -84,7 +142,8 @@ python generate_reads.py --input-csv genomes.csv --num-reads 500 --output-prefix
 - Pyro-PPL
 - pysam
 - Biopython
-- Click
+- Typer
+- PyYAML
 
 ## License
 

@@ -1,0 +1,43 @@
+# genome-blender configuration
+#
+# All keys correspond to CLI options (use hyphens or underscores).
+# Values set here act as defaults -- any option passed on the command
+# line will override the corresponding value from this file.
+
+# --- Required --------------------------------------------------------
+input_csv: genomes.csv
+num_reads: 10000
+output_prefix: output/sim_reads
+
+# --- Fragment generation ---------------------------------------------
+fragment_mean: 300.0
+fragment_variance: 300.0
+
+# --- Read generation -------------------------------------------------
+read_length_mean: 150.0
+read_length_variance: 10.0
+paired_end: true
+
+# --- GC bias ---------------------------------------------------------
+gc_bias_strength: 0.0  # 0 = no bias
+
+# --- Amplicon mode ---------------------------------------------------
+amplicon: false  # set true to skip shearing and replicate input sequences
+
+# --- Error model -----------------------------------------------------
+# Options: none, illumina, pacbio, nanopore
+error_model: illumina
+
+# --- Quality calibration ---------------------------------------------
+# Options: phred, log-linear, sigmoid
+quality_calibration_model: phred
+qcal_variability: 0.0
+qcal_intercept: -0.3
+qcal_slope: -0.08
+qcal_floor: 1.0e-7
+qcal_ceiling: 0.5
+qcal_steepness: 0.25
+qcal_midpoint: 15.0
+
+# --- Reproducibility -------------------------------------------------
+seed: 42

@@ -9,6 +9,7 @@ description = "Synthetic whole genome sequencing data generator for benchmarking
 requires-python = ">=3.10"
 dependencies = [
     "typer",
+    "pyyaml",
     "biopython",
     "pysam",
     "torch",

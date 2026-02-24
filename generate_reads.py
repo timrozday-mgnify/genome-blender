@@ -12,14 +12,15 @@ import csv
 import logging
 import math
 from dataclasses import dataclass
-from pathlib import Path
-
 from enum import Enum
+from pathlib import Path
 from typing import Annotated
 
+import click.core
 import pysam
-import typer
 import torch
+import typer
+import yaml
 from Bio import SeqIO
 from Bio.Seq import Seq
 from pyro.distributions import Categorical as PyroCategorical
@@ -42,6 +43,69 @@ class QualityCalibrationModel(str, Enum):
     phred = "phred"
     log_linear = "log-linear"
     sigmoid = "sigmoid"
+
+
+# Mapping from YAML key names to the enum classes that need conversion
+_ENUM_PARAMS: dict[str, type[Enum]] = {
+    "error_model": ErrorModel,
+    "quality_calibration_model": QualityCalibrationModel,
+}
+
+
+def _load_yaml_config(config_path: Path) -> dict[str, object]:
+    """Load a YAML config file and normalise keys to snake_case.
+
+    Parameters
+    ----------
+    config_path : Path
+        Path to the YAML configuration file.
+
+    Returns
+    -------
+    dict mapping parameter names (snake_case) to values.
+
+    Raises
+    ------
+    typer.BadParameter
+        If the file doesn't contain a YAML mapping.
+
+    """
+    with open(config_path) as fh:
+        data = yaml.safe_load(fh)
+    if not isinstance(data, dict):
+        raise typer.BadParameter(
+            f"Config file must contain a YAML mapping, got {type(data).__name__}"
+        )
+    # Normalise kebab-case keys to snake_case
+    return {k.replace("-", "_"): v for k, v in data.items()}
+
+
+def _apply_yaml_config(
+    ctx: typer.Context,
+    config: dict[str, object],
+) -> None:
+    """Override default-valued CLI parameters with YAML config values.
+
+    Only parameters whose source is DEFAULT (i.e. not explicitly provided
+    on the command line) are overridden. Enum-typed parameters are
+    converted from their string values.
+
+    Parameters
+    ----------
+    ctx : typer.Context
+        Typer/Click invocation context.
+    config : dict
+        Parsed YAML config (snake_case keys).
+
+    """
+    for key, value in config.items():
+        source = ctx.get_parameter_source(key)
+        if source is not click.core.ParameterSource.COMMANDLINE:
+            if key in _ENUM_PARAMS and isinstance(value, str):
+                value = _ENUM_PARAMS[key](value)
+            elif key == "input_csv" and isinstance(value, str):
+                value = Path(value)
+            ctx.params[key] = value
 
 
 @dataclass
@@ -1193,11 +1257,19 @@ def write_bam(
 
 @app.command()
 def main(
-    input_csv: Annotated[Path, typer.Option(
+    ctx: typer.Context,
+    config: Annotated[Path | None, typer.Option(
+        help="YAML config file (CLI options override config values)",
+    )] = None,
+    input_csv: Annotated[Path | None, typer.Option(
         help="CSV with columns: genome_id, fasta_path, abundance",
-    )],
-    num_reads: Annotated[int, typer.Option(help="Total number of reads to generate")],
-    output_prefix: Annotated[str, typer.Option(help="Output file prefix")],
+    )] = None,
+    num_reads: Annotated[int | None, typer.Option(
+        help="Total number of reads to generate",
+    )] = None,
+    output_prefix: Annotated[str | None, typer.Option(
+        help="Output file prefix",
+    )] = None,
     fragment_mean: Annotated[float, typer.Option(help="Mean fragment length")] = 300.0,
     fragment_variance: Annotated[float, typer.Option(
         help="Variance of fragment length (Negative Binomial)",
@@ -1249,10 +1321,50 @@ def main(
     )] = 15.0,
     amplicon: Annotated[bool, typer.Option(
         "--amplicon/--no-amplicon",
-        help="Treat input sequences as amplicons (no shearing); replicate proportionally to abundance",
+        help="Treat input sequences as amplicons (no shearing); "
+        "replicate proportionally to abundance",
     )] = False,
 ) -> None:
     """Generate simulated WGS reads from reference genomes."""
+    # Apply YAML config: values from the file fill in anything not
+    # explicitly provided on the command line.
+    if config is not None:
+        _apply_yaml_config(ctx, _load_yaml_config(config))
+        # Re-read parameters that may have been overridden by config.
+        # ctx.params holds raw click values, so enum/Path types need
+        # explicit conversion.
+        p = ctx.params
+        input_csv = Path(p["input_csv"]) if p.get("input_csv") else None
+        num_reads = p.get("num_reads")
+        output_prefix = p.get("output_prefix")
+        fragment_mean = p["fragment_mean"]
+        fragment_variance = p["fragment_variance"]
+        read_length_mean = p["read_length_mean"]
+        read_length_variance = p["read_length_variance"]
+        gc_bias_strength = p["gc_bias_strength"]
+        paired_end = p["paired_end"]
+        seed = p.get("seed")
+        error_model = ErrorModel(p["error_model"])
+        quality_calibration_model = QualityCalibrationModel(
+            p["quality_calibration_model"]
+        )
+        qcal_variability = p["qcal_variability"]
+        qcal_intercept = p["qcal_intercept"]
+        qcal_slope = p["qcal_slope"]
+        qcal_floor = p["qcal_floor"]
+        qcal_ceiling = p["qcal_ceiling"]
+        qcal_steepness = p["qcal_steepness"]
+        qcal_midpoint = p["qcal_midpoint"]
+        amplicon = p["amplicon"]
+
+    # Validate required parameters
+    if input_csv is None:
+        raise typer.BadParameter("--input-csv is required (via CLI or config)")
+    if num_reads is None:
+        raise typer.BadParameter("--num-reads is required (via CLI or config)")
+    if output_prefix is None:
+        raise typer.BadParameter("--output-prefix is required (via CLI or config)")
+
     logging.basicConfig(
         level=logging.INFO,
         format="%(asctime)s %(levelname)s %(message)s",
