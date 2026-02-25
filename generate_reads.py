@@ -16,7 +16,23 @@ from enum import Enum
 from pathlib import Path
 from typing import Annotated
 
-from alive_progress import alive_bar
+import sys
+from contextlib import contextmanager
+
+from alive_progress import alive_bar as _alive_bar_orig
+
+
+@contextmanager
+def alive_bar(*args, **kwargs):
+    """Wrap alive_bar to gracefully handle closed file descriptors."""
+    try:
+        is_tty = sys.stderr.isatty()
+    except ValueError:
+        is_tty = False
+    if not is_tty:
+        kwargs["disable"] = True
+    with _alive_bar_orig(*args, **kwargs) as bar:
+        yield bar
 
 import click.core
 import pysam
@@ -715,10 +731,10 @@ def _nb_params_from_mean_variance(
         )
         return "poisson", {"rate": mean}
 
-    # NB parameterisation: total_count = r = mu^2 / (sigma^2 - mu)
-    # probs = p = mu / sigma^2
+    # Pyro NB parameterisation: mean = r*p/(1-p), var = r*p/(1-p)^2
+    # Solving: r = mu^2 / (sigma^2 - mu), p = 1 - mu / sigma^2
     r = mean**2 / (variance - mean)
-    p = mean / variance
+    p = 1.0 - mean / variance
     return "nb", {"total_count": r, "probs": p}
 
 
