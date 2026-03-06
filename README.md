@@ -153,6 +153,34 @@ Build a container image with:
 docker buildx build -t <tool-name> containers/<tool>/
 ```
 
+## Comparison with other simulators
+
+Several existing tools address overlapping aspects of read simulation. genome-blender aims to combine metagenome-aware abundance modelling, configurable error profiles, and full ground-truth tracking in a single Python toolkit.
+
+| Feature | genome-blender | [NEAT](https://github.com/ncsa/NEAT) | [CAMISIM](https://github.com/CAMI-challenge/CAMISIM) | [ART](https://www.niehs.nih.gov/research/resources/software/biostatistics/art) | [InSilicoSeq](https://github.com/HadrienG/InSilicoSeq) |
+|---------|---------------|------|---------|-----|-------------|
+| Language | Python | Python | Nextflow + Python | C++ | Python |
+| Metagenome mixing | Yes (CSV abundances) | No (single genome) | Yes (community profiles) | No (single genome) | Yes (abundances) |
+| Paired-end reads | Yes (FR orientation) | Yes (FR orientation) | Yes (via ART/wgsim) | Yes (FR orientation) | Yes |
+| Error models | HMM-based (Illumina, PacBio, ONT) | Empirical (learned from BAM) | Delegates to ART/wgsim/NanoSim | Empirical profiles | KDE from real data |
+| Quality calibration | Phred / log-linear / sigmoid | Learned from data | Via backend simulator | Empirical | KDE |
+| GC bias | Configurable accept/reject | No | No | No | Yes |
+| Fragment model | NegativeBinomial / Poisson / fixed | Empirical (learned from BAM) | Configurable mean/sd | Configurable mean/sd | Empirical |
+| Ground-truth BAM | Yes | Yes (with golden VCF) | No | Yes (SAM output) | No |
+| Amplicon mode | Yes | No | No | No | No |
+| Long read support | Yes (ONT, PacBio profiles) | No | Yes (via NanoSim) | No | No |
+| Variant simulation | Planned | Yes (SNPs, indels, SVs) | Yes (via sgEvolver) | No | No |
+| Config format | YAML + CLI | YAML | INI / Nextflow | CLI only | CLI |
+
+### Paired-end implementation
+
+All tools that generate paired-end reads from scratch use the same FR (forward-reverse) orientation, matching the Illumina sequencing chemistry:
+
+- **R1** is sequenced from the 5' end of the forward strand of the fragment
+- **R2** is the reverse complement of the 3' end of the fragment
+
+In genome-blender: `r1_seq = fragment[:read_len]`, `r2_seq = revcomp(fragment[-read_len:])`. NEAT applies the same logic: it extracts the forward segment for R1 and applies `reverse_complement()` to the reverse segment for R2. CAMISIM delegates paired-end generation entirely to ART (`art_illumina -p`) or wgsim, which implement the same FR convention internally.
+
 ## Requirements
 
 - Python 3.10+
