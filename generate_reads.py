@@ -1657,7 +1657,9 @@ def main(
         num_fragments, num_chunks, chunk_size,
     )
 
-    # Set up output paths
+    # Set up output paths, creating parent directories if needed
+    output_dir = Path(output_prefix).parent
+    output_dir.mkdir(parents=True, exist_ok=True)
     bam_path = Path(f"{output_prefix}.bam")
     if paired_end:
         r1_path = Path(f"{output_prefix}_R1.fastq")
