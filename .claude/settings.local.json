@@ -24,7 +24,13 @@
       "WebFetch(domain:pmc.ncbi.nlm.nih.gov)",
       "Bash(cat:*)",
       "Bash(ls:*)",
-      "Bash(docker buildx:*)"
+      "Bash(docker buildx:*)",
+      "Bash(chmod +x:*)",
+      "WebFetch(domain:ablab.github.io)",
+      "WebFetch(domain:en.wikipedia.org)",
+      "WebFetch(domain:knowledge.illumina.com)",
+      "WebFetch(domain:seekdeep.brown.edu)",
+      "WebFetch(domain:www.cureffi.org)"
     ]
   }
 }

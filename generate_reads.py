@@ -1329,6 +1329,50 @@ def build_bam_header(
     return header, ref_name_to_idx
 
 
+def _ref_consumed(cigar: list[tuple[int, int]]) -> int:
+    """Return the number of reference bases consumed by a CIGAR."""
+    # M=0 and D=2 consume reference bases
+    return sum(length for op, length in cigar if op in (0, 2))
+
+
+def _bam_fields_for_read(
+    read: Read,
+    frag: Fragment,
+    is_reverse: bool,
+) -> tuple[str, str, list[tuple[int, int]], int]:
+    """Compute BAM-ready sequence, quality, CIGAR, and ref_start.
+
+    SAM stores query_sequence on the forward strand. When the read
+    maps to the reverse strand, sequence and quality must be reversed
+    and complemented, and the CIGAR must be reversed. The
+    reference_start is computed from the fragment end for
+    reverse-strand reads.
+
+    Returns
+    -------
+    tuple of (query_sequence, quality, cigar, reference_start)
+
+    """
+    cigar = (
+        read.cigar if read.cigar is not None
+        else [(0, len(read.sequence))]
+    )
+    if is_reverse:
+        ref_span = _ref_consumed(cigar)
+        return (
+            _reverse_complement(read.sequence),
+            read.quality[::-1],
+            list(reversed(cigar)),
+            frag.end - ref_span,
+        )
+    return (
+        read.sequence,
+        read.quality,
+        cigar,
+        frag.start,
+    )
+
+
 def write_bam_chunk(
     bam: pysam.AlignmentFile,
     header: pysam.AlignmentHeader,
@@ -1352,25 +1396,45 @@ def write_bam_chunk(
         Generated reads (single-end or paired-end).
 
     """
+    tlen = 0
     with alive_bar(
         len(fragments), title="Writing BAM",
     ) as bar:
         for i, frag in enumerate(fragments):
             ref_name = f"{frag.genome_id}:{frag.contig_id}"
             ref_id = ref_name_to_idx[ref_name]
+            tlen = frag.end - frag.start
 
             if read_batch.is_paired:
                 assert read_batch.paired is not None
                 r1, r2 = read_batch.paired[i]
                 qname = r1.name.split("/")[0]
 
+                # + strand: R1 forward at frag.start,
+                #           R2 reverse at frag.end
+                # - strand: R1 reverse at frag.end,
+                #           R2 forward at frag.start
                 r1_is_reverse = frag.strand == "-"
                 r2_is_reverse = not r1_is_reverse
+
+                r1_seq, r1_qual, r1_cigar, r1_start = (
+                    _bam_fields_for_read(r1, frag, r1_is_reverse)
+                )
+                r2_seq, r2_qual, r2_cigar, r2_start = (
+                    _bam_fields_for_read(r2, frag, r2_is_reverse)
+                )
+
+                # Template length: positive for leftmost read,
+                # negative for rightmost
+                if r1_start <= r2_start:
+                    r1_tlen, r2_tlen = tlen, -tlen
+                else:
+                    r1_tlen, r2_tlen = -tlen, tlen
 
                 # R1
                 a1 = pysam.AlignedSegment(header)
                 a1.query_name = qname
-                a1.query_sequence = r1.sequence
+                a1.query_sequence = r1_seq
                 a1.flag = 0
                 a1.is_paired = True
                 a1.is_proper_pair = True
@@ -1378,24 +1442,20 @@ def write_bam_chunk(
                 a1.is_reverse = r1_is_reverse
                 a1.mate_is_reverse = r2_is_reverse
                 a1.reference_id = ref_id
-                a1.reference_start = frag.start
-                a1.cigar = (
-                    r1.cigar if r1.cigar is not None
-                    else [(0, len(r1.sequence))]
-                )
+                a1.reference_start = r1_start
+                a1.cigar = r1_cigar
                 a1.mapping_quality = 255
                 a1.query_qualities = (
-                    pysam.qualitystring_to_array(r1.quality)
+                    pysam.qualitystring_to_array(r1_qual)
                 )
                 a1.next_reference_id = ref_id
-                r2_start = frag.end - len(r2.sequence)
                 a1.next_reference_start = r2_start
-                a1.template_length = frag.end - frag.start
+                a1.template_length = r1_tlen
 
                 # R2
                 a2 = pysam.AlignedSegment(header)
                 a2.query_name = qname
-                a2.query_sequence = r2.sequence
+                a2.query_sequence = r2_seq
                 a2.flag = 0
                 a2.is_paired = True
                 a2.is_proper_pair = True
@@ -1404,37 +1464,35 @@ def write_bam_chunk(
                 a2.mate_is_reverse = r1_is_reverse
                 a2.reference_id = ref_id
                 a2.reference_start = r2_start
-                a2.cigar = (
-                    r2.cigar if r2.cigar is not None
-                    else [(0, len(r2.sequence))]
-                )
+                a2.cigar = r2_cigar
                 a2.mapping_quality = 255
                 a2.query_qualities = (
-                    pysam.qualitystring_to_array(r2.quality)
+                    pysam.qualitystring_to_array(r2_qual)
                 )
                 a2.next_reference_id = ref_id
-                a2.next_reference_start = frag.start
-                a2.template_length = -(frag.end - frag.start)
+                a2.next_reference_start = r1_start
+                a2.template_length = r2_tlen
 
                 bam.write(a1)
                 bam.write(a2)
             else:
                 assert read_batch.single is not None
                 read = read_batch.single[i]
+                is_reverse = frag.strand == "-"
+                seq, qual, cigar, ref_start = (
+                    _bam_fields_for_read(read, frag, is_reverse)
+                )
                 a = pysam.AlignedSegment(header)
                 a.query_name = read.name
-                a.query_sequence = read.sequence
+                a.query_sequence = seq
                 a.flag = 0
-                a.is_reverse = frag.strand == "-"
+                a.is_reverse = is_reverse
                 a.reference_id = ref_id
-                a.reference_start = frag.start
-                a.cigar = (
-                    read.cigar if read.cigar is not None
-                    else [(0, len(read.sequence))]
-                )
+                a.reference_start = ref_start
+                a.cigar = cigar
                 a.mapping_quality = 255
                 a.query_qualities = (
-                    pysam.qualitystring_to_array(read.quality)
+                    pysam.qualitystring_to_array(qual)
                 )
                 bam.write(a)
             bar()
