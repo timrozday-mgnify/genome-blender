@@ -30,3 +30,13 @@ docker run --rm \
             > "/output/assembly_graph.k${k}.fastg"
         echo "Wrote assembly_graph.k${k}.fastg"
     '
+
+# Convert FASTG to GFA
+FASTG=$(ls "${OUTPUT_DIR}"/assembly_graph.k*.fastg)
+K_FASTG=$(basename "${FASTG}" .fastg)
+docker run --rm \
+    -v "${OUTPUT_DIR}:/output" \
+    quay.io/biocontainers/gfatools:0.5.5--h577a1d6_0 \
+    gfatools view -S "/output/${K_FASTG}.fastg" \
+    > "${OUTPUT_DIR}/${K_FASTG}.gfa"
+echo "Wrote ${K_FASTG}.gfa"

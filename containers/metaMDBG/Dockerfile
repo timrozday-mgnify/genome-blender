@@ -26,6 +26,7 @@ ARG DEBIAN_FRONTEND=noninteractive
 
 RUN apt-get update && apt-get install -y --no-install-recommends \
         zlib1g \
+        libgomp1 \
         minimap2 \
         time \
     && rm -rf /var/lib/apt/lists/*

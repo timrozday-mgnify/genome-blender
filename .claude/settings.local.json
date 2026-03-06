@@ -31,7 +31,9 @@
       "WebFetch(domain:knowledge.illumina.com)",
       "WebFetch(domain:seekdeep.brown.edu)",
       "WebFetch(domain:www.cureffi.org)",
-      "WebFetch(domain:www.niehs.nih.gov)"
+      "WebFetch(domain:www.niehs.nih.gov)",
+      "Bash(bash:*)",
+      "Bash(docker run:*)"
     ]
   }
 }
