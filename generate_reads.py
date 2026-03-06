@@ -809,25 +809,32 @@ def sample_fragments(
             counts[idx] += 1
 
     # Set up fragment length distribution
-    dist_name, dist_params = _nb_params_from_mean_variance(
-        fragment_mean, fragment_variance
-    )
-    if dist_name == "nb":
-        frag_dist = NegativeBinomial(
-            total_count=dist_params["total_count"],
-            probs=dist_params["probs"],
-        )
+    if fragment_variance == 0:
+        frag_dist = None
         logger.debug(
-            "Fragment length distribution: NegativeBinomial"
-            "(r=%.2f, p=%.4f)",
-            dist_params["total_count"], dist_params["probs"],
+            "Fragment length distribution: fixed at %d",
+            int(fragment_mean),
         )
     else:
-        frag_dist = Poisson(rate=dist_params["rate"])
-        logger.debug(
-            "Fragment length distribution: Poisson(rate=%.2f)",
-            dist_params["rate"],
+        dist_name, dist_params = _nb_params_from_mean_variance(
+            fragment_mean, fragment_variance
         )
+        if dist_name == "nb":
+            frag_dist = NegativeBinomial(
+                total_count=dist_params["total_count"],
+                probs=dist_params["probs"],
+            )
+            logger.debug(
+                "Fragment length distribution: NegativeBinomial"
+                "(r=%.2f, p=%.4f)",
+                dist_params["total_count"], dist_params["probs"],
+            )
+        else:
+            frag_dist = Poisson(rate=dist_params["rate"])
+            logger.debug(
+                "Fragment length distribution: Poisson(rate=%.2f)",
+                dist_params["rate"],
+            )
 
     for gid in genome_ids:
         logger.debug(
@@ -867,7 +874,12 @@ def sample_fragments(
                 contig_len = len(record.seq)
 
                 # Sample fragment length
-                frag_len = int(frag_dist.sample().clamp(min=1).item())
+                if frag_dist is None:
+                    frag_len = max(1, int(fragment_mean))
+                else:
+                    frag_len = int(
+                        frag_dist.sample().clamp(min=1).item()
+                    )
                 if frag_len > contig_len:
                     rejected += 1
                     continue
@@ -1055,14 +1067,21 @@ def generate_reads(
     # which is seeded in main() via torch.manual_seed()
     _ = rng
 
-    mu_ln, sigma_ln = _lognormal_params_from_mean_variance(
-        read_length_mean, read_length_variance
-    )
-    read_len_dist = LogNormal(loc=mu_ln, scale=sigma_ln)
-    logger.debug(
-        "Read length distribution: LogNormal(mu=%.4f, sigma=%.4f)",
-        mu_ln, sigma_ln,
-    )
+    if read_length_variance == 0:
+        read_len_dist = None
+        logger.debug(
+            "Read length distribution: fixed at %d",
+            int(read_length_mean),
+        )
+    else:
+        mu_ln, sigma_ln = _lognormal_params_from_mean_variance(
+            read_length_mean, read_length_variance
+        )
+        read_len_dist = LogNormal(loc=mu_ln, scale=sigma_ln)
+        logger.debug(
+            "Read length distribution: LogNormal(mu=%.4f, sigma=%.4f)",
+            mu_ln, sigma_ln,
+        )
 
     mode = "paired-end" if paired_end else "single-end"
     se_reads: list[Read] = []
@@ -1074,9 +1093,12 @@ def generate_reads(
         for i, frag in enumerate(fragments):
             global_idx = read_index_offset + i
             frag_len = len(frag.sequence)
-            sampled_len = int(
-                read_len_dist.sample().clamp(min=1).item()
-            )
+            if read_len_dist is None:
+                sampled_len = max(1, int(read_length_mean))
+            else:
+                sampled_len = int(
+                    read_len_dist.sample().clamp(min=1).item()
+                )
             read_len = min(sampled_len, frag_len)
 
             base_name = (
