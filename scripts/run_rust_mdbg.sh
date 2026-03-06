@@ -14,9 +14,9 @@ docker run --rm \
     --entrypoint rust-mdbg \
     rust-mdbg \
     /output/combined_reads.fastq \
-    -k 4 \
+    -k 5 \
     --density 0.1 \
-    -l 8 \
+    -l 5 \
     --minabund 2 \
     --prefix /output/rust_mdbg_out
 

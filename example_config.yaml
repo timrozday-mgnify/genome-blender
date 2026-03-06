@@ -28,6 +28,9 @@ amplicon: false  # set true to skip shearing and replicate input sequences
 # Options: none, illumina, pacbio, nanopore
 error_model: illumina
 
+# --- Error rate scaling ----------------------------------------------
+error_rate_scale: 1.0  # multiplier on error probabilities; <1 fewer errors, >1 more
+
 # --- Quality calibration ---------------------------------------------
 # Options: phred, log-linear, sigmoid
 quality_calibration_model: phred

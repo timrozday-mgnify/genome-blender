@@ -11,6 +11,7 @@ docker run --rm \
     --entrypoint spades.py \
     quay.io/biocontainers/spades:4.2.0--h8d6e82b_2 \
     --meta \
+    --phred-offset 33 \
     -1 /input/sim_reads_R1.fastq \
     -2 /input/sim_reads_R2.fastq \
     -o /output \

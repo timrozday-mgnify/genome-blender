@@ -531,6 +531,7 @@ def apply_errors_to_sequence(
     profile: ErrorModelProfile,
     rng: torch.Generator,
     calibration: QualityCalibration | None = None,
+    error_rate_scale: float = 1.0,
 ) -> tuple[str, str, list[tuple[int, int]]]:
     """Apply errors to a sequence based on quality scores.
 
@@ -567,6 +568,8 @@ def apply_errors_to_sequence(
         p_error = calibration(q_scores)
     else:
         p_error = 10.0 ** (-q_scores.float() / 10.0)
+    if error_rate_scale != 1.0:
+        p_error = (p_error * error_rate_scale).clamp(max=1.0)
     is_error = torch.rand(ref_len, generator=rng) < p_error
 
     error_type_weights = torch.tensor(
@@ -1153,6 +1156,7 @@ def apply_error_model(
     profile: ErrorModelProfile | None,
     rng: torch.Generator,
     calibration: QualityCalibration | None = None,
+    error_rate_scale: float = 1.0,
 ) -> ReadBatch:
     """Apply HMM-based sequencing error model to reads.
 
@@ -1214,7 +1218,8 @@ def apply_error_model(
     ) as bar:
         for read, q_scores in zip(flat_reads, all_q_scores):
             new_seq, new_qual, cigar = apply_errors_to_sequence(
-                read.sequence, q_scores, profile, rng, calibration
+                read.sequence, q_scores, profile, rng, calibration,
+                error_rate_scale,
             )
             n_bases_total += len(read.sequence)
             n_errors_total += sum(
@@ -1597,6 +1602,10 @@ def main(
     qcal_midpoint: Annotated[float, typer.Option(
         help="Sigmoid model midpoint (Q-score at inflection)",
     )] = 15.0,
+    error_rate_scale: Annotated[float, typer.Option(
+        help="Multiplier applied to error probabilities after quality "
+        "calibration; <1 reduces errors, >1 increases them",
+    )] = 1.0,
     amplicon: Annotated[bool, typer.Option(
         "--amplicon/--no-amplicon",
         help="Treat input sequences as amplicons (no shearing); "
@@ -1637,6 +1646,7 @@ def main(
         qcal_ceiling = p["qcal_ceiling"]
         qcal_steepness = p["qcal_steepness"]
         qcal_midpoint = p["qcal_midpoint"]
+        error_rate_scale = p.get("error_rate_scale", 1.0)
         amplicon = p["amplicon"]
         chunk_size = p.get("chunk_size", 1_000_000)
 
@@ -1800,6 +1810,7 @@ def main(
             )
             read_batch = apply_error_model(
                 read_batch, profile, rng, calibration,
+                error_rate_scale,
             )
 
             # Write FASTQ (append for chunks after the first)
