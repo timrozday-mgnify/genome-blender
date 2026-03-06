@@ -1,19 +1,19 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-INPUT_DIR="$(cd ../genome-blender_run/single_short_shallow/output && pwd)"
+INPUT_DIR="$(cd ../genome-blender_run/single_genome_full/output && pwd)"
 OUTPUT_DIR="${INPUT_DIR}/megahit"
 # megahit requires the output dir not to exist
 rm -rf "${OUTPUT_DIR}"
 
 # Assembly parameters
-K_LIST="21,31,41,51"    # comma-separated odd k-mer sizes (range 15-255)
+K_LIST="31"              # comma-separated odd k-mer sizes (range 15-255)
 BUBBLE_LEVEL=0           # bubble merging intensity (0-2); 0 = disabled
 PRUNE_LEVEL=0            # low-depth pruning strength (0-3); 0 = disabled
 MAX_TIP_LEN=0            # remove tips shorter than this; 0 = keep all
-CLEANING_ROUNDS=0        # graph cleaning iterations; 0 = skip cleaning
+CLEANING_ROUNDS=1        # graph cleaning iterations; 0 = skip cleaning
 DISCONNECT_RATIO=0       # disable unitig removal by depth ratio
-LOW_LOCAL_RATIO=0        # disable neighbourhood depth filtering
+LOW_LOCAL_RATIO=0.01     # disable neighbourhood depth filtering
 MIN_COUNT=1              # minimum k-mer multiplicity; 1 = keep singletons
 
 # Assemble

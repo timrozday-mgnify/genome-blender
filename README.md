@@ -164,26 +164,36 @@ The `scripts/` directory contains ready-to-run shell scripts that execute each t
 
 Runs [cuttlefish3](https://github.com/COMBINE-lab/cuttlefish/tree/cuttlefish3) to build a compacted de Bruijn graph from reads, outputting unitigs as FASTA.
 
-| Argument | Value | Description |
-|----------|-------|-------------|
-| `--read` | — | Treat input as sequencing reads (not reference) |
-| `-k` | `31` | K-mer length (must be odd, max 63) |
-| `-o` | output path | Output file prefix |
-| `-w` | `/tmp/cf3` | Working directory (uses a Docker volume to avoid macOS filesystem issues) |
-| `-c` | `1` | Minimum (k+1)-mer frequency cutoff |
+| Variable | Flag | Default | Description |
+|----------|------|---------|-------------|
+| `K` | `-k` | `31` | K-mer length (must be odd, max 63) |
+| `MIN_LEN` | `--min-len` | `12` | Minimizer length |
+| `CUTOFF` | `-c` | `1` | Minimum (k+1)-mer frequency cutoff (default for reads is 2) |
+| `INPUT_MODE` | `--read`/`--ref` | `--read` | `--read` for FASTQ input, `--ref` for FASTA reference input |
+| `COLOR` | `--color` | `false` | Color the compacted de Bruijn graph |
+| — | `-w` | `/tmp/cf3` | Working directory (uses a Docker volume to avoid macOS filesystem issues) |
+
+Input files are passed as `--seq` arguments. Alternatives: `--list` for a text file of paths, `--dir` for a directory.
 
 #### `run_bifrost.sh` — Compacted coloured de Bruijn graph (GFA)
 
 Runs [Bifrost](https://github.com/pmelsted/bifrost) to build a compacted de Bruijn graph, outputting GFA directly.
 
-| Argument | Value | Description |
-|----------|-------|-------------|
-| `-s` | each FASTQ | Input read files (k-mers occurring once are filtered) |
-| `-k` | `31` | K-mer length |
-| `-o` | output path | Output file prefix |
-| `-i` | — | Clip short tips |
-| `-d` | — | Delete small isolated contigs |
-| `-t` | `4` | Number of threads |
+| Variable | Flag | Default | Description |
+|----------|------|---------|-------------|
+| `K` | `-k` | `31` | K-mer length |
+| `THREADS` | `-t` | `4` | Number of threads |
+| `BLOOM_BITS` | `-B` | `24` | Bloom filter bits per k-mer |
+| `CLIP_TIPS` | `-i` | `true` | Clip tips shorter than k k-mers |
+| `DEL_ISOLATED` | `-d` | `true` | Delete isolated contigs shorter than k k-mers |
+| `COLORS` | `-c` | `false` | Color the compacted de Bruijn graph |
+| `FASTA_OUT` | `-f` | `false` | Output FASTA instead of GFA |
+| `BFG_OUT` | `-b` | `false` | Output bfg/bfi format instead of GFA |
+| `VERBOSE` | `-v` | `false` | Print info messages during execution |
+| `NO_COMPRESS` | `-n` | `false` | Do not compress output files |
+| `NO_INDEX` | `-N` | `false` | Do not make index file |
+
+Input files are passed as `-s` (sequencing reads; k-mers with exactly 1 occurrence are filtered). Use `-r` instead for reference files (all k-mers kept).
 
 #### `run_megahit.sh` — Succinct de Bruijn graph assembly (FASTG → GFA)
 
@@ -207,14 +217,32 @@ Note: MEGAHIT always compacts unitigs — there is no flag to output the uncompa
 
 #### `run_spades.sh` — Metagenomic assembly (GFA)
 
-Runs [SPAdes](https://github.com/ablab/spades) in metagenomic mode. SPAdes natively outputs `assembly_graph.gfa` alongside contigs.
+Runs [SPAdes](https://github.com/ablab/spades) in metagenomic mode with default graph simplification. SPAdes natively outputs `assembly_graph.gfa` alongside contigs.
 
 | Argument | Value | Description |
 |----------|-------|-------------|
 | `--meta` | — | Metagenomic assembly mode |
+| `-k` | `21,31,41,51` | K-mer sizes |
 | `-1`, `-2` | R1, R2 FASTQs | Paired-end input files |
 | `-o` | output path | Output directory |
 | `-t` | `4` | Number of threads |
+
+#### `run_spades_raw.sh` — Metagenomic assembly with simplification disabled (GFA)
+
+Runs [SPAdes](https://github.com/ablab/spades) in metagenomic mode with all graph simplification disabled (no tip clipping, bubble removal, erroneous-connection removal, or isolated-edge removal). This produces a raw de Bruijn graph. Uses the hidden `--configs-dir` flag to supply a patched `simplification.info` and strips the `simp`/`preliminary_simp` overrides from `meta_mode.info`.
+
+| Argument | Value | Description |
+|----------|-------|-------------|
+| `--meta` | — | Metagenomic assembly mode |
+| `--only-assembler` | — | Skip read error correction |
+| `--disable-rr` | — | Skip repeat resolution |
+| `--configs-dir` | custom path | Use patched configs with simplification disabled |
+| `-k` | `31` | K-mer sizes (configurable via `K_LIST`) |
+| `-1`, `-2` | R1, R2 FASTQs | Paired-end input files |
+| `-o` | output path | Output directory |
+| `-t` | `4` | Number of threads |
+
+On first run the script extracts the default SPAdes configs from the container, replaces `simplification.info` with a version where all simplification steps use no-op conditions or are disabled, and removes the `simp` and `preliminary_simp` blocks from `meta_mode.info` (which would otherwise re-enable simplification). The patched configs are cached in the output directory.
 
 #### `run_metaMDBG.sh` — Minimizer-space de Bruijn graph assembly
 

@@ -90,6 +90,18 @@ The `containers/` directory holds Dockerfiles (and occasionally Singularity defi
 - **bifrost** (`containers/bifrost/`) -- parallel construction and indexing of compacted de Bruijn graphs
 - **spades** (`containers/spades/`) -- SPAdes genome assembler (pre-built image from BioContainers, no Dockerfile)
 
+## Run scripts
+
+The `scripts/` directory contains shell scripts that execute external tools via Docker against simulated FASTQ files. Each script has configurable variables at the top for all tool-specific parameters.
+
+- **`run_cuttlefish3.sh`** -- compacted de Bruijn graph from reads (cuttlefish3); parameters: `K`, `MIN_LEN`, `CUTOFF`, `INPUT_MODE`, `COLOR`
+- **`run_bifrost.sh`** -- compacted de Bruijn graph in GFA (Bifrost); parameters: `K`, `THREADS`, `BLOOM_BITS`, `CLIP_TIPS`, `DEL_ISOLATED`, `COLORS`, `FASTA_OUT`, `BFG_OUT`, `VERBOSE`, `NO_COMPRESS`, `NO_INDEX`
+- **`run_megahit.sh`** -- succinct de Bruijn graph assembly with FASTG→GFA conversion (MEGAHIT)
+- **`run_spades.sh`** -- metagenomic assembly with default simplification (SPAdes)
+- **`run_spades_raw.sh`** -- metagenomic assembly with all graph simplification disabled (SPAdes); uses the hidden `--configs-dir` flag with a patched `simplification.info` and stripped `meta_mode.info` to prevent tip clipping, bubble removal, erroneous-connection removal, and isolated-edge removal
+- **`run_metaMDBG.sh`** -- minimizer-space de Bruijn graph assembly (metaMDBG)
+- **`run_rust_mdbg.sh`** -- minimizer-space de Bruijn graph in GFA (rust-mdbg)
+
 ## Existing tools for reference
 
 These tools solve related problems and can inform design decisions:
