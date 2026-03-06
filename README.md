@@ -153,6 +153,92 @@ Build a container image with:
 docker buildx build -t <tool-name> containers/<tool>/
 ```
 
+### Run scripts
+
+The `scripts/` directory contains ready-to-run shell scripts that execute each tool via Docker against simulated FASTQ files. All scripts read paired-end input from `../genome-blender_run/single_short_shallow/output/` and write output to a tool-specific subdirectory alongside the input.
+
+#### `run_cuttlefish3.sh` — Compacted de Bruijn graph (unitigs)
+
+Runs [cuttlefish3](https://github.com/COMBINE-lab/cuttlefish/tree/cuttlefish3) to build a compacted de Bruijn graph from reads, outputting unitigs as FASTA.
+
+| Argument | Value | Description |
+|----------|-------|-------------|
+| `--read` | — | Treat input as sequencing reads (not reference) |
+| `-k` | `31` | K-mer length (must be odd, max 63) |
+| `-o` | output path | Output file prefix |
+| `-w` | `/tmp/cf3` | Working directory (uses a Docker volume to avoid macOS filesystem issues) |
+| `-c` | `1` | Minimum (k+1)-mer frequency cutoff |
+
+#### `run_bifrost.sh` — Compacted coloured de Bruijn graph (GFA)
+
+Runs [Bifrost](https://github.com/pmelsted/bifrost) to build a compacted de Bruijn graph, outputting GFA directly.
+
+| Argument | Value | Description |
+|----------|-------|-------------|
+| `-s` | each FASTQ | Input read files (k-mers occurring once are filtered) |
+| `-k` | `31` | K-mer length |
+| `-o` | output path | Output file prefix |
+| `-i` | — | Clip short tips |
+| `-d` | — | Delete small isolated contigs |
+| `-t` | `4` | Number of threads |
+
+#### `run_megahit.sh` — Succinct de Bruijn graph assembly (FASTG → GFA)
+
+Runs [MEGAHIT](https://github.com/voutcn/megahit) for metagenome assembly, then converts the intermediate contigs to FASTG using `megahit_core contig2fastg`, and finally converts FASTG to GFA using [gfatools](https://github.com/lh3/gfatools). All graph cleaning is disabled to preserve the raw graph structure.
+
+| Variable | Flag | Value | Description |
+|----------|------|-------|-------------|
+| `K_LIST` | `--k-list` | `21,31,41,51` | Comma-separated k-mer sizes to iterate over |
+| `BUBBLE_LEVEL` | `--bubble-level` | `0` | Bubble merging intensity (0 = disabled) |
+| `PRUNE_LEVEL` | `--prune-level` | `0` | Low-depth pruning strength (0 = disabled) |
+| `MAX_TIP_LEN` | `--max-tip-len` | `0` | Tip removal length threshold (0 = keep all) |
+| `CLEANING_ROUNDS` | `--cleaning-rounds` | `0` | Graph cleaning iterations (0 = skip) |
+| `DISCONNECT_RATIO` | `--disconnect-ratio` | `0` | Depth-ratio unitig disconnection (0 = disabled) |
+| `LOW_LOCAL_RATIO` | `--low-local-ratio` | `0` | Neighbourhood depth filtering (0 = disabled) |
+| `MIN_COUNT` | `--min-count` | `1` | Minimum k-mer multiplicity (1 = keep singletons) |
+| — | `--no-mercy` | — | Do not add mercy k-mers |
+| — | `--no-local` | — | Disable local assembly |
+| — | `--keep-tmp-files` | — | Preserve intermediate contigs for FASTG conversion |
+
+Note: MEGAHIT always compacts unitigs — there is no flag to output the uncompacted de Bruijn graph.
+
+#### `run_spades.sh` — Metagenomic assembly (GFA)
+
+Runs [SPAdes](https://github.com/ablab/spades) in metagenomic mode. SPAdes natively outputs `assembly_graph.gfa` alongside contigs.
+
+| Argument | Value | Description |
+|----------|-------|-------------|
+| `--meta` | — | Metagenomic assembly mode |
+| `-1`, `-2` | R1, R2 FASTQs | Paired-end input files |
+| `-o` | output path | Output directory |
+| `-t` | `4` | Number of threads |
+
+#### `run_metaMDBG.sh` — Minimizer-space de Bruijn graph assembly
+
+Runs [metaMDBG](https://github.com/GaetanBenoitDev/metaMDBG) for metagenome assembly using minimizer-space de Bruijn graphs. Designed for long reads; parameters are adjusted for short-read input. Uses a Docker volume for working data due to macOS bind-mount permission issues.
+
+| Variable | Flag | Value | Description |
+|----------|------|-------|-------------|
+| `KMER_SIZE` | `--kmer-size` | `11` | Minimizer length (default 15; reduced for short reads) |
+| `DENSITY` | `--density-assembly` | `0.01` | Fraction of k-mers used for assembly (default 0.005) |
+| `MIN_ABUNDANCE` | `--min-abundance` | `2` | Minimum k-min-mer abundance (0 = rescue mode) |
+| `MIN_OVERLAP` | `--min-read-overlap` | `150` | Minimum read overlap in bp (default 1000; set to match read length) |
+| — | `--skip-correction` | — | Skip long-read error correction (not useful for Illumina) |
+
+The `gfa` subcommand is run after assembly with `--k 0` to list available k values for graph extraction.
+
+#### `run_rust_mdbg.sh` — Minimizer-space de Bruijn graph (GFA)
+
+Runs [rust-mdbg](https://github.com/ekimb/rust-mdbg) to build a minimizer-space de Bruijn graph, then converts to base-space with `to_basespace`. Designed for long reads; all FASTQ files are concatenated into a single input since rust-mdbg accepts only one reads file.
+
+| Argument | Value | Description |
+|----------|-------|-------------|
+| `-k` | `4` | K-min-mer order |
+| `--density` | `0.1` | Minimizer density (δ) |
+| `-l` | `8` | Minimizer length |
+| `--minabund` | `2` | Minimum k-min-mer abundance |
+| `--prefix` | output path | Output file prefix |
+
 ## Comparison with other simulators
 
 Several existing tools address overlapping aspects of read simulation. genome-blender aims to combine metagenome-aware abundance modelling, configurable error profiles, and full ground-truth tracking in a single Python toolkit.

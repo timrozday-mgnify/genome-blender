@@ -6,6 +6,16 @@ OUTPUT_DIR="${INPUT_DIR}/megahit"
 # megahit requires the output dir not to exist
 rm -rf "${OUTPUT_DIR}"
 
+# Assembly parameters
+K_LIST="21,31,41,51"    # comma-separated odd k-mer sizes (range 15-255)
+BUBBLE_LEVEL=0           # bubble merging intensity (0-2); 0 = disabled
+PRUNE_LEVEL=0            # low-depth pruning strength (0-3); 0 = disabled
+MAX_TIP_LEN=0            # remove tips shorter than this; 0 = keep all
+CLEANING_ROUNDS=0        # graph cleaning iterations; 0 = skip cleaning
+DISCONNECT_RATIO=0       # disable unitig removal by depth ratio
+LOW_LOCAL_RATIO=0        # disable neighbourhood depth filtering
+MIN_COUNT=1              # minimum k-mer multiplicity; 1 = keep singletons
+
 # Assemble
 docker run --rm \
     -v "${INPUT_DIR}:/input:ro" \
@@ -15,6 +25,17 @@ docker run --rm \
     -1 /input/sim_reads_R1.fastq \
     -2 /input/sim_reads_R2.fastq \
     -o /output/megahit \
+    --k-list "${K_LIST}" \
+    --bubble-level "${BUBBLE_LEVEL}" \
+    --prune-level "${PRUNE_LEVEL}" \
+    --max-tip-len "${MAX_TIP_LEN}" \
+    --cleaning-rounds "${CLEANING_ROUNDS}" \
+    --disconnect-ratio "${DISCONNECT_RATIO}" \
+    --low-local-ratio "${LOW_LOCAL_RATIO}" \
+    --min-count "${MIN_COUNT}" \
+    --no-mercy \
+    --no-local \
+    --keep-tmp-files \
     -t 4
 
 # Find the largest k used in intermediate contigs and convert to FASTG
