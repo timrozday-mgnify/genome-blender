@@ -135,6 +135,24 @@ seed: 42
 
 The three required parameters (`input_csv`, `num_reads`, `output_prefix`) must be provided either in the config file or on the command line.
 
+## Parameter estimation tools
+
+The `containers/` directory provides Dockerfiles for external tools being trialled for estimating realistic simulation parameters (e.g. fragment size distributions, error profiles, community composition) from existing metagenome sequencing data. These are not part of the core genome-blender pipeline but support the goal of generating data that closely mirrors real experiments.
+
+| Tool | Description |
+|------|-------------|
+| [cuttlefish3](https://github.com/COMBINE-lab/cuttlefish/tree/cuttlefish3) | Compacted de Bruijn graph construction |
+| [rust-mdbg](https://github.com/ekimb/rust-mdbg) | Minimizer-space de Bruijn graph assembler |
+| [metaMDBG](https://github.com/GaetanBenoitDev/metaMDBG) | Metagenome assembler based on minimizer-space de Bruijn graphs |
+| [Bifrost](https://github.com/pmelsted/bifrost) | Parallel construction and indexing of compacted de Bruijn graphs |
+| [SPAdes](https://github.com/ablab/spades) | Genome assembler (pre-built image from BioContainers) |
+
+Build a container image with:
+
+```bash
+docker buildx build -t <tool-name> containers/<tool>/
+```
+
 ## Requirements
 
 - Python 3.10+

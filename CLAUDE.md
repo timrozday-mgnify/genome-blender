@@ -80,6 +80,16 @@ These terms appear throughout the codebase. Use them consistently.
 - Candidate modules for Rust acceleration: fragment sampling, error model application, quality score generation
 - Profile before optimising; use `cProfile` or `py-spy`
 
+## Containers
+
+The `containers/` directory holds Dockerfiles (and occasionally Singularity definition files) for external tools being trialled for estimating simulation parameters from existing metagenome sequencing data. Each tool has its own subdirectory; built images are saved as `.tar` files (excluded from git).
+
+- **cuttlefish3** (`containers/cuttlefish3/`) -- compacted de Bruijn graph construction (Dockerfile + Singularity def)
+- **rust-mdbg** (`containers/rust-mdbg/`) -- minimizer-space de Bruijn graph assembler
+- **metaMDBG** (`containers/metaMDBG/`) -- metagenome assembler based on minimizer-space de Bruijn graphs
+- **bifrost** (`containers/bifrost/`) -- parallel construction and indexing of compacted de Bruijn graphs
+- **spades** (`containers/spades/`) -- SPAdes genome assembler (pre-built image from BioContainers, no Dockerfile)
+
 ## Existing tools for reference
 
 These tools solve related problems and can inform design decisions:
