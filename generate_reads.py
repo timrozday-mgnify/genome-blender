@@ -1027,6 +1027,7 @@ def generate_reads(
     read_length_variance: float,
     paired_end: bool,
     rng: torch.Generator,
+    read_index_offset: int = 0,
 ) -> ReadBatch:
     """Generate reads from fragments.
 
@@ -1041,6 +1042,9 @@ def generate_reads(
         If True, generate paired-end reads.
     rng : torch.Generator
         Seeded random number generator.
+    read_index_offset : int
+        Starting index for read naming, used when generating
+        reads in chunks to ensure globally unique names.
 
     Returns
     -------
@@ -1068,6 +1072,7 @@ def generate_reads(
         len(fragments), title=f"Generating {mode} reads",
     ) as bar:
         for i, frag in enumerate(fragments):
+            global_idx = read_index_offset + i
             frag_len = len(frag.sequence)
             sampled_len = int(
                 read_len_dist.sample().clamp(min=1).item()
@@ -1092,12 +1097,12 @@ def generate_reads(
                 r2_qual = "I" * len(r2_seq)
 
                 r1 = Read(
-                    name=f"{base_name}/1 read_{i}",
+                    name=f"{base_name}/1 read_{global_idx}",
                     sequence=r1_seq,
                     quality=r1_qual,
                 )
                 r2 = Read(
-                    name=f"{base_name}/2 read_{i}",
+                    name=f"{base_name}/2 read_{global_idx}",
                     sequence=r2_seq,
                     quality=r2_qual,
                 )
@@ -1107,7 +1112,7 @@ def generate_reads(
                 qual = "I" * len(seq)  # Q40 Phred+33
                 se_reads.append(
                     Read(
-                        name=f"{base_name} read_{i}",
+                        name=f"{base_name} read_{global_idx}",
                         sequence=seq,
                         quality=qual,
                     )
@@ -1220,7 +1225,11 @@ def apply_error_model(
     return ReadBatch(single=modified)
 
 
-def write_fastq(reads: list[Read], output_path: Path) -> None:
+def write_fastq(
+    reads: list[Read],
+    output_path: Path,
+    append: bool = False,
+) -> None:
     """Write reads to a FASTQ file with Phred+33 encoding.
 
     Parameters
@@ -1228,10 +1237,18 @@ def write_fastq(reads: list[Read], output_path: Path) -> None:
     reads : list of Read
     output_path : Path
         Output FASTQ file path.
+    append : bool
+        If True, append to existing file instead of overwriting.
 
     """
-    logger.debug("Writing %d reads to %s", len(reads), output_path)
-    with open(output_path, "w") as fh:
+    mode = "a" if append else "w"
+    logger.debug(
+        "%s %d reads to %s",
+        "Appending" if append else "Writing",
+        len(reads),
+        output_path,
+    )
+    with open(output_path, mode) as fh:
         with alive_bar(
             len(reads),
             title=f"Writing {output_path.name}",
@@ -1243,33 +1260,29 @@ def write_fastq(reads: list[Read], output_path: Path) -> None:
                 fh.write(f"{read.quality}\n")
                 bar()
 
-    logger.info("Wrote %d reads to %s", len(reads), output_path)
+    logger.info(
+        "%s %d reads to %s",
+        "Appended" if append else "Wrote",
+        len(reads),
+        output_path,
+    )
 
 
-def write_bam(
-    fragments: list[Fragment],
-    read_batch: ReadBatch,
+def build_bam_header(
     genomes: dict[str, list],
-    output_path: Path,
-) -> None:
-    """Write ground-truth alignments to a BAM file.
-
-    Each read is placed at the genomic position of the fragment it was
-    derived from, with a simple all-match CIGAR string.
+) -> tuple[pysam.AlignmentHeader, dict[str, int]]:
+    """Build a BAM header and reference name index from genomes.
 
     Parameters
     ----------
-    fragments : list of Fragment
-        Source fragments (one per read or read-pair).
-    read_batch : ReadBatch
-        Generated reads (single-end or paired-end).
     genomes : dict mapping genome_id to list of Bio.SeqRecord
         Used to build the BAM header with contig lengths.
-    output_path : Path
-        Output BAM file path.
+
+    Returns
+    -------
+    tuple of (AlignmentHeader, dict mapping ref_name to ref_id)
 
     """
-    # Build reference name list and header @SQ entries
     ref_names: list[str] = []
     ref_lengths: list[int] = []
     ref_name_to_idx: dict[str, int] = {}
@@ -1291,95 +1304,148 @@ def write_bam(
     logger.debug(
         "BAM header: %d reference sequences", len(ref_names),
     )
+    return header, ref_name_to_idx
 
+
+def write_bam_chunk(
+    bam: pysam.AlignmentFile,
+    header: pysam.AlignmentHeader,
+    ref_name_to_idx: dict[str, int],
+    fragments: list[Fragment],
+    read_batch: ReadBatch,
+) -> None:
+    """Write a chunk of ground-truth alignments to an open BAM file.
+
+    Parameters
+    ----------
+    bam : pysam.AlignmentFile
+        Open BAM file for writing.
+    header : pysam.AlignmentHeader
+        BAM header (needed to create AlignedSegment objects).
+    ref_name_to_idx : dict mapping ref_name to ref_id
+        Reference name to index mapping.
+    fragments : list of Fragment
+        Source fragments (one per read or read-pair).
+    read_batch : ReadBatch
+        Generated reads (single-end or paired-end).
+
+    """
+    with alive_bar(
+        len(fragments), title="Writing BAM",
+    ) as bar:
+        for i, frag in enumerate(fragments):
+            ref_name = f"{frag.genome_id}:{frag.contig_id}"
+            ref_id = ref_name_to_idx[ref_name]
+
+            if read_batch.is_paired:
+                assert read_batch.paired is not None
+                r1, r2 = read_batch.paired[i]
+                qname = r1.name.split("/")[0]
+
+                r1_is_reverse = frag.strand == "-"
+                r2_is_reverse = not r1_is_reverse
+
+                # R1
+                a1 = pysam.AlignedSegment(header)
+                a1.query_name = qname
+                a1.query_sequence = r1.sequence
+                a1.flag = 0
+                a1.is_paired = True
+                a1.is_proper_pair = True
+                a1.is_read1 = True
+                a1.is_reverse = r1_is_reverse
+                a1.mate_is_reverse = r2_is_reverse
+                a1.reference_id = ref_id
+                a1.reference_start = frag.start
+                a1.cigar = (
+                    r1.cigar if r1.cigar is not None
+                    else [(0, len(r1.sequence))]
+                )
+                a1.mapping_quality = 255
+                a1.query_qualities = (
+                    pysam.qualitystring_to_array(r1.quality)
+                )
+                a1.next_reference_id = ref_id
+                r2_start = frag.end - len(r2.sequence)
+                a1.next_reference_start = r2_start
+                a1.template_length = frag.end - frag.start
+
+                # R2
+                a2 = pysam.AlignedSegment(header)
+                a2.query_name = qname
+                a2.query_sequence = r2.sequence
+                a2.flag = 0
+                a2.is_paired = True
+                a2.is_proper_pair = True
+                a2.is_read2 = True
+                a2.is_reverse = r2_is_reverse
+                a2.mate_is_reverse = r1_is_reverse
+                a2.reference_id = ref_id
+                a2.reference_start = r2_start
+                a2.cigar = (
+                    r2.cigar if r2.cigar is not None
+                    else [(0, len(r2.sequence))]
+                )
+                a2.mapping_quality = 255
+                a2.query_qualities = (
+                    pysam.qualitystring_to_array(r2.quality)
+                )
+                a2.next_reference_id = ref_id
+                a2.next_reference_start = frag.start
+                a2.template_length = -(frag.end - frag.start)
+
+                bam.write(a1)
+                bam.write(a2)
+            else:
+                assert read_batch.single is not None
+                read = read_batch.single[i]
+                a = pysam.AlignedSegment(header)
+                a.query_name = read.name
+                a.query_sequence = read.sequence
+                a.flag = 0
+                a.is_reverse = frag.strand == "-"
+                a.reference_id = ref_id
+                a.reference_start = frag.start
+                a.cigar = (
+                    read.cigar if read.cigar is not None
+                    else [(0, len(read.sequence))]
+                )
+                a.mapping_quality = 255
+                a.query_qualities = (
+                    pysam.qualitystring_to_array(read.quality)
+                )
+                bam.write(a)
+            bar()
+
+
+def write_bam(
+    fragments: list[Fragment],
+    read_batch: ReadBatch,
+    genomes: dict[str, list],
+    output_path: Path,
+) -> None:
+    """Write ground-truth alignments to a BAM file.
+
+    Convenience wrapper that builds the header and writes all
+    fragments in a single pass.
+
+    Parameters
+    ----------
+    fragments : list of Fragment
+        Source fragments (one per read or read-pair).
+    read_batch : ReadBatch
+        Generated reads (single-end or paired-end).
+    genomes : dict mapping genome_id to list of Bio.SeqRecord
+        Used to build the BAM header with contig lengths.
+    output_path : Path
+        Output BAM file path.
+
+    """
+    header, ref_name_to_idx = build_bam_header(genomes)
     with pysam.AlignmentFile(output_path, "wb", header=header) as bam:
-        with alive_bar(
-            len(fragments), title="Writing BAM",
-        ) as bar:
-            for i, frag in enumerate(fragments):
-                ref_name = f"{frag.genome_id}:{frag.contig_id}"
-                ref_id = ref_name_to_idx[ref_name]
-
-                if read_batch.is_paired:
-                    assert read_batch.paired is not None
-                    r1, r2 = read_batch.paired[i]
-                    qname = r1.name.split("/")[0]
-
-                    r1_is_reverse = frag.strand == "-"
-                    r2_is_reverse = not r1_is_reverse
-
-                    # R1
-                    a1 = pysam.AlignedSegment(header)
-                    a1.query_name = qname
-                    a1.query_sequence = r1.sequence
-                    a1.flag = 0
-                    a1.is_paired = True
-                    a1.is_proper_pair = True
-                    a1.is_read1 = True
-                    a1.is_reverse = r1_is_reverse
-                    a1.mate_is_reverse = r2_is_reverse
-                    a1.reference_id = ref_id
-                    a1.reference_start = frag.start
-                    a1.cigar = (
-                        r1.cigar if r1.cigar is not None
-                        else [(0, len(r1.sequence))]
-                    )
-                    a1.mapping_quality = 255
-                    a1.query_qualities = (
-                        pysam.qualitystring_to_array(r1.quality)
-                    )
-                    a1.next_reference_id = ref_id
-                    r2_start = frag.end - len(r2.sequence)
-                    a1.next_reference_start = r2_start
-                    a1.template_length = frag.end - frag.start
-
-                    # R2
-                    a2 = pysam.AlignedSegment(header)
-                    a2.query_name = qname
-                    a2.query_sequence = r2.sequence
-                    a2.flag = 0
-                    a2.is_paired = True
-                    a2.is_proper_pair = True
-                    a2.is_read2 = True
-                    a2.is_reverse = r2_is_reverse
-                    a2.mate_is_reverse = r1_is_reverse
-                    a2.reference_id = ref_id
-                    a2.reference_start = r2_start
-                    a2.cigar = (
-                        r2.cigar if r2.cigar is not None
-                        else [(0, len(r2.sequence))]
-                    )
-                    a2.mapping_quality = 255
-                    a2.query_qualities = (
-                        pysam.qualitystring_to_array(r2.quality)
-                    )
-                    a2.next_reference_id = ref_id
-                    a2.next_reference_start = frag.start
-                    a2.template_length = -(frag.end - frag.start)
-
-                    bam.write(a1)
-                    bam.write(a2)
-                else:
-                    assert read_batch.single is not None
-                    read = read_batch.single[i]
-                    a = pysam.AlignedSegment(header)
-                    a.query_name = read.name
-                    a.query_sequence = read.sequence
-                    a.flag = 0
-                    a.is_reverse = frag.strand == "-"
-                    a.reference_id = ref_id
-                    a.reference_start = frag.start
-                    a.cigar = (
-                        read.cigar if read.cigar is not None
-                        else [(0, len(read.sequence))]
-                    )
-                    a.mapping_quality = 255
-                    a.query_qualities = (
-                        pysam.qualitystring_to_array(read.quality)
-                    )
-                    bam.write(a)
-                bar()
-
+        write_bam_chunk(
+            bam, header, ref_name_to_idx, fragments, read_batch,
+        )
     logger.info("Wrote ground-truth BAM to %s", output_path)
 
 
@@ -1456,6 +1522,10 @@ def main(
         help="Treat input sequences as amplicons (no shearing); "
         "replicate proportionally to abundance",
     )] = False,
+    chunk_size: Annotated[int, typer.Option(
+        help="Number of fragments to process per chunk to limit "
+        "memory usage",
+    )] = 1_000_000,
 ) -> None:
     """Generate simulated WGS reads from reference genomes."""
     # Apply YAML config: values from the file fill in anything not
@@ -1488,6 +1558,7 @@ def main(
         qcal_steepness = p["qcal_steepness"]
         qcal_midpoint = p["qcal_midpoint"]
         amplicon = p["amplicon"]
+        chunk_size = p.get("chunk_size", 1_000_000)
 
     # Validate required parameters
     if input_csv is None:
@@ -1515,6 +1586,7 @@ def main(
     logger.debug("  gc_bias         = %.2f", gc_bias_strength)
     logger.debug("  paired_end      = %s", paired_end)
     logger.debug("  amplicon        = %s", amplicon)
+    logger.debug("  chunk_size      = %d", chunk_size)
     logger.debug("  error_model     = %s", error_model.value)
     logger.debug("  quality_cal     = %s", quality_calibration_model.value)
     logger.debug("  seed            = %s", seed)
@@ -1573,60 +1645,102 @@ def main(
     # so we need num_reads // 2 fragments for PE, num_reads for SE
     num_fragments = num_reads // 2 if paired_end else num_reads
 
-    # Generate fragments
-    if amplicon:
-        logger.info(
-            "Amplicon mode: replicating %d input sequences to %d fragments...",
-            sum(len(recs) for recs in genomes.values()),
-            num_fragments,
-        )
-        fragments = amplicon_fragments(
-            genomes=genomes,
-            abundances=abundances,
-            num_fragments=num_fragments,
-            rng=rng,
-        )
-    else:
-        logger.info("Sampling %d fragments...", num_fragments)
-        fragments = sample_fragments(
-            genomes=genomes,
-            abundances=abundances,
-            num_fragments=num_fragments,
-            fragment_mean=fragment_mean,
-            fragment_variance=fragment_variance,
-            gc_bias_strength=gc_bias_strength,
-            rng=rng,
-        )
-    logger.info("Generated %d fragments", len(fragments))
-
-    # Generate reads and write output
-    logger.info("Generating reads (paired_end=%s)...", paired_end)
-    read_batch = generate_reads(
-        fragments=fragments,
-        read_length_mean=read_length_mean,
-        read_length_variance=read_length_variance,
-        paired_end=paired_end,
-        rng=rng,
+    # Compute chunk boundaries
+    chunk_starts = list(range(0, num_fragments, chunk_size))
+    chunk_counts = [
+        min(chunk_size, num_fragments - start)
+        for start in chunk_starts
+    ]
+    num_chunks = len(chunk_counts)
+    logger.info(
+        "Processing %d fragments in %d chunk(s) of up to %d",
+        num_fragments, num_chunks, chunk_size,
     )
-    read_batch = apply_error_model(read_batch, profile, rng, calibration)
 
-    if read_batch.is_paired:
-        assert read_batch.paired is not None
+    # Set up output paths
+    bam_path = Path(f"{output_prefix}.bam")
+    if paired_end:
         r1_path = Path(f"{output_prefix}_R1.fastq")
         r2_path = Path(f"{output_prefix}_R2.fastq")
-        r1_reads = [pair[0] for pair in read_batch.paired]
-        r2_reads = [pair[1] for pair in read_batch.paired]
-        write_fastq(r1_reads, r1_path)
-        write_fastq(r2_reads, r2_path)
     else:
-        assert read_batch.single is not None
         out_path = Path(f"{output_prefix}.fastq")
-        write_fastq(read_batch.single, out_path)
 
-    bam_path = Path(f"{output_prefix}.bam")
-    write_bam(fragments, read_batch, genomes=genomes,
-              output_path=bam_path)
+    # Build BAM header once (needs genome info, not per-chunk data)
+    header, ref_name_to_idx = build_bam_header(genomes)
 
+    with pysam.AlignmentFile(bam_path, "wb", header=header) as bam:
+        for chunk_idx, (chunk_start, chunk_n) in enumerate(
+            zip(chunk_starts, chunk_counts)
+        ):
+            logger.info(
+                "Chunk %d/%d: %d fragments (offset %d)",
+                chunk_idx + 1, num_chunks, chunk_n, chunk_start,
+            )
+
+            # Generate fragments for this chunk
+            if amplicon:
+                logger.info(
+                    "Amplicon mode: replicating %d input sequences "
+                    "to %d fragments...",
+                    sum(len(recs) for recs in genomes.values()),
+                    chunk_n,
+                )
+                fragments = amplicon_fragments(
+                    genomes=genomes,
+                    abundances=abundances,
+                    num_fragments=chunk_n,
+                    rng=rng,
+                )
+            else:
+                logger.info("Sampling %d fragments...", chunk_n)
+                fragments = sample_fragments(
+                    genomes=genomes,
+                    abundances=abundances,
+                    num_fragments=chunk_n,
+                    fragment_mean=fragment_mean,
+                    fragment_variance=fragment_variance,
+                    gc_bias_strength=gc_bias_strength,
+                    rng=rng,
+                )
+            logger.info("Generated %d fragments", len(fragments))
+
+            # Generate reads from this chunk's fragments
+            logger.info(
+                "Generating reads (paired_end=%s)...", paired_end,
+            )
+            read_batch = generate_reads(
+                fragments=fragments,
+                read_length_mean=read_length_mean,
+                read_length_variance=read_length_variance,
+                paired_end=paired_end,
+                rng=rng,
+                read_index_offset=chunk_start,
+            )
+            read_batch = apply_error_model(
+                read_batch, profile, rng, calibration,
+            )
+
+            # Write FASTQ (append for chunks after the first)
+            append = chunk_idx > 0
+            if read_batch.is_paired:
+                assert read_batch.paired is not None
+                r1_reads = [pair[0] for pair in read_batch.paired]
+                r2_reads = [pair[1] for pair in read_batch.paired]
+                write_fastq(r1_reads, r1_path, append=append)
+                write_fastq(r2_reads, r2_path, append=append)
+            else:
+                assert read_batch.single is not None
+                write_fastq(
+                    read_batch.single, out_path, append=append,
+                )
+
+            # Write BAM chunk
+            write_bam_chunk(
+                bam, header, ref_name_to_idx,
+                fragments, read_batch,
+            )
+
+    logger.info("Wrote ground-truth BAM to %s", bam_path)
     logger.info("Done.")
 
 
