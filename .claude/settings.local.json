@@ -22,7 +22,9 @@
       "Bash(gh api:*)",
       "WebFetch(domain:benjjneb.github.io)",
       "WebFetch(domain:pmc.ncbi.nlm.nih.gov)",
-      "Bash(cat:*)"
+      "Bash(cat:*)",
+      "Bash(ls:*)",
+      "Bash(docker buildx:*)"
     ]
   }
 }

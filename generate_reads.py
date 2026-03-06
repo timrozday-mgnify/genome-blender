@@ -1547,7 +1547,7 @@ def main(
     chunk_size: Annotated[int, typer.Option(
         help="Number of fragments to process per chunk to limit "
         "memory usage",
-    )] = 1_000_000,
+    )] = 100_000,
 ) -> None:
     """Generate simulated WGS reads from reference genomes."""
     # Apply YAML config: values from the file fill in anything not
