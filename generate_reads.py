@@ -11,28 +11,40 @@ from __future__ import annotations
 import csv
 import logging
 import math
+import sys
+from contextlib import contextmanager
 from dataclasses import dataclass
 from enum import Enum
 from pathlib import Path
 from typing import Annotated
 
-import sys
-from contextlib import contextmanager
+from rich.console import Group
+from rich.live import Live
+from rich.progress import (
+    BarColumn,
+    MofNCompleteColumn,
+    Progress,
+    SpinnerColumn,
+    TextColumn,
+)
 
-from alive_progress import alive_bar as _alive_bar_orig
+_inner_progress: Progress | None = None
 
 
 @contextmanager
-def alive_bar(*args, **kwargs):
-    """Wrap alive_bar to gracefully handle closed file descriptors."""
+def progress_task(total: int, description: str):
+    """Add a sub-task to the inner progress display.
+
+    Yields a callable that advances the task by one step.
+    """
+    if _inner_progress is None:
+        yield lambda: None
+        return
+    task_id = _inner_progress.add_task(description, total=total)
     try:
-        is_tty = sys.stderr.isatty()
-    except ValueError:
-        is_tty = False
-    if not is_tty:
-        kwargs["disable"] = True
-    with _alive_bar_orig(*args, **kwargs) as bar:
-        yield bar
+        yield lambda: _inner_progress.advance(task_id)
+    finally:
+        _inner_progress.remove_task(task_id)
 
 import click.core
 import pysam
@@ -673,9 +685,7 @@ def load_genomes(
         rows = list(csv.DictReader(fh))
     logger.debug("Found %d entries in %s", len(rows), csv_path)
 
-    with alive_bar(
-        len(rows), title="Loading genomes", disable=not rows,
-    ) as bar:
+    with progress_task(len(rows), "Loading genomes") as step:
         for row in rows:
             genome_id = row["genome_id"]
             fasta_path = Path(row["fasta_path"])
@@ -685,7 +695,7 @@ def load_genomes(
             records = list(SeqIO.parse(fasta_path, "fasta"))
             if not records:
                 logger.warning("No sequences found in %s", fasta_path)
-                bar()
+                step()
                 continue
 
             genomes[genome_id] = records
@@ -703,7 +713,7 @@ def load_genomes(
                     len(rec.seq),
                     _gc_fraction(str(rec.seq)) * 100,
                 )
-            bar()
+            step()
 
     # Normalise abundances
     total = sum(raw_abundances.values())
@@ -726,7 +736,7 @@ def _nb_params_from_mean_variance(
 
     """
     if variance <= mean:
-        logger.warning(
+        logger.info(
             "Fragment variance (%.1f) <= mean (%.1f); "
             "falling back to Poisson distribution",
             variance,
@@ -847,9 +857,7 @@ def sample_fragments(
 
     fragments: list[Fragment] = []
 
-    with alive_bar(
-        num_fragments, title="Sampling fragments",
-    ) as bar:
+    with progress_task(num_fragments, "Sampling fragments") as step:
         for genome_idx, genome_id in enumerate(genome_ids):
             n_frags = counts[genome_idx].item()
             if n_frags == 0:
@@ -927,7 +935,7 @@ def sample_fragments(
                     )
                 )
                 accepted += 1
-                bar()
+                step()
 
             logger.debug(
                 "  %s: accepted %d/%d fragments (%d rejected, "
@@ -1003,9 +1011,9 @@ def amplicon_fragments(
     # Build fragment list
     fragments: list[Fragment] = []
     logger.debug("Amplicon allocation:")
-    with alive_bar(
-        num_fragments, title="Building amplicon fragments",
-    ) as bar:
+    with progress_task(
+        num_fragments, "Building amplicon fragments",
+    ) as step:
         for i, (genome_id, record) in enumerate(amplicons):
             n = counts[i].item()
             if n == 0:
@@ -1026,7 +1034,7 @@ def amplicon_fragments(
                         sequence=seq_str,
                     )
                 )
-                bar()
+                step()
 
     # Shuffle so reads aren't grouped by amplicon
     n = len(fragments)
@@ -1090,9 +1098,9 @@ def generate_reads(
     se_reads: list[Read] = []
     pe_reads: list[tuple[Read, Read]] = []
 
-    with alive_bar(
-        len(fragments), title=f"Generating {mode} reads",
-    ) as bar:
+    with progress_task(
+        len(fragments), f"Generating {mode} reads",
+    ) as step:
         for i, frag in enumerate(fragments):
             global_idx = read_index_offset + i
             frag_len = len(frag.sequence)
@@ -1142,7 +1150,7 @@ def generate_reads(
                         quality=qual,
                     )
                 )
-            bar()
+            step()
 
     if paired_end:
         logger.debug("Generated %d read pairs", len(pe_reads))
@@ -1213,9 +1221,7 @@ def apply_error_model(
     modified: list[Read] = []
     n_errors_total = 0
     n_bases_total = 0
-    with alive_bar(
-        len(flat_reads), title="Applying errors",
-    ) as bar:
+    with progress_task(len(flat_reads), "Applying errors") as step:
         for read, q_scores in zip(flat_reads, all_q_scores):
             new_seq, new_qual, cigar = apply_errors_to_sequence(
                 read.sequence, q_scores, profile, rng, calibration,
@@ -1231,7 +1237,7 @@ def apply_error_model(
                 quality=new_qual,
                 cigar=cigar,
             ))
-            bar()
+            step()
 
     if n_bases_total > 0:
         logger.debug(
@@ -1276,16 +1282,15 @@ def write_fastq(
         output_path,
     )
     with open(output_path, mode) as fh:
-        with alive_bar(
-            len(reads),
-            title=f"Writing {output_path.name}",
-        ) as bar:
+        with progress_task(
+            len(reads), f"Writing {output_path.name}",
+        ) as step:
             for read in reads:
                 fh.write(f"@{read.name}\n")
                 fh.write(f"{read.sequence}\n")
                 fh.write("+\n")
                 fh.write(f"{read.quality}\n")
-                bar()
+                step()
 
     logger.info(
         "%s %d reads to %s",
@@ -1402,9 +1407,7 @@ def write_bam_chunk(
 
     """
     tlen = 0
-    with alive_bar(
-        len(fragments), title="Writing BAM",
-    ) as bar:
+    with progress_task(len(fragments), "Writing BAM") as step:
         for i, frag in enumerate(fragments):
             ref_name = f"{frag.genome_id}:{frag.contig_id}"
             ref_id = ref_name_to_idx[ref_name]
@@ -1500,7 +1503,7 @@ def write_bam_chunk(
                     pysam.qualitystring_to_array(qual)
                 )
                 bam.write(a)
-            bar()
+            step()
 
 
 def write_bam(
@@ -1543,6 +1546,10 @@ def main(
     verbose: Annotated[bool, typer.Option(
         "--verbose/--no-verbose",
         help="Enable verbose (DEBUG) logging",
+    )] = False,
+    no_ansi: Annotated[bool, typer.Option(
+        "--no-ansi",
+        help="Disable ANSI escape codes (progress bars, colours)",
     )] = False,
     input_csv: Annotated[Path | None, typer.Option(
         help="CSV with columns: genome_id, fasta_path, abundance",
@@ -1625,6 +1632,7 @@ def main(
         # ctx.params holds raw click values, so enum/Path types need
         # explicit conversion.
         p = ctx.params
+        no_ansi = p.get("no_ansi", False)
         input_csv = Path(p["input_csv"]) if p.get("input_csv") else None
         num_reads = p.get("num_reads")
         output_prefix = p.get("output_prefix")
@@ -1721,7 +1729,96 @@ def main(
         midpoint=qcal_midpoint,
     )
 
-    # Load genomes
+    # Determine whether to show progress bars
+    try:
+        is_tty = sys.stderr.isatty()
+    except ValueError:
+        is_tty = False
+    disable_progress = no_ansi or not is_tty
+
+    progress_columns = (
+        SpinnerColumn(),
+        TextColumn("[progress.description]{task.description}"),
+        BarColumn(),
+        MofNCompleteColumn(),
+        TextColumn("[cyan]{task.elapsed:.1f}s"),
+    )
+    outer_progress = Progress(*progress_columns)
+    inner_progress = Progress(*progress_columns)
+
+    global _inner_progress  # noqa: PLW0603
+
+    pipeline_kwargs = dict(
+        input_csv=input_csv,
+        num_reads=num_reads,
+        output_prefix=output_prefix,
+        fragment_mean=fragment_mean,
+        fragment_variance=fragment_variance,
+        read_length_mean=read_length_mean,
+        read_length_variance=read_length_variance,
+        gc_bias_strength=gc_bias_strength,
+        paired_end=paired_end,
+        amplicon=amplicon,
+        chunk_size=chunk_size,
+        rng=rng,
+        profile=profile,
+        calibration=calibration,
+        error_rate_scale=error_rate_scale,
+    )
+
+    if disable_progress:
+        _inner_progress = None
+        _run_pipeline(
+            **pipeline_kwargs,
+            outer_progress=None,
+            inner_progress=None,
+        )
+    else:
+        # Suppress log output while the Live display is active;
+        # progress bars convey status instead.
+        saved_level = logging.root.level
+        logging.root.setLevel(logging.WARNING)
+        with Live(
+            Group(outer_progress, inner_progress),
+            refresh_per_second=10,
+        ):
+            _inner_progress = inner_progress
+            _run_pipeline(
+                **pipeline_kwargs,
+                outer_progress=outer_progress,
+                inner_progress=inner_progress,
+            )
+            _inner_progress = None
+        logging.root.setLevel(saved_level)
+
+    logger.info("Done.")
+
+
+def _run_pipeline(
+    *,
+    input_csv: Path,
+    num_reads: int,
+    output_prefix: str,
+    fragment_mean: float,
+    fragment_variance: float,
+    read_length_mean: float,
+    read_length_variance: float,
+    gc_bias_strength: float,
+    paired_end: bool,
+    amplicon: bool,
+    chunk_size: int,
+    rng: torch.Generator,
+    profile: ErrorModelProfile | None,
+    calibration: QualityCalibration | None,
+    error_rate_scale: float,
+    outer_progress: Progress | None,
+    inner_progress: Progress | None,
+) -> None:
+    """Run the read-generation pipeline.
+
+    Extracted from main() so the Live display context can be set
+    up before this function is called.
+    """
     genomes, abundances = load_genomes(input_csv)
     logger.info("Loaded %d genomes", len(genomes))
     for gid, abd in abundances.items():
@@ -1731,11 +1828,8 @@ def main(
             gid, abd, len(genomes[gid]), total_bp,
         )
 
-    # For paired-end, each pair counts as 2 reads towards num_reads,
-    # so we need num_reads // 2 fragments for PE, num_reads for SE
     num_fragments = num_reads // 2 if paired_end else num_reads
 
-    # Compute chunk boundaries
     chunk_starts = list(range(0, num_fragments, chunk_size))
     chunk_counts = [
         min(chunk_size, num_fragments - start)
@@ -1747,7 +1841,6 @@ def main(
         num_fragments, num_chunks, chunk_size,
     )
 
-    # Set up output paths, creating parent directories if needed
     output_dir = Path(output_prefix).parent
     output_dir.mkdir(parents=True, exist_ok=True)
     bam_path = Path(f"{output_prefix}.bam")
@@ -1757,24 +1850,39 @@ def main(
     else:
         out_path = Path(f"{output_prefix}.fastq")
 
-    # Build BAM header once (needs genome info, not per-chunk data)
     header, ref_name_to_idx = build_bam_header(genomes)
 
-    with pysam.AlignmentFile(bam_path, "wb", header=header) as bam:
+    chunk_task = None
+    if outer_progress is not None:
+        chunk_task = outer_progress.add_task(
+            "Chunks", total=num_chunks,
+        )
+
+    with pysam.AlignmentFile(
+        bam_path, "wb", header=header,
+    ) as bam:
         for chunk_idx, (chunk_start, chunk_n) in enumerate(
             zip(chunk_starts, chunk_counts)
         ):
+            # Clear completed inner tasks from previous chunk
+            if inner_progress is not None:
+                for tid in list(inner_progress.task_ids):
+                    inner_progress.remove_task(tid)
+
             logger.info(
                 "Chunk %d/%d: %d fragments (offset %d)",
-                chunk_idx + 1, num_chunks, chunk_n, chunk_start,
+                chunk_idx + 1, num_chunks, chunk_n,
+                chunk_start,
             )
 
-            # Generate fragments for this chunk
             if amplicon:
                 logger.info(
-                    "Amplicon mode: replicating %d input sequences "
-                    "to %d fragments...",
-                    sum(len(recs) for recs in genomes.values()),
+                    "Amplicon mode: replicating %d input "
+                    "sequences to %d fragments...",
+                    sum(
+                        len(recs)
+                        for recs in genomes.values()
+                    ),
                     chunk_n,
                 )
                 fragments = amplicon_fragments(
@@ -1784,7 +1892,9 @@ def main(
                     rng=rng,
                 )
             else:
-                logger.info("Sampling %d fragments...", chunk_n)
+                logger.info(
+                    "Sampling %d fragments...", chunk_n,
+                )
                 fragments = sample_fragments(
                     genomes=genomes,
                     abundances=abundances,
@@ -1794,11 +1904,13 @@ def main(
                     gc_bias_strength=gc_bias_strength,
                     rng=rng,
                 )
-            logger.info("Generated %d fragments", len(fragments))
-
-            # Generate reads from this chunk's fragments
             logger.info(
-                "Generating reads (paired_end=%s)...", paired_end,
+                "Generated %d fragments", len(fragments),
+            )
+
+            logger.info(
+                "Generating reads (paired_end=%s)...",
+                paired_end,
             )
             read_batch = generate_reads(
                 fragments=fragments,
@@ -1813,28 +1925,37 @@ def main(
                 error_rate_scale,
             )
 
-            # Write FASTQ (append for chunks after the first)
             append = chunk_idx > 0
             if read_batch.is_paired:
                 assert read_batch.paired is not None
-                r1_reads = [pair[0] for pair in read_batch.paired]
-                r2_reads = [pair[1] for pair in read_batch.paired]
-                write_fastq(r1_reads, r1_path, append=append)
-                write_fastq(r2_reads, r2_path, append=append)
+                r1_reads = [
+                    pair[0] for pair in read_batch.paired
+                ]
+                r2_reads = [
+                    pair[1] for pair in read_batch.paired
+                ]
+                write_fastq(
+                    r1_reads, r1_path, append=append,
+                )
+                write_fastq(
+                    r2_reads, r2_path, append=append,
+                )
             else:
                 assert read_batch.single is not None
                 write_fastq(
-                    read_batch.single, out_path, append=append,
+                    read_batch.single, out_path,
+                    append=append,
                 )
 
-            # Write BAM chunk
             write_bam_chunk(
                 bam, header, ref_name_to_idx,
                 fragments, read_batch,
             )
 
+            if outer_progress is not None and chunk_task is not None:
+                outer_progress.advance(chunk_task)
+
     logger.info("Wrote ground-truth BAM to %s", bam_path)
-    logger.info("Done.")
 
 
 if __name__ == "__main__":

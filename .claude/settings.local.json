@@ -33,7 +33,10 @@
       "WebFetch(domain:www.cureffi.org)",
       "WebFetch(domain:www.niehs.nih.gov)",
       "Bash(bash:*)",
-      "Bash(docker run:*)"
+      "Bash(docker run:*)",
+      "Bash(git clone --depth 1 git://biogrinder.git.sourceforge.net/gitroot/biogrinder/biogrinder /tmp/biogrinder_checkout)",
+      "Read(//tmp/biogrinder_checkout/**)",
+      "WebFetch(domain:rich.readthedocs.io)"
     ]
   }
 }

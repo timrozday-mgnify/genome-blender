@@ -42,5 +42,8 @@ qcal_ceiling: 0.5
 qcal_steepness: 0.25
 qcal_midpoint: 15.0
 
+# --- Output ----------------------------------------------------------
+no_ansi: false  # set true to suppress ANSI escape codes (progress bars, colours)
+
 # --- Reproducibility -------------------------------------------------
 seed: 42

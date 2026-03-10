@@ -26,3 +26,5 @@ docker run --rm \
     rust-mdbg \
     --gfa /output/rust_mdbg_out.unitigs.gfa \
     --sequences /output/rust_mdbg_out
+
+echo "rust_mdbg_out.unitigs.gfa wc stats: $(wc -l ${OUTPUT_DIR}/rust_mdbg_out.unitigs.gfa)"

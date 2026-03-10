@@ -10,7 +10,7 @@ requires-python = ">=3.10"
 dependencies = [
     "typer",
     "pyyaml",
-    "alive-progress",
+    "rich",
     "biopython",
     "pysam",
     "torch",
