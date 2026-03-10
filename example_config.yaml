@@ -21,6 +21,9 @@ paired_end: true
 # --- GC bias ---------------------------------------------------------
 gc_bias_strength: 0.0  # 0 = no bias
 
+# --- Long-read mode --------------------------------------------------
+long_read: false  # set true to sequence entire fragments (read length ignored)
+
 # --- Amplicon mode ---------------------------------------------------
 amplicon: false  # set true to skip shearing and replicate input sequences
 

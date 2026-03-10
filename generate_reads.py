@@ -28,7 +28,23 @@ from rich.progress import (
     TextColumn,
 )
 
+import click.core
+import pysam
+import torch
+import typer
+import yaml
+from Bio import SeqIO
+from Bio.Seq import Seq
+from pyro.distributions import Categorical as PyroCategorical
+from pyro.distributions import LogNormal, NegativeBinomial, Poisson
+from pyro.distributions.hmm import DiscreteHMM
+
+logger = logging.getLogger(__name__)
+
 _inner_progress: Progress | None = None
+_BASES = "ACGT"
+
+app = typer.Typer()
 
 
 @contextmanager
@@ -45,21 +61,6 @@ def progress_task(total: int, description: str):
         yield lambda: _inner_progress.advance(task_id)
     finally:
         _inner_progress.remove_task(task_id)
-
-import click.core
-import pysam
-import torch
-import typer
-import yaml
-from Bio import SeqIO
-from Bio.Seq import Seq
-from pyro.distributions import Categorical as PyroCategorical
-from pyro.distributions import LogNormal, NegativeBinomial, Poisson
-from pyro.distributions.hmm import DiscreteHMM
-
-logger = logging.getLogger(__name__)
-
-app = typer.Typer()
 
 
 class ErrorModel(str, Enum):
@@ -532,10 +533,6 @@ def batch_sample_quality_scores(
         all_scores[i, :length]
         for i, length in enumerate(read_lengths)
     ]
-
-
-_BASES = "ACGT"
-
 
 def apply_errors_to_sequence(
     sequence: str,
@@ -1044,6 +1041,69 @@ def amplicon_fragments(
     return fragments
 
 
+def _generate_long_read(
+    frag: Fragment, global_idx: int, read_len: int,
+) -> Read:
+    """Generate a long read spanning the entire fragment."""
+    base_name = (
+        f"{frag.genome_id}:{frag.contig_id}:"
+        f"{frag.start}-{frag.end}:{frag.strand}"
+    )
+    seq = frag.sequence
+    qual = "I" * len(seq)  # Q40 Phred+33
+    return Read(
+        name=f"{base_name} read_{global_idx}",
+        sequence=seq,
+        quality=qual,
+    )
+
+
+def _generate_se_read(
+    frag: Fragment, global_idx: int, read_len: int,
+) -> Read:
+    """Generate a single-end read from a fragment."""
+    base_name = (
+        f"{frag.genome_id}:{frag.contig_id}:"
+        f"{frag.start}-{frag.end}:{frag.strand}"
+    )
+    seq = frag.sequence[:read_len]
+    qual = "I" * len(seq)  # Q40 Phred+33
+    return Read(
+        name=f"{base_name} read_{global_idx}",
+        sequence=seq,
+        quality=qual,
+    )
+
+
+def _generate_pe_read(
+    frag: Fragment, global_idx: int, read_len: int,
+) -> tuple[Read, Read]:
+    """Generate a paired-end read pair from a fragment."""
+    base_name = (
+        f"{frag.genome_id}:{frag.contig_id}:"
+        f"{frag.start}-{frag.end}:{frag.strand}"
+    )
+    frag_len = len(frag.sequence)
+    r1_len = min(read_len, frag_len)
+    r2_len = min(read_len, frag_len)
+
+    r1_seq = frag.sequence[:r1_len]
+    r2_seq = _reverse_complement(frag.sequence[-r2_len:])
+
+    return (
+        Read(
+            name=f"{base_name}/1 read_{global_idx}",
+            sequence=r1_seq,
+            quality="I" * len(r1_seq),
+        ),
+        Read(
+            name=f"{base_name}/2 read_{global_idx}",
+            sequence=r2_seq,
+            quality="I" * len(r2_seq),
+        ),
+    )
+
+
 def generate_reads(
     fragments: list[Fragment],
     read_length_mean: float,
@@ -1051,6 +1111,7 @@ def generate_reads(
     paired_end: bool,
     rng: torch.Generator,
     read_index_offset: int = 0,
+    long_read: bool = False,
 ) -> ReadBatch:
     """Generate reads from fragments.
 
@@ -1068,6 +1129,9 @@ def generate_reads(
     read_index_offset : int
         Starting index for read naming, used when generating
         reads in chunks to ensure globally unique names.
+    long_read : bool
+        If True, each read spans the entire fragment (read
+        length parameters are ignored).
 
     Returns
     -------
@@ -1078,25 +1142,44 @@ def generate_reads(
     # which is seeded in main() via torch.manual_seed()
     _ = rng
 
-    if read_length_variance == 0:
+    # Select read generator and set up length sampling
+    if long_read:
+        mode = "long"
+        generate_read = _generate_long_read
+        batch_key = "single"
         read_len_dist = None
-        logger.debug(
-            "Read length distribution: fixed at %d",
-            int(read_length_mean),
-        )
+    elif paired_end:
+        mode = "paired-end"
+        generate_read = _generate_pe_read
+        batch_key = "paired"
     else:
-        mu_ln, sigma_ln = _lognormal_params_from_mean_variance(
-            read_length_mean, read_length_variance
-        )
-        read_len_dist = LogNormal(loc=mu_ln, scale=sigma_ln)
-        logger.debug(
-            "Read length distribution: LogNormal(mu=%.4f, sigma=%.4f)",
-            mu_ln, sigma_ln,
-        )
+        mode = "single-end"
+        generate_read = _generate_se_read
+        batch_key = "single"
 
-    mode = "paired-end" if paired_end else "single-end"
-    se_reads: list[Read] = []
-    pe_reads: list[tuple[Read, Read]] = []
+    if not long_read:
+        if read_length_variance == 0:
+            read_len_dist = None
+            logger.debug(
+                "Read length distribution: fixed at %d",
+                int(read_length_mean),
+            )
+        else:
+            mu_ln, sigma_ln = (
+                _lognormal_params_from_mean_variance(
+                    read_length_mean, read_length_variance,
+                )
+            )
+            read_len_dist = LogNormal(
+                loc=mu_ln, scale=sigma_ln,
+            )
+            logger.debug(
+                "Read length distribution: "
+                "LogNormal(mu=%.4f, sigma=%.4f)",
+                mu_ln, sigma_ln,
+            )
+
+    reads: list = []
 
     with progress_task(
         len(fragments), f"Generating {mode} reads",
@@ -1104,59 +1187,24 @@ def generate_reads(
         for i, frag in enumerate(fragments):
             global_idx = read_index_offset + i
             frag_len = len(frag.sequence)
-            if read_len_dist is None:
-                sampled_len = max(1, int(read_length_mean))
+            if long_read:
+                read_len = frag_len
+            elif read_len_dist is None:
+                read_len = min(
+                    max(1, int(read_length_mean)), frag_len,
+                )
             else:
                 sampled_len = int(
                     read_len_dist.sample().clamp(min=1).item()
                 )
-            read_len = min(sampled_len, frag_len)
-
-            base_name = (
-                f"{frag.genome_id}:{frag.contig_id}:"
-                f"{frag.start}-{frag.end}:{frag.strand}"
+                read_len = min(sampled_len, frag_len)
+            reads.append(
+                generate_read(frag, global_idx, read_len),
             )
-
-            if paired_end:
-                r1_len = min(read_len, frag_len)
-                r2_len = min(read_len, frag_len)
-
-                r1_seq = frag.sequence[:r1_len]
-                r2_seq = _reverse_complement(
-                    frag.sequence[-r2_len:]
-                )
-
-                r1_qual = "I" * len(r1_seq)  # Q40 Phred+33
-                r2_qual = "I" * len(r2_seq)
-
-                r1 = Read(
-                    name=f"{base_name}/1 read_{global_idx}",
-                    sequence=r1_seq,
-                    quality=r1_qual,
-                )
-                r2 = Read(
-                    name=f"{base_name}/2 read_{global_idx}",
-                    sequence=r2_seq,
-                    quality=r2_qual,
-                )
-                pe_reads.append((r1, r2))
-            else:
-                seq = frag.sequence[:read_len]
-                qual = "I" * len(seq)  # Q40 Phred+33
-                se_reads.append(
-                    Read(
-                        name=f"{base_name} read_{global_idx}",
-                        sequence=seq,
-                        quality=qual,
-                    )
-                )
             step()
 
-    if paired_end:
-        logger.debug("Generated %d read pairs", len(pe_reads))
-        return ReadBatch(paired=pe_reads)
-    logger.debug("Generated %d single-end reads", len(se_reads))
-    return ReadBatch(single=se_reads)
+    logger.debug("Generated %d %s reads", len(reads), mode)
+    return ReadBatch(**{batch_key: reads})
 
 
 def apply_error_model(
@@ -1248,14 +1296,15 @@ def apply_error_model(
         )
 
     # Re-pack into ReadBatch
+    batch_key = "paired" if read_batch.is_paired else "single"
     if read_batch.is_paired:
-        pairs = [
+        result = [
             (modified[i], modified[i + 1])
             for i in range(0, len(modified), 2)
         ]
-        return ReadBatch(paired=pairs)
-
-    return ReadBatch(single=modified)
+    else:
+        result = modified
+    return ReadBatch(**{batch_key: result})
 
 
 def write_fastq(
@@ -1367,20 +1416,15 @@ def _bam_fields_for_read(
         read.cigar if read.cigar is not None
         else [(0, len(read.sequence))]
     )
+    seq = read.sequence
+    qual = read.quality
+    ref_start = frag.start
     if is_reverse:
-        ref_span = _ref_consumed(cigar)
-        return (
-            _reverse_complement(read.sequence),
-            read.quality[::-1],
-            list(reversed(cigar)),
-            frag.end - ref_span,
-        )
-    return (
-        read.sequence,
-        read.quality,
-        cigar,
-        frag.start,
-    )
+        seq = _reverse_complement(seq)
+        qual = qual[::-1]
+        cigar = list(reversed(cigar))
+        ref_start = frag.end - _ref_consumed(cigar)
+    return seq, qual, cigar, ref_start
 
 
 def write_bam_chunk(
@@ -1406,103 +1450,98 @@ def write_bam_chunk(
         Generated reads (single-end or paired-end).
 
     """
-    tlen = 0
+    def write_pe(i: int, frag: Fragment, ref_id: int) -> None:
+        assert read_batch.paired is not None
+        r1, r2 = read_batch.paired[i]
+        qname = r1.name.split("/")[0]
+        tlen = frag.end - frag.start
+
+        r1_is_reverse = frag.strand == "-"
+        r2_is_reverse = not r1_is_reverse
+
+        r1_seq, r1_qual, r1_cigar, r1_start = (
+            _bam_fields_for_read(r1, frag, r1_is_reverse)
+        )
+        r2_seq, r2_qual, r2_cigar, r2_start = (
+            _bam_fields_for_read(r2, frag, r2_is_reverse)
+        )
+
+        if r1_start <= r2_start:
+            r1_tlen, r2_tlen = tlen, -tlen
+        else:
+            r1_tlen, r2_tlen = -tlen, tlen
+
+        a1 = pysam.AlignedSegment(header)
+        a1.query_name = qname
+        a1.query_sequence = r1_seq
+        a1.flag = 0
+        a1.is_paired = True
+        a1.is_proper_pair = True
+        a1.is_read1 = True
+        a1.is_reverse = r1_is_reverse
+        a1.mate_is_reverse = r2_is_reverse
+        a1.reference_id = ref_id
+        a1.reference_start = r1_start
+        a1.cigar = r1_cigar
+        a1.mapping_quality = 255
+        a1.query_qualities = (
+            pysam.qualitystring_to_array(r1_qual)
+        )
+        a1.next_reference_id = ref_id
+        a1.next_reference_start = r2_start
+        a1.template_length = r1_tlen
+
+        a2 = pysam.AlignedSegment(header)
+        a2.query_name = qname
+        a2.query_sequence = r2_seq
+        a2.flag = 0
+        a2.is_paired = True
+        a2.is_proper_pair = True
+        a2.is_read2 = True
+        a2.is_reverse = r2_is_reverse
+        a2.mate_is_reverse = r1_is_reverse
+        a2.reference_id = ref_id
+        a2.reference_start = r2_start
+        a2.cigar = r2_cigar
+        a2.mapping_quality = 255
+        a2.query_qualities = (
+            pysam.qualitystring_to_array(r2_qual)
+        )
+        a2.next_reference_id = ref_id
+        a2.next_reference_start = r1_start
+        a2.template_length = r2_tlen
+
+        bam.write(a1)
+        bam.write(a2)
+
+    def write_se(i: int, frag: Fragment, ref_id: int) -> None:
+        assert read_batch.single is not None
+        read = read_batch.single[i]
+        is_reverse = frag.strand == "-"
+        seq, qual, cigar, ref_start = (
+            _bam_fields_for_read(read, frag, is_reverse)
+        )
+        a = pysam.AlignedSegment(header)
+        a.query_name = read.name
+        a.query_sequence = seq
+        a.flag = 0
+        a.is_reverse = is_reverse
+        a.reference_id = ref_id
+        a.reference_start = ref_start
+        a.cigar = cigar
+        a.mapping_quality = 255
+        a.query_qualities = (
+            pysam.qualitystring_to_array(qual)
+        )
+        bam.write(a)
+
+    write_alignment = write_pe if read_batch.is_paired else write_se
+
     with progress_task(len(fragments), "Writing BAM") as step:
         for i, frag in enumerate(fragments):
             ref_name = f"{frag.genome_id}:{frag.contig_id}"
             ref_id = ref_name_to_idx[ref_name]
-            tlen = frag.end - frag.start
-
-            if read_batch.is_paired:
-                assert read_batch.paired is not None
-                r1, r2 = read_batch.paired[i]
-                qname = r1.name.split("/")[0]
-
-                # + strand: R1 forward at frag.start,
-                #           R2 reverse at frag.end
-                # - strand: R1 reverse at frag.end,
-                #           R2 forward at frag.start
-                r1_is_reverse = frag.strand == "-"
-                r2_is_reverse = not r1_is_reverse
-
-                r1_seq, r1_qual, r1_cigar, r1_start = (
-                    _bam_fields_for_read(r1, frag, r1_is_reverse)
-                )
-                r2_seq, r2_qual, r2_cigar, r2_start = (
-                    _bam_fields_for_read(r2, frag, r2_is_reverse)
-                )
-
-                # Template length: positive for leftmost read,
-                # negative for rightmost
-                if r1_start <= r2_start:
-                    r1_tlen, r2_tlen = tlen, -tlen
-                else:
-                    r1_tlen, r2_tlen = -tlen, tlen
-
-                # R1
-                a1 = pysam.AlignedSegment(header)
-                a1.query_name = qname
-                a1.query_sequence = r1_seq
-                a1.flag = 0
-                a1.is_paired = True
-                a1.is_proper_pair = True
-                a1.is_read1 = True
-                a1.is_reverse = r1_is_reverse
-                a1.mate_is_reverse = r2_is_reverse
-                a1.reference_id = ref_id
-                a1.reference_start = r1_start
-                a1.cigar = r1_cigar
-                a1.mapping_quality = 255
-                a1.query_qualities = (
-                    pysam.qualitystring_to_array(r1_qual)
-                )
-                a1.next_reference_id = ref_id
-                a1.next_reference_start = r2_start
-                a1.template_length = r1_tlen
-
-                # R2
-                a2 = pysam.AlignedSegment(header)
-                a2.query_name = qname
-                a2.query_sequence = r2_seq
-                a2.flag = 0
-                a2.is_paired = True
-                a2.is_proper_pair = True
-                a2.is_read2 = True
-                a2.is_reverse = r2_is_reverse
-                a2.mate_is_reverse = r1_is_reverse
-                a2.reference_id = ref_id
-                a2.reference_start = r2_start
-                a2.cigar = r2_cigar
-                a2.mapping_quality = 255
-                a2.query_qualities = (
-                    pysam.qualitystring_to_array(r2_qual)
-                )
-                a2.next_reference_id = ref_id
-                a2.next_reference_start = r1_start
-                a2.template_length = r2_tlen
-
-                bam.write(a1)
-                bam.write(a2)
-            else:
-                assert read_batch.single is not None
-                read = read_batch.single[i]
-                is_reverse = frag.strand == "-"
-                seq, qual, cigar, ref_start = (
-                    _bam_fields_for_read(read, frag, is_reverse)
-                )
-                a = pysam.AlignedSegment(header)
-                a.query_name = read.name
-                a.query_sequence = seq
-                a.flag = 0
-                a.is_reverse = is_reverse
-                a.reference_id = ref_id
-                a.reference_start = ref_start
-                a.cigar = cigar
-                a.mapping_quality = 255
-                a.query_qualities = (
-                    pysam.qualitystring_to_array(qual)
-                )
-                bam.write(a)
+            write_alignment(i, frag, ref_id)
             step()
 
 
@@ -1613,6 +1652,10 @@ def main(
         help="Multiplier applied to error probabilities after quality "
         "calibration; <1 reduces errors, >1 increases them",
     )] = 1.0,
+    long_read: Annotated[bool, typer.Option(
+        "--long-read/--no-long-read",
+        help="Sequence entire fragments (read length params ignored)",
+    )] = False,
     amplicon: Annotated[bool, typer.Option(
         "--amplicon/--no-amplicon",
         help="Treat input sequences as amplicons (no shearing); "
@@ -1655,6 +1698,7 @@ def main(
         qcal_steepness = p["qcal_steepness"]
         qcal_midpoint = p["qcal_midpoint"]
         error_rate_scale = p.get("error_rate_scale", 1.0)
+        long_read = p.get("long_read", False)
         amplicon = p["amplicon"]
         chunk_size = p.get("chunk_size", 1_000_000)
 
@@ -1665,6 +1709,10 @@ def main(
         raise typer.BadParameter("--num-reads is required (via CLI or config)")
     if output_prefix is None:
         raise typer.BadParameter("--output-prefix is required (via CLI or config)")
+    if long_read and paired_end:
+        raise typer.BadParameter(
+            "--long-read and --paired-end are mutually exclusive"
+        )
 
     logging.basicConfig(
         level=logging.DEBUG if verbose else logging.INFO,
@@ -1683,6 +1731,7 @@ def main(
     logger.debug("  read_len_var    = %.1f", read_length_variance)
     logger.debug("  gc_bias         = %.2f", gc_bias_strength)
     logger.debug("  paired_end      = %s", paired_end)
+    logger.debug("  long_read       = %s", long_read)
     logger.debug("  amplicon        = %s", amplicon)
     logger.debug("  chunk_size      = %d", chunk_size)
     logger.debug("  error_model     = %s", error_model.value)
@@ -1758,6 +1807,7 @@ def main(
         read_length_variance=read_length_variance,
         gc_bias_strength=gc_bias_strength,
         paired_end=paired_end,
+        long_read=long_read,
         amplicon=amplicon,
         chunk_size=chunk_size,
         rng=rng,
@@ -1805,6 +1855,7 @@ def _run_pipeline(
     read_length_variance: float,
     gc_bias_strength: float,
     paired_end: bool,
+    long_read: bool,
     amplicon: bool,
     chunk_size: int,
     rng: torch.Generator,
@@ -1858,6 +1909,46 @@ def _run_pipeline(
             "Chunks", total=num_chunks,
         )
 
+    # Set up fragment generator based on mode (amplicon vs shearing)
+    if amplicon:
+        def make_fragments(n: int) -> list[Fragment]:
+            return amplicon_fragments(
+                genomes=genomes,
+                abundances=abundances,
+                num_fragments=n,
+                rng=rng,
+            )
+    else:
+        def make_fragments(n: int) -> list[Fragment]:
+            return sample_fragments(
+                genomes=genomes,
+                abundances=abundances,
+                num_fragments=n,
+                fragment_mean=fragment_mean,
+                fragment_variance=fragment_variance,
+                gc_bias_strength=gc_bias_strength,
+                rng=rng,
+            )
+
+    # Set up FASTQ writer based on SE/PE mode
+    if paired_end:
+        def write_fastqs(
+            batch: ReadBatch, append: bool,
+        ) -> None:
+            assert batch.paired is not None
+            r1_reads = [p[0] for p in batch.paired]
+            r2_reads = [p[1] for p in batch.paired]
+            write_fastq(r1_reads, r1_path, append=append)
+            write_fastq(r2_reads, r2_path, append=append)
+    else:
+        def write_fastqs(
+            batch: ReadBatch, append: bool,
+        ) -> None:
+            assert batch.single is not None
+            write_fastq(
+                batch.single, out_path, append=append,
+            )
+
     with pysam.AlignmentFile(
         bam_path, "wb", header=header,
     ) as bam:
@@ -1875,43 +1966,11 @@ def _run_pipeline(
                 chunk_start,
             )
 
-            if amplicon:
-                logger.info(
-                    "Amplicon mode: replicating %d input "
-                    "sequences to %d fragments...",
-                    sum(
-                        len(recs)
-                        for recs in genomes.values()
-                    ),
-                    chunk_n,
-                )
-                fragments = amplicon_fragments(
-                    genomes=genomes,
-                    abundances=abundances,
-                    num_fragments=chunk_n,
-                    rng=rng,
-                )
-            else:
-                logger.info(
-                    "Sampling %d fragments...", chunk_n,
-                )
-                fragments = sample_fragments(
-                    genomes=genomes,
-                    abundances=abundances,
-                    num_fragments=chunk_n,
-                    fragment_mean=fragment_mean,
-                    fragment_variance=fragment_variance,
-                    gc_bias_strength=gc_bias_strength,
-                    rng=rng,
-                )
+            fragments = make_fragments(chunk_n)
             logger.info(
                 "Generated %d fragments", len(fragments),
             )
 
-            logger.info(
-                "Generating reads (paired_end=%s)...",
-                paired_end,
-            )
             read_batch = generate_reads(
                 fragments=fragments,
                 read_length_mean=read_length_mean,
@@ -1919,33 +1978,14 @@ def _run_pipeline(
                 paired_end=paired_end,
                 rng=rng,
                 read_index_offset=chunk_start,
+                long_read=long_read,
             )
             read_batch = apply_error_model(
                 read_batch, profile, rng, calibration,
                 error_rate_scale,
             )
 
-            append = chunk_idx > 0
-            if read_batch.is_paired:
-                assert read_batch.paired is not None
-                r1_reads = [
-                    pair[0] for pair in read_batch.paired
-                ]
-                r2_reads = [
-                    pair[1] for pair in read_batch.paired
-                ]
-                write_fastq(
-                    r1_reads, r1_path, append=append,
-                )
-                write_fastq(
-                    r2_reads, r2_path, append=append,
-                )
-            else:
-                assert read_batch.single is not None
-                write_fastq(
-                    read_batch.single, out_path,
-                    append=append,
-                )
+            write_fastqs(read_batch, append=chunk_idx > 0)
 
             write_bam_chunk(
                 bam, header, ref_name_to_idx,
