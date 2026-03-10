@@ -9,7 +9,7 @@ import pytest
 import torch
 import yaml
 
-from generate_reads import (
+from genome_blender import (
     Fragment,
     LogLinearCalibration,
     PhredCalibration,

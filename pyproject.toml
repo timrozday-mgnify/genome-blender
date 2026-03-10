@@ -21,4 +21,4 @@ dependencies = [
 dev = ["pytest"]
 
 [project.scripts]
-generate-reads = "generate_reads:app"
+generate-reads = "genome_blender.cli:app"

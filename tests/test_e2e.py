@@ -7,7 +7,7 @@ from pathlib import Path
 import pysam
 from typer.testing import CliRunner
 
-from generate_reads import app
+from genome_blender import app
 
 runner = CliRunner()
 

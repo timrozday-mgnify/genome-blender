@@ -8,7 +8,7 @@ import pysam
 import pytest
 import torch
 
-from generate_reads import (
+from genome_blender import (
     Fragment,
     Read,
     ReadBatch,
