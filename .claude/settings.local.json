@@ -42,7 +42,12 @@
       "WebFetch(domain:gfa-spec.github.io)",
       "Bash(strings $f:*)",
       "WebFetch(domain:api.github.com)",
-      "Bash(pip install:*)"
+      "Bash(pip install:*)",
+      "Read(//Users/timrozday/Documents/rust-mdbg/**)",
+      "Bash(cargo build --release)",
+      "Bash(/Users/timrozday/Documents/genome-blender/bin/rust-mdbg:*)",
+      "Bash(/Users/timrozday/miniforge3/envs/genome_blender_dev/bin/python:*)",
+      "Bash(/Users/timrozday/miniforge3/envs/genome_blender_dev/bin/pip install:*)"
     ]
   }
 }

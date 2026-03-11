@@ -28,21 +28,33 @@ DENSITY=$(
 echo "Estimated mean read length: ${MEAN_READ_LEN} bp"
 echo "Using density: ${DENSITY}  (l=${L} / (${MEAN_READ_LEN} * 0.75))"
 
-docker run --rm \
-    -v "${OUTPUT_DIR}:/output" \
-    --entrypoint rust-mdbg \
-    rust-mdbg \
-    /output/combined_reads.fastq \
+# Run rust-mdbg directly (local build from timrozday-mgnify/rust-mdbg, mg-summary branch)
+# --dump-read-minimizers writes {prefix}.{thread}.read_minimizers (LZ4-compressed TSV)
+# and {prefix}.minimizer_table (plain-text TSV: id <-> l-mer lookup)
+"$(dirname "$0")/../bin/rust-mdbg" \
+    "${COMBINED}" \
     -k 7 \
     --density "${DENSITY}" \
     -l ${L} \
     --minabund 2 \
-    --prefix /output/rust_mdbg_out \
-    --debug \
-2>&1 | tee ${OUTPUT_DIR}/output.txt
+    --prefix "${OUTPUT_DIR}/rust_mdbg_out" \
+    --dump-read-minimizers \
+2>&1 | tee "${OUTPUT_DIR}/output.txt"
 
 
-/Users/timrozday/miniforge3/envs/genome_blender_dev/bin/python $(dirname $0)/parse_gfa.py --paired-end -n 10000 ${OUTPUT_DIR}/rust_mdbg_out.gfa
+/Users/timrozday/miniforge3/envs/genome_blender_dev/bin/python "$(dirname "$0")/parse_gfa.py" \
+    -n 10000 \
+    --json "${OUTPUT_DIR}/rust_mdbg_out.graph_summary.json" \
+    "${OUTPUT_DIR}/rust_mdbg_out.gfa"
+
+MINIMIZER_TABLE="${OUTPUT_DIR}/rust_mdbg_out.minimizer_table"
+UNIQUE_MINIMIZERS=$(grep -vc '^#' "${MINIMIZER_TABLE}" 2>/dev/null || echo 0)
+echo "Unique minimizers in minimizer_table: ${UNIQUE_MINIMIZERS}"
+
+/Users/timrozday/miniforge3/envs/genome_blender_dev/bin/python "$(dirname "$0")/read_minimizers.py" \
+    --summary \
+    --json "${OUTPUT_DIR}/rust_mdbg_out.minimizer_summary.json" \
+    "${OUTPUT_DIR}/rust_mdbg_out"
 
 # echo "rust_mdbg_out.gfa head: $( cat ${OUTPUT_DIR}/rust_mdbg_out.gfa | sed -nE 's/^.*LN:i:([0-9]+).*$/\1/p' | sort -nr | head -n 5 )"
 
