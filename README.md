@@ -333,7 +333,7 @@ Core simulation pipeline (`genome_blender` package):
 
 Analysis scripts (`scripts/`):
 - rustworkx
-- click
+- Typer
 - rich
 
 ## License

@@ -6,6 +6,7 @@ Usage::
     python scripts/parse_gfa.py assembly.gfa
     python scripts/parse_gfa.py assembly.gfa --samples 5000
     python scripts/parse_gfa.py assembly.gfa --no-sample
+    python scripts/parse_gfa.py assembly.gfa --paired-end --pe-bam reads.bam
 """
 
 from __future__ import annotations
@@ -13,13 +14,14 @@ from __future__ import annotations
 import logging
 import math
 import random
-from dataclasses import dataclass
-from pathlib import Path
-
 import re
+from dataclasses import dataclass
+from enum import Enum
+from pathlib import Path
+from typing import Annotated
 
-import click
 import rustworkx as rx
+import typer
 from rich.progress import (
     BarColumn,
     MofNCompleteColumn,
@@ -27,6 +29,11 @@ from rich.progress import (
     SpinnerColumn,
     TextColumn,
 )
+
+try:
+    import pysam as _pysam
+except ImportError:
+    _pysam = None  # type: ignore[assignment]
 
 logger = logging.getLogger(__name__)
 
@@ -45,6 +52,16 @@ _PROGRESS_COLUMNS = (
     MofNCompleteColumn(),
     TextColumn("[cyan]{task.elapsed:.1f}s"),
 )
+
+app = typer.Typer()
+
+
+class WeightMode(str, Enum):
+    """Random walk neighbour-selection weighting."""
+
+    kmer = "kmer"
+    overlap = "overlap"
+    unweighted = "unweighted"
 
 
 @dataclass
@@ -409,6 +426,169 @@ def sample_path_lengths(
     return bp_lengths
 
 
+# ------------------------------------------------------------------
+# Paired-end insert size estimation
+# ------------------------------------------------------------------
+
+def _seg_name_index(graph: rx.PyGraph) -> dict[str, int]:
+    """Return a mapping from segment name to graph node index.
+
+    Args:
+        graph: Parsed GFA graph.
+
+    Returns:
+        Dict mapping ``Segment.name`` to node index.
+    """
+    return {graph[idx].name: idx for idx in graph.node_indices()}
+
+
+def _load_pe_pairs(bam_path: Path) -> dict[str, tuple[str, str]]:
+    """Load paired-end read-to-segment mappings from a BAM file.
+
+    Reads are grouped by template name.  Only primary, mapped
+    alignments are considered.  Returns only templates where
+    both R1 and R2 have a primary alignment.
+
+    Args:
+        bam_path: BAM file with reads aligned to assembly segments.
+            The reference sequence names must match segment names
+            in the GFA.
+
+    Returns:
+        Mapping of template name to ``(R1_segment, R2_segment)``.
+
+    Raises:
+        typer.BadParameter: If pysam is not installed.
+    """
+    if _pysam is None:
+        raise typer.BadParameter(
+            "pysam is required for --paired-end. "
+            "Install it with: pip install pysam"
+        )
+
+    r1_seg: dict[str, str] = {}
+    r2_seg: dict[str, str] = {}
+
+    with _pysam.AlignmentFile(str(bam_path), "rb") as bam:
+        for read in bam.fetch(until_eof=True):
+            if (
+                read.is_unmapped
+                or read.is_secondary
+                or read.is_supplementary
+                or not read.is_paired
+            ):
+                continue
+            seg = read.reference_name
+            name = read.query_name
+            if seg is None or name is None:
+                continue
+            if read.is_read1:
+                r1_seg[name] = seg
+            elif read.is_read2:
+                r2_seg[name] = seg
+
+    pairs = {
+        name: (r1_seg[name], r2_seg[name])
+        for name in r1_seg
+        if name in r2_seg
+    }
+    logger.info(
+        "Loaded %d read pairs from %s", len(pairs), bam_path,
+    )
+    return pairs
+
+
+def _path_pair_distances(
+    graph: rx.PyGraph,
+    path: list[int],
+    pair_seg_indices: list[tuple[int, int]],
+) -> list[int]:
+    """Return bp distances for read pairs found within a path.
+
+    For each pair where both segments appear in *path*, the
+    distance is the sum of segment lengths from the earlier
+    segment to the later one (inclusive).  This approximates
+    the DNA fragment length spanned by the pair.
+
+    Pairs where both reads map to the same segment are included;
+    their distance equals that segment's length.
+
+    Args:
+        graph: The assembled sequence graph.
+        path: Ordered list of node indices forming the path.
+        pair_seg_indices: List of ``(R1_node_idx, R2_node_idx)``
+            pairs to search for.
+
+    Returns:
+        List of bp distances, one per pair found in the path.
+    """
+    node_pos = {node: i for i, node in enumerate(path)}
+    distances: list[int] = []
+
+    for seg1_idx, seg2_idx in pair_seg_indices:
+        if seg1_idx not in node_pos or seg2_idx not in node_pos:
+            continue
+        i = node_pos[seg1_idx]
+        j = node_pos[seg2_idx]
+        if i > j:
+            i, j = j, i
+        dist = sum(graph[path[k]].length for k in range(i, j + 1))
+        distances.append(dist)
+
+    return distances
+
+
+def sample_pair_distances(
+    graph: rx.PyGraph,
+    pair_seg_indices: list[tuple[int, int]],
+    n_samples: int,
+    weight_mode: str = "kmer",
+) -> list[int]:
+    """Sample random paths and collect paired-end bp distances.
+
+    For each sampled path, finds all read pairs where both
+    segments appear in the path and records the bp distance
+    between them (sum of segment lengths, inclusive).  The
+    distribution of these distances estimates the fragment
+    length (insert size).
+
+    Args:
+        graph: The assembled sequence graph.
+        pair_seg_indices: List of ``(R1_node_idx, R2_node_idx)``
+            pairs, pre-converted from segment names.
+        n_samples: Number of random paths to sample.
+        weight_mode: Neighbour selection weighting —
+            ``"kmer"``, ``"overlap"``, or ``"unweighted"``.
+
+    Returns:
+        List of bp distances across all sampled paths.
+    """
+    leaves = leaf_nodes(graph)
+    if leaves:
+        start_nodes = leaves
+    else:
+        logger.warning(
+            "Graph has no leaf nodes; using all nodes as "
+            "start candidates."
+        )
+        start_nodes = list(graph.node_indices())
+
+    distances: list[int] = []
+
+    with Progress(*_PROGRESS_COLUMNS) as progress:
+        task = progress.add_task(
+            "Sampling PE distances", total=n_samples,
+        )
+        for _ in range(n_samples):
+            path = _random_simple_path(graph, start_nodes, weight_mode)
+            distances.extend(
+                _path_pair_distances(graph, path, pair_seg_indices)
+            )
+            progress.advance(task)
+
+    return distances
+
+
 def longest_simple_path(graph: rx.PyGraph) -> list[int]:
     """Return a longest simple path in the graph.
 
@@ -435,6 +615,7 @@ def print_summary(
     graph: rx.PyGraph,
     path_lengths: list[int] | None,
     weight_mode: str = "kmer",
+    pair_distances: list[int] | None = None,
 ) -> None:
     """Print a summary of graph properties to stdout.
 
@@ -444,6 +625,8 @@ def print_summary(
             if path sampling was skipped.
         weight_mode: Weight mode used for path sampling —
             shown in the output header.
+        pair_distances: Estimated insert sizes in bp from
+            paired-end analysis, or ``None`` if not performed.
     """
     n_nodes = graph.num_nodes()
     n_edges = graph.num_edges()
@@ -524,42 +707,71 @@ def print_summary(
         print(f"  std dev:  {math.sqrt(variance):,.0f}")
         print(f"  variance: {variance:,.0f}")
 
+    # Paired-end insert size estimates
+    if pair_distances is not None:
+        if not pair_distances:
+            print("\nPaired-end insert size: no pairs found in sampled paths.")
+        else:
+            n = len(pair_distances)
+            mean = sum(pair_distances) / n
+            variance = (
+                sum((x - mean) ** 2 for x in pair_distances) / n
+            )
+            print(f"\nEstimated insert sizes ({n:,} pairs, bp):")
+            print(f"  min:      {min(pair_distances):,}")
+            print(f"  max:      {max(pair_distances):,}")
+            print(f"  mean:     {mean:,.0f}")
+            print(f"  variance: {variance:,.0f}")
+
 
 # ------------------------------------------------------------------
 # CLI
 # ------------------------------------------------------------------
 
-@click.command()
-@click.argument("gfa", type=click.Path(
-    exists=True, dir_okay=False, path_type=Path,
-))
-@click.option(
-    "-n", "--samples", default=1000, show_default=True,
-    help="Number of random paths to sample.",
-)
-@click.option(
-    "--no-sample", is_flag=True, default=False,
-    help="Skip path sampling entirely.",
-)
-@click.option(
-    "--weight",
-    type=click.Choice(["kmer", "overlap", "unweighted"]),
-    default="kmer",
-    show_default=True,
-    help="Neighbour selection weighting for random walks.",
-)
-@click.option(
-    "-v", "--verbose", is_flag=True, default=False,
-    help="Enable debug logging.",
-)
+@app.command()
 def main(
-    gfa: Path,
-    samples: int,
-    no_sample: bool,
-    weight: str,
-    verbose: bool,
+    gfa: Annotated[Path, typer.Argument(
+        help="Path to the GFA file",
+        exists=True,
+        dir_okay=False,
+    )],
+    samples: Annotated[int, typer.Option(
+        "-n", "--samples",
+        help="Number of random paths to sample",
+    )] = 1000,
+    no_sample: Annotated[bool, typer.Option(
+        "--no-sample",
+        help="Skip path sampling entirely",
+    )] = False,
+    weight: Annotated[WeightMode, typer.Option(
+        help="Neighbour selection weighting "
+        "for random walks",
+        case_sensitive=False,
+    )] = WeightMode.kmer,
+    paired_end: Annotated[bool, typer.Option(
+        "--paired-end/--no-paired-end",
+        help="Estimate insert sizes from "
+        "paired-end read alignments",
+    )] = False,
+    pe_bam: Annotated[Path | None, typer.Option(
+        help="BAM file of reads aligned to assembly "
+        "segments (required with --paired-end). "
+        "Reference names must match GFA segment names",
+        exists=True,
+        dir_okay=False,
+    )] = None,
+    verbose: Annotated[bool, typer.Option(
+        "--verbose/--no-verbose",
+        help="Enable debug logging",
+    )] = False,
 ) -> None:
     """Parse a GFA file into a graph and report properties."""
+    if paired_end and pe_bam is None:
+        raise typer.BadParameter(
+            "--pe-bam PATH is required when "
+            "--paired-end is set."
+        )
+
     logging.basicConfig(
         level=logging.DEBUG if verbose else logging.INFO,
         format="%(levelname)s %(message)s",
@@ -567,19 +779,51 @@ def main(
 
     graph = parse_gfa(gfa)
 
+    weight_str = weight.value
+
     path_lengths: list[int] | None = None
     if no_sample:
         logger.debug("Path sampling skipped by --no-sample.")
     elif graph.num_nodes() == 0:
-        click.echo(
+        typer.echo(
             "Graph has no nodes; skipping path sampling.",
             err=True,
         )
     else:
-        path_lengths = sample_path_lengths(graph, samples, weight)
+        path_lengths = sample_path_lengths(
+            graph, samples, weight_str,
+        )
 
-    print_summary(graph, path_lengths, weight)
+    pair_distances: list[int] | None = None
+    if paired_end and pe_bam is not None:
+        pairs = _load_pe_pairs(pe_bam)
+        seg_idx = _seg_name_index(graph)
+        pair_seg_indices = [
+            (seg_idx[r1], seg_idx[r2])
+            for r1, r2 in pairs.values()
+            if r1 in seg_idx and r2 in seg_idx
+        ]
+        if not pair_seg_indices:
+            typer.echo(
+                "No read pairs map to known "
+                "graph segments.",
+                err=True,
+            )
+            pair_distances = []
+        else:
+            logger.info(
+                "%d of %d pairs map to graph segments",
+                len(pair_seg_indices), len(pairs),
+            )
+            pair_distances = sample_pair_distances(
+                graph, pair_seg_indices,
+                samples, weight_str,
+            )
+
+    print_summary(
+        graph, path_lengths, weight_str, pair_distances,
+    )
 
 
 if __name__ == "__main__":
-    main()
+    app()

@@ -23,7 +23,7 @@ docker run --rm \
 2>&1 | tee ${OUTPUT_DIR}/output.txt
 
 
-/Users/timrozday/miniforge3/envs/genome_blender_dev/bin/python $(dirname $0)/parse_gfa.py -n 10000 ${OUTPUT_DIR}/rust_mdbg_out.gfa
+/Users/timrozday/miniforge3/envs/genome_blender_dev/bin/python $(dirname $0)/parse_gfa.py --paired-end -n 10000 ${OUTPUT_DIR}/rust_mdbg_out.gfa
 
 # echo "rust_mdbg_out.gfa head: $( cat ${OUTPUT_DIR}/rust_mdbg_out.gfa | sed -nE 's/^.*LN:i:([0-9]+).*$/\1/p' | sort -nr | head -n 5 )"
 

@@ -39,7 +39,10 @@
       "WebFetch(domain:rich.readthedocs.io)",
       "WebFetch(domain:qiskit.org)",
       "WebFetch(domain:www.rustworkx.org)",
-      "WebFetch(domain:gfa-spec.github.io)"
+      "WebFetch(domain:gfa-spec.github.io)",
+      "Bash(strings $f:*)",
+      "WebFetch(domain:api.github.com)",
+      "Bash(pip install:*)"
     ]
   }
 }

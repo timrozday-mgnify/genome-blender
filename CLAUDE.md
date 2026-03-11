@@ -25,7 +25,7 @@ A ground-truth record of all introduced variants and the true origin of each rea
 - Use **pysam** for reading/writing FASTA/FASTQ and BAM files
 - Use **Biopython** (`Bio.SeqIO`, `Bio.Seq`) for sequence parsing and manipulation where pysam is insufficient
 - Packaging: use a `pyproject.toml` with hatchling; no `setup.py`
-- Analysis scripts in `scripts/` use **click** for CLI arguments, **rustworkx** for graph algorithms, and **rich** for progress bars
+- Analysis scripts in `scripts/` use **Typer** (with `Annotated` type hints) for CLI arguments, **rustworkx** for graph algorithms, and **rich** for progress bars
 
 ## Domain terminology
 
