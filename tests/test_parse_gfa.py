@@ -26,6 +26,7 @@ from parse_gfa import (
     _pick_uniformly,
     _random_simple_path,
     _seg_name_index,
+    _template_name,
     app,
     leaf_nodes,
     longest_simple_path,
@@ -37,6 +38,52 @@ from parse_gfa import (
 
 
 runner = CliRunner()
+
+
+# ------------------------------------------------------------------ #
+# Unit: _template_name
+# ------------------------------------------------------------------ #
+
+@pytest.mark.parametrize("name, expected", [
+    # Slash convention: /1, /2
+    ("read/1", "read"),
+    ("read/2", "read"),
+    # Slash with R: /R1, /R2
+    ("read/R1", "read"),
+    ("read/R2", "read"),
+    # Underscore with R: _R1, _R2
+    ("read_R1", "read"),
+    ("read_R2", "read"),
+    # Dot convention: .1, .2, .R1, .R2
+    ("read.1", "read"),
+    ("read.2", "read"),
+    ("read.R1", "read"),
+    ("read.R2", "read"),
+    # Illumina CASAVA space suffix
+    ("read 1:N:0:ATCG", "read"),
+    ("read 2:N:0:ATCG", "read"),
+    # The specific failing case from a genome-blender read name
+    (
+        "MGYG000290000_1:MGYG000290000_1:77418-85405:+/2",
+        "MGYG000290000_1:MGYG000290000_1:77418-85405:+",
+    ),
+    (
+        "MGYG000290000_1:MGYG000290000_1:77418-85405:+/1",
+        "MGYG000290000_1:MGYG000290000_1:77418-85405:+",
+    ),
+    # Bare _1/_2 must NOT be stripped: indistinguishable from accession suffix
+    ("MGYG000290000_1", "MGYG000290000_1"),
+    ("MGYG000290000_2", "MGYG000290000_2"),
+    # No recognised suffix — name unchanged
+    ("read_name", "read_name"),
+    ("SRR123456.1.1", "SRR123456.1"),  # .1 stripped, but inner .1 kept
+    # Description after space is stripped before suffix matching
+    ("read/2 some description here", "read"),
+    ("read_R1 extra", "read"),
+])
+def test_template_name(name: str, expected: str) -> None:
+    """_template_name strips recognised pair suffixes and descriptions."""
+    assert _template_name(name) == expected
 
 
 # ------------------------------------------------------------------ #

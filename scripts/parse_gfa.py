@@ -1,25 +1,35 @@
 #!/usr/bin/env python3
-"""Parse a GFA file into a rustworkx graph and report properties.
+"""Parse a rust-mdbg GFA output into a rustworkx graph and report properties.
+
+Optionally loads per-read minimizer IDs produced by rust-mdbg
+``--dump-read-minimizers`` for downstream alignment to sampled paths.
 
 Usage::
 
-    python scripts/parse_gfa.py assembly.gfa
-    python scripts/parse_gfa.py assembly.gfa --samples 5000
-    python scripts/parse_gfa.py assembly.gfa --no-sample
-    python scripts/parse_gfa.py assembly.gfa --paired-end --pe-bam reads.bam
+    python scripts/parse_gfa.py rust_mdbg_out.gfa
+    python scripts/parse_gfa.py rust_mdbg_out.gfa --samples 5000
+    python scripts/parse_gfa.py rust_mdbg_out.gfa --no-sample
+    python scripts/parse_gfa.py rust_mdbg_out.gfa --paired-end --pe-bam reads.bam
+    python scripts/parse_gfa.py rust_mdbg_out.gfa --read-minimizers rust_mdbg_out
 """
 
 from __future__ import annotations
 
+import glob
+import io
 import json
 import logging
 import math
 import random
 import re
-from dataclasses import dataclass
+from collections import deque
+from collections.abc import Iterator
+from dataclasses import dataclass, field
 from enum import Enum
 from pathlib import Path
 from typing import Annotated
+
+import lz4.frame
 
 import rustworkx as rx
 import typer
@@ -252,6 +262,481 @@ def _add_link(
 
 
 # ------------------------------------------------------------------
+# rust-mdbg read minimizers
+# ------------------------------------------------------------------
+
+
+def load_read_minimizers(prefix: Path) -> dict[str, tuple[int, ...]]:
+    """Load per-read minimizer IDs from rust-mdbg output files.
+
+    Reads all ``{prefix}.*.read_minimizers`` LZ4-compressed TSV files
+    produced by rust-mdbg ``--dump-read-minimizers``.  Each file has
+    one tab-separated row per read: ``read_id\tids\tpositions`` where
+    *ids* is a comma-separated list of NT-hash minimizer IDs (u64).
+
+    Args:
+        prefix: rust-mdbg output prefix (e.g. ``Path("rust_mdbg_out")``).
+
+    Returns:
+        Mapping of read name to ordered tuple of NT-hash minimizer IDs.
+    """
+    pattern = str(prefix) + ".*.read_minimizers"
+    files = sorted(glob.glob(pattern))
+    if not files:
+        logger.warning(
+            "No .read_minimizers files found for prefix: %s", prefix,
+        )
+        return {}
+
+    records: dict[str, tuple[int, ...]] = {}
+    with Progress(*_PROGRESS_COLUMNS) as progress:
+        task = progress.add_task(
+            "Loading read minimizers", total=len(files),
+        )
+        for fpath in files:
+            raw = lz4.frame.decompress(Path(fpath).read_bytes())
+            for line in io.TextIOWrapper(
+                io.BytesIO(raw), encoding="utf-8",
+            ):
+                line = line.rstrip("\n")
+                if not line or line.startswith("#"):
+                    continue
+                parts = line.split("\t")
+                if len(parts) != 3:
+                    continue
+                read_id = parts[0]
+                ids = tuple(int(x) for x in parts[1].split(",") if x)
+                records[read_id] = ids
+                logger.debug("Read name: %s", read_id)
+            progress.advance(task)
+
+    logger.info(
+        "Loaded minimizers for %d reads from %s.*",
+        len(records), prefix,
+    )
+    return records
+
+
+def load_minimizer_table(table_path: Path) -> dict[int, str]:
+    """Load a rust-mdbg minimizer_table file into a hash-to-lmer dict.
+
+    Args:
+        table_path: Path to ``{prefix}.minimizer_table`` (plain-text
+            TSV: ``hash<TAB>lmer`` per line).
+
+    Returns:
+        Mapping of NT-hash (u64) to l-mer string.
+    """
+    table: dict[int, str] = {}
+    with open(table_path) as fh:
+        for line in fh:
+            line = line.rstrip("\n")
+            if not line or line.startswith("#"):
+                continue
+            parts = line.split("\t")
+            if len(parts) >= 2:
+                table[int(parts[0])] = parts[1]
+    logger.info(
+        "Loaded %d minimizers from %s", len(table), table_path,
+    )
+    return table
+
+
+# ------------------------------------------------------------------
+# Read index
+# ------------------------------------------------------------------
+
+# Strips common paired-end read-name suffixes to obtain the template name.
+# Handles: /1 /2, /R1 /R2, _R1 _R2, .1 .2, .R1 .R2,
+#          and Illumina CASAVA space suffixes (e.g. " 1:N:0:BARCODE").
+# Bare _1/_2 (underscore without R) are intentionally excluded: they are
+# indistinguishable from accession suffixes (e.g. MGYG000290000_1).
+_PAIR_SUFFIX_RE = re.compile(
+    r"/R?[12]$"             # /1  /2  /R1  /R2
+    r"|_R[12]$"             # _R1  _R2
+    r"|\.R?[12]$"           # .1  .2  .R1  .R2
+    r"|[ \t][12]:[^ \t]+$"  # CASAVA: " 1:N:0:BARCODE"
+)
+
+
+def _template_name(name: str) -> str:
+    """Strip paired-end suffix from *name* to get the template name.
+
+    Args:
+        name: Raw read name from a FASTQ/FASTA file.
+
+    Returns:
+        Template name shared by both mates of a pair.
+    """
+    return _PAIR_SUFFIX_RE.sub("", name.split()[0])
+
+
+@dataclass
+class ReadIndex:
+    """Integer-keyed read registry for memory-efficient downstream use.
+
+    Each read is assigned a compact integer ID so that index structures
+    (Aho-Corasick output lists, pair maps, position tables) store small
+    ints rather than variable-length strings.
+
+    Attributes:
+        name_to_id: Read name to compact integer ID.
+        names: Inverse map — index is the read ID, value is the name.
+        minimizers: Per-read ordered minimizer-ID tuples, indexed by
+            read ID.
+        pairs: Read ID to mate read ID for paired-end reads.  Unpaired
+            reads have no entry.
+    """
+
+    name_to_id: dict[str, int]
+    names: list[str]
+    minimizers: list[tuple[int, ...]]
+    pairs: dict[int, int]
+
+
+def build_read_index(
+    read_minimizers: dict[str, tuple[int, ...]],
+) -> ReadIndex:
+    """Build an integer-indexed read registry from a minimizer dict.
+
+    Reads are assigned IDs in sorted name order for reproducibility.
+    Paired-end mates are detected by stripping common name suffixes
+    and grouping reads that share the same template name.
+
+    Args:
+        read_minimizers: Mapping of read name to ordered minimizer IDs
+            as returned by :func:`load_read_minimizers`.
+
+    Returns:
+        A :class:`ReadIndex` with integer IDs, minimizer lists stored
+        by index, and paired mates cross-linked.
+    """
+    sorted_names = sorted(read_minimizers)
+    n_reads = len(sorted_names)
+
+    name_to_id: dict[str, int] = {}
+    names: list[str] = sorted_names
+    minimizers: list[tuple[int, ...]] = []
+    template_to_ids: dict[str, list[int]] = {}
+
+    with Progress(*_PROGRESS_COLUMNS) as progress:
+        task = progress.add_task("Building read index", total=n_reads)
+        for read_id, name in enumerate(sorted_names):
+            name_to_id[name] = read_id
+            minimizers.append(read_minimizers[name])
+            tmpl = _template_name(name)
+            logger.debug("Read name: %s  template: %s", name, tmpl)
+            template_to_ids.setdefault(tmpl, []).append(read_id)
+            progress.advance(task)
+
+    pairs: dict[int, int] = {}
+    for tmpl, ids in template_to_ids.items():
+        if len(ids) == 2:
+            pairs[ids[0]] = ids[1]
+            pairs[ids[1]] = ids[0]
+        elif len(ids) > 2:
+            logger.warning(
+                "Template %r has %d reads; skipping pair detection",
+                tmpl, len(ids),
+            )
+
+    logger.info(
+        "Read index: %d reads, %d paired templates",
+        len(names), len(pairs) // 2,
+    )
+    return ReadIndex(
+        name_to_id=name_to_id,
+        names=names,
+        minimizers=minimizers,
+        pairs=pairs,
+    )
+
+
+# ------------------------------------------------------------------
+# Segment minimizers
+# ------------------------------------------------------------------
+
+
+def _segment_minimizers(
+    sequence: str,
+    reverse_table: dict[str, int],
+    l: int,
+) -> tuple[int, ...]:
+    """Extract minimizer IDs from a segment sequence by l-mer lookup.
+
+    Slides an l-mer window over *sequence* and looks up each l-mer in
+    *reverse_table*.  Only l-mers present in the table (those selected
+    as minimizers during graph construction) are included.  The table
+    was built from HPC sequences, so *sequence* should also be in HPC
+    space (as output by rust-mdbg).
+
+    Args:
+        sequence: Segment DNA sequence, typically HPC-encoded.
+        reverse_table: lmer-string to NT-hash mapping (inverse of the
+            minimizer_table file).
+        l: l-mer length used during rust-mdbg graph construction.
+
+    Returns:
+        Ordered tuple of NT-hash minimizer IDs for this segment.
+    """
+    ids: list[int] = []
+    for i in range(len(sequence) - l + 1):
+        h = reverse_table.get(sequence[i: i + l])
+        if h is not None:
+            ids.append(h)
+    return tuple(ids)
+
+
+def build_segment_minimizers(
+    graph: rx.PyGraph,
+    reverse_table: dict[str, int],
+    l: int,
+) -> dict[str, tuple[int, ...]]:
+    """Build a segment-name → minimizer-ID mapping for all graph nodes.
+
+    Segments whose sequence is ``*`` (not stored in the GFA) are
+    skipped with a warning and will be absent from path minimizer
+    sequences.
+
+    Args:
+        graph: Parsed GFA graph.
+        reverse_table: lmer → NT-hash mapping derived by inverting the
+            minimizer_table (``{h: lmer for h, lmer in table.items()}``
+            → ``{lmer: h ...}``).
+        l: l-mer length.
+
+    Returns:
+        Dict mapping segment name to ordered tuple of minimizer IDs.
+    """
+    seg_min: dict[str, tuple[int, ...]] = {}
+    n_missing = 0
+    with Progress(*_PROGRESS_COLUMNS) as progress:
+        task = progress.add_task(
+            "Extracting segment minimizers", total=graph.num_nodes(),
+        )
+        for idx in graph.node_indices():
+            seg: Segment = graph[idx]
+            if seg.sequence == "*":
+                n_missing += 1
+            else:
+                seg_min[seg.name] = _segment_minimizers(
+                    seg.sequence, reverse_table, l,
+                )
+            progress.advance(task)
+    if n_missing:
+        logger.warning(
+            "%d segment(s) have sequence \"*\" and are excluded "
+            "from path minimizer sequences",
+            n_missing,
+        )
+    return seg_min
+
+
+def path_minimizer_sequence(
+    graph: rx.PyGraph,
+    path: list[int],
+    segment_minimizers: dict[str, tuple[int, ...]],
+    k: int,
+) -> tuple[int, ...]:
+    """Build the minimizer sequence for a sampled graph path.
+
+    Adjacent segments in a rust-mdbg path share *k* − 1 minimizers
+    (the graph is a k-mer de Bruijn graph over minimizer sequences).
+    The overlapping prefix of each segment after the first is therefore
+    dropped before concatenation.
+
+    Args:
+        graph: Parsed GFA graph.
+        path: Ordered list of node indices forming the path.
+        segment_minimizers: Precomputed segment-name → minimizer IDs
+            from :func:`build_segment_minimizers`.
+        k: rust-mdbg k-mer size (overlap between adjacent segments is
+            *k* − 1 minimizers).
+
+    Returns:
+        Ordered tuple of minimizer IDs spanning the entire path.
+    """
+    result: list[int] = []
+    overlap = k - 1
+    for i, node_idx in enumerate(path):
+        seg: Segment = graph[node_idx]
+        ids = segment_minimizers.get(seg.name, ())
+        result.extend(ids if i == 0 else ids[overlap:])
+    return tuple(result)
+
+
+# ------------------------------------------------------------------
+# Aho-Corasick automaton over integer sequences
+# ------------------------------------------------------------------
+
+
+@dataclass
+class _AcNode:
+    """Single node in the Aho-Corasick trie."""
+
+    goto: dict[int, int] = field(default_factory=dict)
+    failure: int = 0
+    # Each entry: (pattern_id, pattern_length) emitted at this state.
+    output: list[tuple[int, int]] = field(default_factory=list)
+
+
+class AhoCorasick:
+    """Aho-Corasick automaton for exact substring matching.
+
+    Operates over arbitrary integer sequences (e.g. NT-hash minimizer
+    IDs) rather than characters.  Trie transitions use dicts so the
+    integer alphabet can be arbitrarily sparse.
+
+    Usage::
+
+        ac = AhoCorasick()
+        for read_id, mids in enumerate(index.minimizers):
+            ac.add_pattern(mids, read_id)
+        ac.build()
+        matches = ac.search(path_minimizer_sequence(...))
+    """
+
+    def __init__(self) -> None:
+        self._nodes: list[_AcNode] = [_AcNode()]
+
+    def _new_node(self) -> int:
+        self._nodes.append(_AcNode())
+        return len(self._nodes) - 1
+
+    def add_pattern(self, pattern: tuple[int, ...], pattern_id: int) -> None:
+        """Insert *pattern* into the trie, tagged with *pattern_id*.
+
+        Args:
+            pattern: Sequence of integer minimizer IDs.
+            pattern_id: Caller-assigned identifier emitted on a match
+                (use the read's integer ID from :class:`ReadIndex`).
+        """
+        state = 0
+        for symbol in pattern:
+            if symbol not in self._nodes[state].goto:
+                self._nodes[state].goto[symbol] = self._new_node()
+            state = self._nodes[state].goto[symbol]
+        self._nodes[state].output.append((pattern_id, len(pattern)))
+
+    def build(self) -> None:
+        """Compute failure links and propagate outputs via BFS.
+
+        Must be called once after all :meth:`add_pattern` calls and
+        before any :meth:`search` calls.
+        """
+        q: deque[int] = deque()
+        for child in self._nodes[0].goto.values():
+            self._nodes[child].failure = 0
+            q.append(child)
+
+        while q:
+            state = q.popleft()
+            node = self._nodes[state]
+            for symbol, next_state in node.goto.items():
+                child = self._nodes[next_state]
+                fall = node.failure
+                while fall != 0 and symbol not in self._nodes[fall].goto:
+                    fall = self._nodes[fall].failure
+                child.failure = self._nodes[fall].goto.get(symbol, 0)
+                if child.failure == next_state:
+                    child.failure = 0
+                child.output = (
+                    child.output + self._nodes[child.failure].output
+                )
+                q.append(next_state)
+
+    def search(
+        self,
+        text: tuple[int, ...],
+    ) -> list[tuple[int, int, int]]:
+        """Find all pattern occurrences in *text*.
+
+        Args:
+            text: Sequence of integer minimizer IDs to search.
+
+        Returns:
+            List of ``(start, end, pattern_id)`` tuples where
+            ``text[start:end]`` matches the pattern for *pattern_id*.
+            Results are ordered by end position.
+        """
+        state = 0
+        matches: list[tuple[int, int, int]] = []
+        for pos, symbol in enumerate(text):
+            while state != 0 and symbol not in self._nodes[state].goto:
+                state = self._nodes[state].failure
+            state = self._nodes[state].goto.get(symbol, 0)
+            for pat_id, pat_len in self._nodes[state].output:
+                matches.append((pos - pat_len + 1, pos + 1, pat_id))
+        return matches
+
+
+def build_aho_corasick(index: ReadIndex) -> AhoCorasick:
+    """Build an Aho-Corasick automaton from all reads in *index*.
+
+    Each read's integer ID is used as the pattern ID so match results
+    can be resolved back to read names and pairs without storing strings
+    in the automaton.  Reads with empty minimizer sequences are skipped.
+
+    Args:
+        index: Populated :class:`ReadIndex`.
+
+    Returns:
+        A compiled :class:`AhoCorasick` automaton ready for searching.
+    """
+    ac = AhoCorasick()
+    with Progress(*_PROGRESS_COLUMNS) as progress:
+        task = progress.add_task(
+            "Building Aho-Corasick", total=len(index.names),
+        )
+        for read_id, minimizers in enumerate(index.minimizers):
+            if minimizers:
+                ac.add_pattern(minimizers, read_id)
+            progress.advance(task)
+    ac.build()
+    return ac
+
+
+# ------------------------------------------------------------------
+# Path matching
+# ------------------------------------------------------------------
+
+
+@dataclass
+class PathMatch:
+    """A read whose minimizer sequence was found within a path.
+
+    Attributes:
+        read_id: Integer read ID from :class:`ReadIndex`.
+        path_start: Start index in the path's minimizer sequence.
+        path_end: Exclusive end index in the path's minimizer sequence.
+    """
+
+    read_id: int
+    path_start: int
+    path_end: int
+
+
+def match_reads_to_path(
+    path_min_seq: tuple[int, ...],
+    ac: AhoCorasick,
+) -> list[PathMatch]:
+    """Find all reads whose minimizer sequences occur in *path_min_seq*.
+
+    Args:
+        path_min_seq: Concatenated minimizer sequence for a sampled
+            graph path, from :func:`path_minimizer_sequence`.
+        ac: Compiled :class:`AhoCorasick` automaton built from all reads.
+
+    Returns:
+        List of :class:`PathMatch` records, one per occurrence.
+    """
+    return [
+        PathMatch(read_id=pat_id, path_start=start, path_end=end)
+        for start, end, pat_id in ac.search(path_min_seq)
+    ]
+
+
+# ------------------------------------------------------------------
 # Path sampling
 # ------------------------------------------------------------------
 
@@ -376,20 +861,15 @@ def _random_simple_path(
     return path
 
 
-def sample_path_lengths(
+def _iter_sampled_paths(
     graph: rx.PyGraph,
     n_samples: int,
     weight_mode: str = "kmer",
-) -> list[int]:
-    """Sample random simple paths and return their bp lengths.
+) -> Iterator[tuple[list[int], int]]:
+    """Yield ``(path, bp_length)`` for *n_samples* random simple paths.
 
-    Walks start from leaf nodes (degree == 1) so that each
-    path travels from a graph boundary inward.  If the graph
-    has no leaves (e.g. a pure cycle), all nodes are used as
-    start candidates instead.
-
-    Each path length is the sum of segment lengths along the
-    path.
+    Walks start from leaf nodes (degree == 1).  If the graph has no
+    leaves, all nodes are used as start candidates instead.
 
     Args:
         graph: The assembled sequence graph.
@@ -397,8 +877,9 @@ def sample_path_lengths(
         weight_mode: Neighbour selection weighting —
             ``"kmer"``, ``"overlap"``, or ``"unweighted"``.
 
-    Returns:
-        List of path lengths in base pairs.
+    Yields:
+        ``(path, bp_length)`` where *path* is an ordered list of node
+        indices and *bp_length* is the sum of their segment lengths.
     """
     leaves = leaf_nodes(graph)
     if leaves:
@@ -410,21 +891,54 @@ def sample_path_lengths(
         )
         start_nodes = list(graph.node_indices())
 
-    bp_lengths: list[int] = []
-
     with Progress(*_PROGRESS_COLUMNS) as progress:
-        task = progress.add_task(
-            "Sampling paths", total=n_samples,
-        )
+        task = progress.add_task("Sampling paths", total=n_samples)
         for _ in range(n_samples):
-            path = _random_simple_path(
-                graph, start_nodes, weight_mode,
-            )
+            path = _random_simple_path(graph, start_nodes, weight_mode)
             bp = sum(graph[idx].length for idx in path)
-            bp_lengths.append(bp)
+            yield path, bp
             progress.advance(task)
 
-    return bp_lengths
+
+def sample_path_lengths(
+    graph: rx.PyGraph,
+    n_samples: int,
+    weight_mode: str = "kmer",
+) -> list[int]:
+    """Sample random simple paths and return their bp lengths.
+
+    Args:
+        graph: The assembled sequence graph.
+        n_samples: Number of paths to sample.
+        weight_mode: Neighbour selection weighting —
+            ``"kmer"``, ``"overlap"``, or ``"unweighted"``.
+
+    Returns:
+        List of path lengths in base pairs.
+    """
+    return [bp for _, bp in _iter_sampled_paths(graph, n_samples, weight_mode)]
+
+
+def sample_paths(
+    graph: rx.PyGraph,
+    n_samples: int,
+    weight_mode: str = "kmer",
+) -> list[tuple[list[int], int]]:
+    """Sample random simple paths and return them with their bp lengths.
+
+    Like :func:`sample_path_lengths` but also returns the path node
+    sequences needed for minimizer matching.
+
+    Args:
+        graph: The assembled sequence graph.
+        n_samples: Number of paths to sample.
+        weight_mode: Neighbour selection weighting —
+            ``"kmer"``, ``"overlap"``, or ``"unweighted"``.
+
+    Returns:
+        List of ``(path, bp_length)`` pairs.
+    """
+    return list(_iter_sampled_paths(graph, n_samples, weight_mode))
 
 
 # ------------------------------------------------------------------
@@ -838,17 +1352,38 @@ def main(
         exists=True,
         dir_okay=False,
     )] = None,
-    verbose: Annotated[bool, typer.Option(
-        "--verbose/--no-verbose",
-        help="Enable debug logging",
+    debug: Annotated[bool, typer.Option(
+        "--debug/--no-debug",
+        help="Enable debug logging (includes per-read name and "
+             "template name output when --read-minimizers is used)",
     )] = False,
     json_out: Annotated[Path | None, typer.Option(
         "--json",
         help="Write summary statistics as JSON to this path",
         dir_okay=False,
     )] = None,
+    read_minimizers_prefix: Annotated[Path | None, typer.Option(
+        "--read-minimizers",
+        help="rust-mdbg output prefix for loading per-read minimizer IDs "
+             "(e.g. rust_mdbg_out); reads all matching "
+             "{prefix}.*.read_minimizers files",
+    )] = None,
+    minimizer_table: Annotated[Path | None, typer.Option(
+        "--minimizer-table",
+        help="Path to the rust-mdbg {prefix}.minimizer_table file. "
+             "Required for read-to-path matching via Aho-Corasick; "
+             "used to reconstruct per-segment minimizer sequences",
+        exists=True,
+        dir_okay=False,
+    )] = None,
+    k: Annotated[int, typer.Option(
+        "--k",
+        help="rust-mdbg k-mer size used during graph construction. "
+             "Controls the minimizer overlap between adjacent segments "
+             "(overlap = k - 1) when building path minimizer sequences",
+    )] = 7,
 ) -> None:
-    """Parse a GFA file into a graph and report properties."""
+    """Parse a rust-mdbg GFA output into a graph and report properties."""
     if paired_end and pe_bam is None:
         raise typer.BadParameter(
             "--pe-bam PATH is required when "
@@ -856,7 +1391,7 @@ def main(
         )
 
     logging.basicConfig(
-        level=logging.DEBUG if verbose else logging.INFO,
+        level=logging.DEBUG if debug else logging.INFO,
         format="%(levelname)s %(message)s",
     )
 
@@ -864,7 +1399,11 @@ def main(
 
     weight_str = weight.value
 
+    # When minimizer matching is requested we need the actual paths,
+    # not just their lengths, so sample once and derive both.
+    sampled: list[tuple[list[int], int]] | None = None
     path_lengths: list[int] | None = None
+
     if no_sample:
         logger.debug("Path sampling skipped by --no-sample.")
     elif graph.num_nodes() == 0:
@@ -873,9 +1412,8 @@ def main(
             err=True,
         )
     else:
-        path_lengths = sample_path_lengths(
-            graph, samples, weight_str,
-        )
+        sampled = sample_paths(graph, samples, weight_str)
+        path_lengths = [bp for _, bp in sampled]
 
     pair_distances: list[int] | None = None
     if paired_end and pe_bam is not None:
@@ -907,11 +1445,76 @@ def main(
         graph, path_lengths, weight_str, pair_distances,
     )
 
+    read_index: ReadIndex | None = None
+    ac: AhoCorasick | None = None
+    n_total_matches = 0
+
+    if read_minimizers_prefix is not None:
+        raw_minimizers = load_read_minimizers(read_minimizers_prefix)
+        read_index = build_read_index(raw_minimizers)
+        typer.echo(
+            f"Read index: {len(read_index.names):,} reads, "
+            f"{len(read_index.pairs) // 2:,} paired templates",
+            err=True,
+        )
+        ac = build_aho_corasick(read_index)
+        typer.echo(
+            f"Aho-Corasick automaton: {len(ac._nodes):,} states",
+            err=True,
+        )
+
+        if minimizer_table is not None and sampled:
+            table = load_minimizer_table(minimizer_table)
+            l = len(next(iter(table.values())))  # infer l from table
+            reverse_table: dict[str, int] = {
+                lmer: h for h, lmer in table.items()
+            }
+            seg_min = build_segment_minimizers(graph, reverse_table, l)
+            typer.echo(
+                f"Segment minimizers: {len(seg_min):,} segments "
+                f"with sequences (l={l})",
+                err=True,
+            )
+
+            match_counts: dict[int, int] = {}  # read_id → hit count
+            with Progress(*_PROGRESS_COLUMNS) as progress:
+                task = progress.add_task(
+                    "Matching reads to paths", total=len(sampled),
+                )
+                for path, _ in sampled:
+                    seq = path_minimizer_sequence(
+                        graph, path, seg_min, k,
+                    )
+                    for m in match_reads_to_path(seq, ac):
+                        match_counts[m.read_id] = (
+                            match_counts.get(m.read_id, 0) + 1
+                        )
+                        n_total_matches += 1
+                    progress.advance(task)
+
+            n_matched_reads = len(match_counts)
+            typer.echo(
+                f"Reads matched to paths: {n_matched_reads:,} reads, "
+                f"{n_total_matches:,} total occurrences",
+                err=True,
+            )
+        elif minimizer_table is None and read_minimizers_prefix is not None:
+            typer.echo(
+                "Provide --minimizer-table to enable read-to-path "
+                "Aho-Corasick matching.",
+                err=True,
+            )
+
     if json_out is not None:
         stats = _compute_summary(
             graph, path_lengths, weight_str, pair_distances,
         )
         stats["gfa"] = str(gfa)
+        if read_index is not None:
+            stats["read_index_reads"] = len(read_index.names)
+            stats["read_index_pairs"] = len(read_index.pairs) // 2
+        if n_total_matches:
+            stats["path_match_occurrences"] = n_total_matches
         json_out.write_text(json.dumps(stats, indent=2) + "\n")
         typer.echo(f"Stats written to {json_out}", err=True)
 
