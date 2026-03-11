@@ -158,7 +158,7 @@ docker buildx build -t <tool-name> containers/<tool>/
 
 ### Run scripts
 
-The `scripts/` directory contains ready-to-run shell scripts that execute each tool via Docker against simulated FASTQ files. All scripts read paired-end input from `../genome-blender_run/single_short_shallow/output/` and write output to a tool-specific subdirectory alongside the input.
+The `scripts/` directory contains ready-to-run shell scripts and Python analysis scripts. Shell scripts execute each tool via Docker against simulated FASTQ files; all read paired-end input from `../genome-blender_run/single_short_shallow/output/` and write output to a tool-specific subdirectory alongside the input.
 
 #### `run_cuttlefish3.sh` — Compacted de Bruijn graph (unitigs)
 
@@ -270,6 +270,28 @@ Runs [rust-mdbg](https://github.com/ekimb/rust-mdbg) to build a minimizer-space 
 | `--minabund` | `2` | Minimum k-min-mer abundance |
 | `--prefix` | output path | Output file prefix |
 
+#### `parse_gfa.py` — GFA graph analysis
+
+Parses a GFA file into an undirected graph using [rustworkx](https://www.rustworkx.org/) and reports structural properties. Segments become nodes, links become edges.
+
+```bash
+python scripts/parse_gfa.py assembly.gfa
+python scripts/parse_gfa.py assembly.gfa --samples 5000
+python scripts/parse_gfa.py assembly.gfa --weight overlap
+python scripts/parse_gfa.py assembly.gfa --no-sample
+```
+
+| Option | Default | Description |
+|--------|---------|-------------|
+| `-n`/`--samples` | `1000` | Number of random paths to sample |
+| `--weight` | `kmer` | Neighbour-selection weighting: `kmer` (k-mer count tag), `overlap` (CIGAR overlap length), `unweighted` (uniform) |
+| `--no-sample` | off | Skip path sampling entirely |
+| `-v`/`--verbose` | off | Enable debug logging |
+
+**Summary output** includes node/edge counts, connected component sizes, segment length statistics (min/max/mean), node degree statistics, k-mer count statistics (when the `KC` tag is present), and sampled path length statistics (min/max/mean/std dev/variance).
+
+**Path sampling** performs random simple walks starting from leaf nodes (degree 1), so each walk travels from one graph boundary to another. If the graph has no leaves (e.g. a pure cycle), all nodes are used as start points. Walk neighbours are selected according to `--weight`.
+
 ## Comparison with other simulators
 
 Several existing tools address overlapping aspects of read simulation. genome-blender aims to combine metagenome-aware abundance modelling, configurable error profiles, and full ground-truth tracking in a single Python toolkit.
@@ -300,6 +322,7 @@ In genome-blender: `r1_seq = fragment[:read_len]`, `r2_seq = revcomp(fragment[-r
 
 ## Requirements
 
+Core simulation pipeline (`genome_blender` package):
 - Python 3.10+
 - PyTorch
 - Pyro-PPL
@@ -307,6 +330,11 @@ In genome-blender: `r1_seq = fragment[:read_len]`, `r2_seq = revcomp(fragment[-r
 - Biopython
 - Typer
 - PyYAML
+
+Analysis scripts (`scripts/`):
+- rustworkx
+- click
+- rich
 
 ## License
 

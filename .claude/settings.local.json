@@ -36,7 +36,10 @@
       "Bash(docker run:*)",
       "Bash(git clone --depth 1 git://biogrinder.git.sourceforge.net/gitroot/biogrinder/biogrinder /tmp/biogrinder_checkout)",
       "Read(//tmp/biogrinder_checkout/**)",
-      "WebFetch(domain:rich.readthedocs.io)"
+      "WebFetch(domain:rich.readthedocs.io)",
+      "WebFetch(domain:qiskit.org)",
+      "WebFetch(domain:www.rustworkx.org)",
+      "WebFetch(domain:gfa-spec.github.io)"
     ]
   }
 }
