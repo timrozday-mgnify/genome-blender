@@ -11,6 +11,7 @@ Usage::
 
 from __future__ import annotations
 
+import json
 import logging
 import math
 import random
@@ -611,6 +612,108 @@ def longest_simple_path(graph: rx.PyGraph) -> list[int]:
 # Summary output
 # ------------------------------------------------------------------
 
+def _compute_summary(
+    graph: rx.PyGraph,
+    path_lengths: list[int] | None,
+    weight_mode: str = "kmer",
+    pair_distances: list[int] | None = None,
+) -> dict[str, object]:
+    """Compute a summary of graph properties as a dict.
+
+    Args:
+        graph: Parsed GFA graph.
+        path_lengths: Sampled path lengths in bp, or ``None``
+            if path sampling was skipped.
+        weight_mode: Weight mode used for path sampling.
+        pair_distances: Estimated insert sizes in bp from
+            paired-end analysis, or ``None`` if not performed.
+
+    Returns:
+        Dict of summary statistics suitable for JSON serialisation.
+    """
+    n_nodes = graph.num_nodes()
+    n_edges = graph.num_edges()
+    result: dict[str, object] = {
+        "nodes": n_nodes,
+        "edges": n_edges,
+    }
+
+    if n_nodes == 0:
+        return result
+
+    components = rx.connected_components(graph)
+    component_sizes = sorted(
+        (len(c) for c in components), reverse=True,
+    )
+    result["connected_components"] = len(components)
+    result["largest_component_nodes"] = component_sizes[0]
+    if len(component_sizes) > 1:
+        result["smallest_component_nodes"] = component_sizes[-1]
+
+    segments: list[Segment] = [
+        graph[idx] for idx in graph.node_indices()
+    ]
+    seg_lengths = [s.length for s in segments]
+    total_bp = sum(seg_lengths)
+    result["total_assembly_bp"] = total_bp
+    result["segment_length_min"] = min(seg_lengths)
+    result["segment_length_max"] = max(seg_lengths)
+    result["segment_length_mean"] = total_bp / n_nodes
+
+    degrees = [
+        graph.degree(idx) for idx in graph.node_indices()
+    ]
+    result["degree_min"] = min(degrees)
+    result["degree_max"] = max(degrees)
+    result["degree_mean"] = sum(degrees) / n_nodes
+
+    kmer_counts = [
+        s.kmer_count for s in segments
+        if s.kmer_count is not None
+    ]
+    if kmer_counts:
+        result["kmer_count_min"] = min(kmer_counts)
+        result["kmer_count_max"] = max(kmer_counts)
+        result["kmer_count_mean"] = (
+            sum(kmer_counts) / len(kmer_counts)
+        )
+
+    if path_lengths is not None:
+        n = len(path_lengths)
+        mean = sum(path_lengths) / n
+        variance = (
+            sum((x - mean) ** 2 for x in path_lengths) / n
+        )
+        result["path_lengths"] = {
+            "samples": n,
+            "weight_mode": weight_mode,
+            "min": min(path_lengths),
+            "max": max(path_lengths),
+            "mean": mean,
+            "std_dev": math.sqrt(variance),
+            "variance": variance,
+        }
+
+    if pair_distances is not None:
+        if not pair_distances:
+            result["insert_sizes"] = None
+        else:
+            n = len(pair_distances)
+            mean = sum(pair_distances) / n
+            variance = (
+                sum((x - mean) ** 2 for x in pair_distances) / n
+            )
+            result["insert_sizes"] = {
+                "pairs": n,
+                "min": min(pair_distances),
+                "max": max(pair_distances),
+                "mean": mean,
+                "variance": variance,
+            }
+
+    return result
+
+
 def print_summary(
     graph: rx.PyGraph,
     path_lengths: list[int] | None,
@@ -628,100 +731,75 @@ def print_summary(
         pair_distances: Estimated insert sizes in bp from
             paired-end analysis, or ``None`` if not performed.
     """
-    n_nodes = graph.num_nodes()
-    n_edges = graph.num_edges()
+    s = _compute_summary(graph, path_lengths, weight_mode, pair_distances)
 
-    print(f"Nodes (segments): {n_nodes}")
-    print(f"Edges (links):    {n_edges}")
+    print(f"Nodes (segments): {s['nodes']}")
+    print(f"Edges (links):    {s['edges']}")
 
-    if n_nodes == 0:
+    if s["nodes"] == 0:
         return
 
-    # Connected components
-    components = rx.connected_components(graph)
-    component_sizes = sorted(
-        (len(c) for c in components), reverse=True,
-    )
-    print(f"Connected components: {len(components)}")
-    print(
-        f"Largest component:  {component_sizes[0]} nodes",
-    )
-    if len(component_sizes) > 1:
+    print(f"Connected components: {s['connected_components']}")
+    print(f"Largest component:  {s['largest_component_nodes']} nodes")
+    if "smallest_component_nodes" in s:
         print(
             f"Smallest component: "
-            f"{component_sizes[-1]} nodes"
+            f"{s['smallest_component_nodes']} nodes"
         )
 
-    # Segment length statistics
-    segments: list[Segment] = [
-        graph[idx] for idx in graph.node_indices()
-    ]
-    lengths = [s.length for s in segments]
-    total_bp = sum(lengths)
-    print(f"Total assembly span: {total_bp:,} bp")
+    print(f"Total assembly span: {s['total_assembly_bp']:,} bp")
     print(
         f"Segment lengths:  "
-        f"min={min(lengths):,}, "
-        f"max={max(lengths):,}, "
-        f"mean={total_bp / n_nodes:,.0f}"
+        f"min={s['segment_length_min']:,}, "
+        f"max={s['segment_length_max']:,}, "
+        f"mean={s['segment_length_mean']:,.0f}"  # type: ignore[str-format]
     )
-
-    # Degree statistics
-    degrees = [
-        graph.degree(idx) for idx in graph.node_indices()
-    ]
     print(
         f"Node degrees:     "
-        f"min={min(degrees)}, "
-        f"max={max(degrees)}, "
-        f"mean={sum(degrees) / n_nodes:.1f}"
+        f"min={s['degree_min']}, "
+        f"max={s['degree_max']}, "
+        f"mean={s['degree_mean']:.1f}"  # type: ignore[str-format]
     )
 
-    # K-mer count statistics (if available)
-    kmer_counts = [
-        s.kmer_count for s in segments
-        if s.kmer_count is not None
-    ]
-    if kmer_counts:
+    if "kmer_count_min" in s:
         print(
             f"K-mer counts:     "
-            f"min={min(kmer_counts):,}, "
-            f"max={max(kmer_counts):,}, "
-            f"mean={sum(kmer_counts) / len(kmer_counts):,.0f}"
+            f"min={s['kmer_count_min']:,}, "
+            f"max={s['kmer_count_max']:,}, "
+            f"mean={s['kmer_count_mean']:,.0f}"  # type: ignore[str-format]
         )
 
-    # Sampled path length statistics
-    if path_lengths is not None:
-        n = len(path_lengths)
-        mean = sum(path_lengths) / n
-        variance = (
-            sum((x - mean) ** 2 for x in path_lengths) / n
-        )
+    if "path_lengths" in s:
+        pl = s["path_lengths"]
+        assert isinstance(pl, dict)
         print(
             f"\nSampled path lengths "
-            f"({n:,} samples, {weight_mode} weights, bp):"
+            f"({pl['samples']:,} samples, "
+            f"{pl['weight_mode']} weights, bp):"
         )
-        print(f"  min:      {min(path_lengths):,}")
-        print(f"  max:      {max(path_lengths):,}")
-        print(f"  mean:     {mean:,.0f}")
-        print(f"  std dev:  {math.sqrt(variance):,.0f}")
-        print(f"  variance: {variance:,.0f}")
+        print(f"  min:      {pl['min']:,}")
+        print(f"  max:      {pl['max']:,}")
+        print(f"  mean:     {pl['mean']:,.0f}")
+        print(f"  std dev:  {pl['std_dev']:,.0f}")
+        print(f"  variance: {pl['variance']:,.0f}")
 
-    # Paired-end insert size estimates
-    if pair_distances is not None:
-        if not pair_distances:
-            print("\nPaired-end insert size: no pairs found in sampled paths.")
-        else:
-            n = len(pair_distances)
-            mean = sum(pair_distances) / n
-            variance = (
-                sum((x - mean) ** 2 for x in pair_distances) / n
+    if "insert_sizes" in s:
+        ins = s["insert_sizes"]
+        if ins is None:
+            print(
+                "\nPaired-end insert size: "
+                "no pairs found in sampled paths."
             )
-            print(f"\nEstimated insert sizes ({n:,} pairs, bp):")
-            print(f"  min:      {min(pair_distances):,}")
-            print(f"  max:      {max(pair_distances):,}")
-            print(f"  mean:     {mean:,.0f}")
-            print(f"  variance: {variance:,.0f}")
+        else:
+            assert isinstance(ins, dict)
+            print(
+                f"\nEstimated insert sizes "
+                f"({ins['pairs']:,} pairs, bp):"
+            )
+            print(f"  min:      {ins['min']:,}")
+            print(f"  max:      {ins['max']:,}")
+            print(f"  mean:     {ins['mean']:,.0f}")
+            print(f"  variance: {ins['variance']:,.0f}")
 
 
 # ------------------------------------------------------------------
@@ -764,6 +842,11 @@ def main(
         "--verbose/--no-verbose",
         help="Enable debug logging",
     )] = False,
+    json_out: Annotated[Path | None, typer.Option(
+        "--json",
+        help="Write summary statistics as JSON to this path",
+        dir_okay=False,
+    )] = None,
 ) -> None:
     """Parse a GFA file into a graph and report properties."""
     if paired_end and pe_bam is None:
@@ -823,6 +906,14 @@ def main(
     print_summary(
         graph, path_lengths, weight_str, pair_distances,
     )
+
+    if json_out is not None:
+        stats = _compute_summary(
+            graph, path_lengths, weight_str, pair_distances,
+        )
+        stats["gfa"] = str(gfa)
+        json_out.write_text(json.dumps(stats, indent=2) + "\n")
+        typer.echo(f"Stats written to {json_out}", err=True)
 
 
 if __name__ == "__main__":

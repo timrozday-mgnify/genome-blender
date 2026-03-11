@@ -6,11 +6,13 @@ Usage::
     python scripts/reads_summary.py reads.fastq
     python scripts/reads_summary.py reads.fq.gz -n 10000
     python scripts/reads_summary.py genome.fasta --all
+    python scripts/reads_summary.py reads.fastq --json stats.json
 """
 
 from __future__ import annotations
 
 import gzip
+import json
 import math
 from collections.abc import Iterator
 from pathlib import Path
@@ -173,22 +175,22 @@ def _read_lengths_fasta(
     return lengths
 
 
-def print_summary(lengths: list[int]) -> None:
-    """Print read-length summary statistics to stdout.
+def _compute_stats(lengths: list[int]) -> dict[str, object]:
+    """Compute summary statistics from a list of read lengths.
 
     Args:
-        lengths: List of read/sequence lengths.
-    """
-    if not lengths:
-        print("No reads found.")
-        return
+        lengths: List of read/sequence lengths (non-empty).
 
+    Returns:
+        Dict with keys ``reads``, ``total_bp``, ``min``,
+        ``max``, ``mean``, ``median``, ``std_dev``, ``n50``.
+    """
     n = len(lengths)
     total_bp = sum(lengths)
     mean = total_bp / n
     variance = sum((x - mean) ** 2 for x in lengths) / n
     sorted_lens = sorted(lengths)
-    median = (
+    median: float = (
         sorted_lens[n // 2]
         if n % 2 == 1
         else (sorted_lens[n // 2 - 1] + sorted_lens[n // 2]) / 2
@@ -204,14 +206,37 @@ def print_summary(lengths: list[int]) -> None:
             n50 = length
             break
 
-    print(f"Reads:      {n:,}")
-    print(f"Total bp:   {total_bp:,}")
-    print(f"Min:        {sorted_lens[0]:,}")
-    print(f"Max:        {sorted_lens[-1]:,}")
-    print(f"Mean:       {mean:,.1f}")
-    print(f"Median:     {median:,.1f}")
-    print(f"Std dev:    {math.sqrt(variance):,.1f}")
-    print(f"N50:        {n50:,}")
+    return {
+        "reads": n,
+        "total_bp": total_bp,
+        "min": sorted_lens[0],
+        "max": sorted_lens[-1],
+        "mean": mean,
+        "median": median,
+        "std_dev": math.sqrt(variance),
+        "n50": n50,
+    }
+
+
+def print_summary(lengths: list[int]) -> None:
+    """Print read-length summary statistics to stdout.
+
+    Args:
+        lengths: List of read/sequence lengths.
+    """
+    if not lengths:
+        print("No reads found.")
+        return
+
+    s = _compute_stats(lengths)
+    print(f"Reads:      {s['reads']:,}")
+    print(f"Total bp:   {s['total_bp']:,}")
+    print(f"Min:        {s['min']:,}")
+    print(f"Max:        {s['max']:,}")
+    print(f"Mean:       {s['mean']:,.1f}")
+    print(f"Median:     {s['median']:,.1f}")
+    print(f"Std dev:    {s['std_dev']:,.1f}")
+    print(f"N50:        {s['n50']:,}")
 
 
 @app.command()
@@ -232,6 +257,11 @@ def main(
         help="Read the entire file instead of the "
         "first n reads",
     )] = False,
+    json_out: Annotated[Path | None, typer.Option(
+        "--json",
+        help="Write summary statistics as JSON to this path",
+        dir_okay=False,
+    )] = None,
 ) -> None:
     """Report read-length statistics from a reads file."""
     fmt = _detect_format(reads)
@@ -245,6 +275,14 @@ def main(
     label = "all" if all_reads else f"first {n:,}"
     print(f"\n{reads.name} ({fmt}, {label} reads):")
     print_summary(lengths)
+
+    if json_out is not None and lengths:
+        stats: dict[str, object] = _compute_stats(lengths)
+        stats["file"] = str(reads)
+        stats["format"] = fmt
+        stats["reads_sampled"] = max_reads
+        json_out.write_text(json.dumps(stats, indent=2) + "\n")
+        typer.echo(f"Stats written to {json_out}", err=True)
 
 
 if __name__ == "__main__":

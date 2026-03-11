@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 import random
 from pathlib import Path
 
@@ -501,3 +502,29 @@ class TestCli:
     def test_nonexistent_file(self) -> None:
         result = runner.invoke(app, ["/nonexistent/file.gfa"])
         assert result.exit_code != 0
+
+    def test_json_output(self, tmp_path, linear_gfa) -> None:
+        json_path = tmp_path / "summary.json"
+        result = runner.invoke(
+            app,
+            [str(linear_gfa), "--no-sample", "--json", str(json_path)],
+        )
+        assert result.exit_code == 0, result.output
+        assert json_path.exists()
+        data = json.loads(json_path.read_text())
+        assert data["nodes"] == 3
+        assert data["edges"] == 2
+        assert "total_assembly_bp" in data
+        assert data["gfa"] == str(linear_gfa)
+
+    def test_json_with_path_lengths(
+        self, tmp_path, linear_gfa,
+    ) -> None:
+        json_path = tmp_path / "summary.json"
+        runner.invoke(
+            app,
+            [str(linear_gfa), "-n", "5", "--json", str(json_path)],
+        )
+        data = json.loads(json_path.read_text())
+        assert "path_lengths" in data
+        assert data["path_lengths"]["samples"] == 5

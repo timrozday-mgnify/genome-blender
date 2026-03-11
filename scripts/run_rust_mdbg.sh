@@ -9,14 +9,33 @@ mkdir -p "${OUTPUT_DIR}"
 COMBINED="${OUTPUT_DIR}/combined_reads.fastq"
 cat "${INPUT_DIR}"/*.fastq > "${COMBINED}"
 
+# Estimate mean read length from the first 1000 reads, then derive density.
+# The minimizer length l and density are related by:
+#   read_length * density * 0.75 = l  =>  density = l / (read_length * 0.75)
+L=12
+READS_STATS_JSON="${OUTPUT_DIR}/reads_stats.json"
+/Users/timrozday/miniforge3/envs/genome_blender_dev/bin/python \
+    "$(dirname "$0")/reads_summary.py" "${COMBINED}" -n 1000 \
+    --json "${READS_STATS_JSON}"
+MEAN_READ_LEN=$(
+    /Users/timrozday/miniforge3/envs/genome_blender_dev/bin/python3 -c \
+        "import json; d=json.load(open('${READS_STATS_JSON}')); print(int(d['mean'] + 0.5))"
+)
+DENSITY=$(
+    /Users/timrozday/miniforge3/envs/genome_blender_dev/bin/python3 -c \
+        "print(f'{${L} / (${MEAN_READ_LEN} * 0.75):.4f}')"
+)
+echo "Estimated mean read length: ${MEAN_READ_LEN} bp"
+echo "Using density: ${DENSITY}  (l=${L} / (${MEAN_READ_LEN} * 0.75))"
+
 docker run --rm \
     -v "${OUTPUT_DIR}:/output" \
     --entrypoint rust-mdbg \
     rust-mdbg \
     /output/combined_reads.fastq \
     -k 7 \
-    --density 0.08 \
-    -l 12 \
+    --density "${DENSITY}" \
+    -l ${L} \
     --minabund 2 \
     --prefix /output/rust_mdbg_out \
     --debug \

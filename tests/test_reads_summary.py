@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import gzip
+import json
 from pathlib import Path
 
 import pytest
@@ -257,3 +258,29 @@ class TestCli:
         assert result.exit_code == 0, result.output
         assert "N50:" in result.output
         assert "Mean:" in result.output
+
+    def test_json_output(self, tmp_path, fastq_path) -> None:
+        json_path = tmp_path / "stats.json"
+        result = runner.invoke(
+            app,
+            [str(fastq_path), "--all", "--json", str(json_path)],
+        )
+        assert result.exit_code == 0, result.output
+        assert json_path.exists()
+        data = json.loads(json_path.read_text())
+        assert data["reads"] == 3
+        assert "mean" in data
+        assert "n50" in data
+        assert data["format"] == "fastq"
+
+    def test_json_contains_mean(
+        self, tmp_path, fastq_path,
+    ) -> None:
+        json_path = tmp_path / "stats.json"
+        runner.invoke(
+            app,
+            [str(fastq_path), "--all", "--json", str(json_path)],
+        )
+        data = json.loads(json_path.read_text())
+        # mean of [10, 20, 30] = 20.0
+        assert data["mean"] == pytest.approx(20.0)
