@@ -1,9 +1,17 @@
 #!/usr/bin/env python3
 """Read and decode rust-mdbg per-read minimizer files.
 
-Reads all ``{prefix}.*.read_minimizers`` (LZ4-compressed TSV) and the
-accompanying ``{prefix}.minimizer_table`` (plain-text TSV) produced by
-rust-mdbg ``--dump-read-minimizers``, and yields structured records.
+Supports two file formats (auto-detected by magic bytes after LZ4
+decompression):
+
+* **Binary** (``RMBG\x01`` magic) — packed little-endian integers; produced
+  by the ``--dump-read-minimizers`` flag in the patched rust-mdbg build.
+* **TSV** (legacy) — LZ4-compressed text ``read_id\\tids\\tpositions`` as
+  written by the upstream rust-mdbg build.
+
+Reads all ``{prefix}.*.read_minimizers`` files and the accompanying
+``{prefix}.minimizer_table`` (plain-text TSV) produced by rust-mdbg
+``--dump-read-minimizers``, and yields structured records.
 
 Usage::
 
@@ -13,6 +21,7 @@ Usage::
     python scripts/read_minimizers.py rust_mdbg_out --summary
     python scripts/read_minimizers.py rust_mdbg_out --summary -n 5000
     python scripts/read_minimizers.py rust_mdbg_out --summary --json summary.json
+    python scripts/read_minimizers.py rust_mdbg_out --convert
 """
 
 from __future__ import annotations
@@ -21,7 +30,8 @@ import glob
 import io
 import json
 import math
-from collections.abc import Iterator
+import struct
+from collections.abc import Iterable, Iterator
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Annotated
@@ -30,6 +40,20 @@ import lz4.frame
 import typer
 
 app = typer.Typer()
+
+# ---------------------------------------------------------------------------
+# Binary format constants
+# ---------------------------------------------------------------------------
+
+_RM_MAGIC = b"RMBG"
+_RM_VERSION = 1
+_RM_HDR = _RM_MAGIC + bytes([_RM_VERSION])
+_RM_HDR_LEN = len(_RM_HDR)  # 5
+
+
+# ---------------------------------------------------------------------------
+# Data model
+# ---------------------------------------------------------------------------
 
 
 @dataclass
@@ -50,6 +74,11 @@ class ReadRecord:
     minimizer_ids: list[int]
     positions: list[int]
     lmers: list[str] = field(default_factory=list)
+
+
+# ---------------------------------------------------------------------------
+# Minimizer table
+# ---------------------------------------------------------------------------
 
 
 def load_minimizer_table(table_path: Path) -> dict[int, str]:
@@ -73,18 +102,22 @@ def load_minimizer_table(table_path: Path) -> dict[int, str]:
     return lookup
 
 
-def _iter_read_minimizers_file(
-    path: Path,
+# ---------------------------------------------------------------------------
+# File readers
+# ---------------------------------------------------------------------------
+
+
+def _iter_tsv_file(
+    raw: bytes,
 ) -> Iterator[tuple[str, list[int], list[int]]]:
-    """Yield (read_id, minimizer_ids, positions) from one LZ4 file.
+    """Yield ``(read_id, minimizer_ids, positions)`` from LZ4-TSV bytes.
 
     Args:
-        path: Path to a ``*.read_minimizers`` file.
+        raw: Decompressed content of a TSV read_minimizers file.
 
     Yields:
         Tuples of ``(read_id, minimizer_ids, positions)``.
     """
-    raw = lz4.frame.decompress(path.read_bytes())
     for line in io.TextIOWrapper(io.BytesIO(raw), encoding="utf-8"):
         line = line.rstrip("\n")
         if not line or line.startswith("#"):
@@ -96,6 +129,107 @@ def _iter_read_minimizers_file(
         ids = [int(x) for x in parts[1].split(",") if x]
         pos = [int(x) for x in parts[2].split(",") if x]
         yield read_id, ids, pos
+
+
+def _iter_binary_file(
+    raw: bytes,
+) -> Iterator[tuple[str, list[int], list[int]]]:
+    """Yield ``(read_id, minimizer_ids, positions)`` from binary bytes.
+
+    The binary format stores each record as::
+
+        u32 LE  name_len
+        bytes   read name (UTF-8, name_len bytes)
+        u32 LE  n  (number of minimizers)
+        u64 LE  minimizer_ids[0..n]
+        u64 LE  positions[0..n]
+
+    The file starts with a 5-byte header (``RMBG\\x01``) which must be
+    skipped before calling this function.
+
+    Args:
+        raw: Decompressed content of a binary read_minimizers file,
+            including the 5-byte header.
+
+    Yields:
+        Tuples of ``(read_id, minimizer_ids, positions)``.
+    """
+    mv = memoryview(raw)
+    offset = _RM_HDR_LEN
+    total = len(raw)
+    while offset < total:
+        (name_len,) = struct.unpack_from("<I", mv, offset)
+        offset += 4
+        name = bytes(mv[offset: offset + name_len]).decode()
+        offset += name_len
+        (n,) = struct.unpack_from("<I", mv, offset)
+        offset += 4
+        ids: list[int] = list(struct.unpack_from(f"<{n}Q", mv, offset))
+        offset += n * 8
+        pos: list[int] = list(struct.unpack_from(f"<{n}Q", mv, offset))
+        offset += n * 8
+        yield name, ids, pos
+
+
+def _iter_read_minimizers_file(
+    path: Path,
+) -> Iterator[tuple[str, list[int], list[int]]]:
+    """Yield ``(read_id, minimizer_ids, positions)`` from one file.
+
+    Auto-detects binary (``RMBG`` magic) vs. legacy LZ4-TSV format.
+
+    Args:
+        path: Path to a ``*.read_minimizers`` file.
+
+    Yields:
+        Tuples of ``(read_id, minimizer_ids, positions)``.
+    """
+    raw = lz4.frame.decompress(path.read_bytes())
+    if raw[:4] == _RM_MAGIC:
+        yield from _iter_binary_file(raw)
+    else:
+        yield from _iter_tsv_file(raw)
+
+
+# ---------------------------------------------------------------------------
+# Binary writer
+# ---------------------------------------------------------------------------
+
+
+def write_binary_read_minimizers(
+    path: Path,
+    records: Iterable[tuple[str, list[int], list[int]]],
+) -> None:
+    """Write read minimizer records to *path* in packed binary format.
+
+    The output is LZ4-compressed.  Records are streamed so the full dataset
+    is never held in memory simultaneously.
+
+    Args:
+        path: Destination file path (will be overwritten if it exists).
+        records: Iterable of ``(read_id, minimizer_ids, positions)`` tuples.
+    """
+    compressor = lz4.frame.LZ4FrameCompressor()
+    with open(path, "wb") as fh:
+        fh.write(compressor.begin())
+        fh.write(compressor.compress(_RM_HDR))
+        for name, ids, pos in records:
+            name_bytes = name.encode()
+            n = len(ids)
+            chunk = bytearray()
+            chunk += struct.pack("<I", len(name_bytes))
+            chunk += name_bytes
+            chunk += struct.pack("<I", n)
+            if n:
+                chunk += struct.pack(f"<{n}Q", *ids)
+                chunk += struct.pack(f"<{n}Q", *pos)
+            fh.write(compressor.compress(bytes(chunk)))
+        fh.write(compressor.flush())
+
+
+# ---------------------------------------------------------------------------
+# Public iterator
+# ---------------------------------------------------------------------------
 
 
 def iter_records(
@@ -132,6 +266,11 @@ def iter_records(
                 positions=pos,
                 lmers=lmers,
             )
+
+
+# ---------------------------------------------------------------------------
+# Statistics helpers
+# ---------------------------------------------------------------------------
 
 
 def _compute_minimizer_stats(
@@ -193,6 +332,11 @@ def _print_minimizer_stats(stats: dict[str, object], label: str) -> None:
     print(f"N50:               {stats['n50']:,}")
 
 
+# ---------------------------------------------------------------------------
+# CLI
+# ---------------------------------------------------------------------------
+
+
 @app.command()
 def main(
     prefix: Annotated[Path, typer.Argument(
@@ -219,8 +363,18 @@ def main(
         help="Stop after this many reads "
              "(default 1000 in --summary mode, 0 = all otherwise)",
     )] = -1,
+    convert: Annotated[bool, typer.Option(
+        "--convert",
+        help="Convert all {prefix}.*.read_minimizers files from "
+             "legacy LZ4-TSV format to packed binary format in-place, "
+             "then exit.  Already-binary files are skipped.",
+    )] = False,
 ) -> None:
     """Read and decode rust-mdbg per-read minimizer files."""
+    if convert:
+        _do_convert(prefix)
+        return
+
     # resolve default for -n
     max_reads: int = (1_000 if n == -1 and summary else n)
 
@@ -302,6 +456,31 @@ def main(
         )
         if json_out:
             typer.echo(f"Records written to {json_out}", err=True)
+
+
+def _do_convert(prefix: Path) -> None:
+    """Convert legacy LZ4-TSV read_minimizers files to binary in-place.
+
+    Args:
+        prefix: rust-mdbg output prefix.
+    """
+    pattern = str(prefix) + ".*.read_minimizers"
+    files = sorted(glob.glob(pattern))
+    if not files:
+        typer.echo(
+            f"No .read_minimizers files found for prefix: {prefix}",
+            err=True,
+        )
+        raise typer.Exit(1)
+    for fpath in files:
+        p = Path(fpath)
+        raw = lz4.frame.decompress(p.read_bytes())
+        if raw[:4] == _RM_MAGIC:
+            typer.echo(f"Already binary, skipping: {fpath}", err=True)
+            continue
+        records = list(_iter_tsv_file(raw))
+        write_binary_read_minimizers(p, iter(records))
+        typer.echo(f"Converted: {fpath} ({len(records):,} reads)", err=True)
 
 
 if __name__ == "__main__":

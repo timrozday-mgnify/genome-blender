@@ -525,9 +525,9 @@ class TestCli:
             )
             assert result.exit_code == 0, result.output
 
-    def test_verbose_flag(self, linear_gfa) -> None:
+    def test_debug_flag(self, linear_gfa) -> None:
         result = runner.invoke(
-            app, [str(linear_gfa), "--verbose", "-n", "3"],
+            app, [str(linear_gfa), "--debug", "-n", "3"],
         )
         assert result.exit_code == 0, result.output
 

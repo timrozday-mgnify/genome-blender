@@ -57,7 +57,7 @@ echo "Unique minimizers in minimizer_table: ${UNIQUE_MINIMIZERS}"
     -n 10000 \
     --read-minimizers "${PREFIX}" \
     --minimizer-table "${MINIMIZER_TABLE}" \
-    --k "${K}" \
+    --insert-sizes-out "${PREFIX}.insert_sizes.tsv" \
     --json "${PREFIX}.graph_summary.json" \
     "${GFA}"
 

@@ -22,6 +22,7 @@ import logging
 import math
 import random
 import re
+import struct
 from collections import deque
 from collections.abc import Iterator
 from dataclasses import dataclass, field
@@ -265,14 +266,47 @@ def _add_link(
 # rust-mdbg read minimizers
 # ------------------------------------------------------------------
 
+# Binary format: LZ4-compressed; header = b"RMBG\x01"; then per-record:
+#   u32 LE name_len | name bytes | u32 LE n | n×u64 LE ids | n×u64 LE pos
+_RM_MAGIC = b"RMBG"
+_RM_HDR_LEN = 5  # 4 magic + 1 version
+
+
+def _iter_tsv_rm(raw: bytes) -> Iterator[tuple[str, tuple[int, ...]]]:
+    """Yield ``(name, minimizer_ids)`` from legacy LZ4-TSV bytes."""
+    for line in io.TextIOWrapper(io.BytesIO(raw), encoding="utf-8"):
+        line = line.rstrip("\n")
+        if not line or line.startswith("#"):
+            continue
+        parts = line.split("\t")
+        if len(parts) != 3:
+            continue
+        yield parts[0], tuple(int(x) for x in parts[1].split(",") if x)
+
+
+def _iter_binary_rm(raw: bytes) -> Iterator[tuple[str, tuple[int, ...]]]:
+    """Yield ``(name, minimizer_ids)`` from binary-format bytes."""
+    mv = memoryview(raw)
+    offset = _RM_HDR_LEN
+    total = len(raw)
+    while offset < total:
+        (name_len,) = struct.unpack_from("<I", mv, offset)
+        offset += 4
+        name = bytes(mv[offset: offset + name_len]).decode()
+        offset += name_len
+        (n,) = struct.unpack_from("<I", mv, offset)
+        offset += 4
+        ids: tuple[int, ...] = struct.unpack_from(f"<{n}Q", mv, offset)
+        offset += n * 8 + n * 8  # skip positions (not needed here)
+        yield name, ids
+
 
 def load_read_minimizers(prefix: Path) -> dict[str, tuple[int, ...]]:
     """Load per-read minimizer IDs from rust-mdbg output files.
 
-    Reads all ``{prefix}.*.read_minimizers`` LZ4-compressed TSV files
-    produced by rust-mdbg ``--dump-read-minimizers``.  Each file has
-    one tab-separated row per read: ``read_id\tids\tpositions`` where
-    *ids* is a comma-separated list of NT-hash minimizer IDs (u64).
+    Reads all ``{prefix}.*.read_minimizers`` LZ4-compressed files.
+    Supports both binary (``RMBG`` magic) and legacy LZ4-TSV formats,
+    auto-detected per file.
 
     Args:
         prefix: rust-mdbg output prefix (e.g. ``Path("rust_mdbg_out")``).
@@ -295,17 +329,8 @@ def load_read_minimizers(prefix: Path) -> dict[str, tuple[int, ...]]:
         )
         for fpath in files:
             raw = lz4.frame.decompress(Path(fpath).read_bytes())
-            for line in io.TextIOWrapper(
-                io.BytesIO(raw), encoding="utf-8",
-            ):
-                line = line.rstrip("\n")
-                if not line or line.startswith("#"):
-                    continue
-                parts = line.split("\t")
-                if len(parts) != 3:
-                    continue
-                read_id = parts[0]
-                ids = tuple(int(x) for x in parts[1].split(",") if x)
+            iter_fn = _iter_binary_rm if raw[:4] == _RM_MAGIC else _iter_tsv_rm
+            for read_id, ids in iter_fn(raw):
                 records[read_id] = ids
                 logger.debug("Read name: %s", read_id)
             progress.advance(task)
@@ -457,79 +482,81 @@ def build_read_index(
 # ------------------------------------------------------------------
 
 
-def _segment_minimizers(
-    sequence: str,
-    reverse_table: dict[str, int],
-    l: int,
-) -> tuple[int, ...]:
-    """Extract minimizer IDs from a segment sequence by l-mer lookup.
+def load_segment_minimizers(
+    prefix: Path,
+) -> tuple[dict[str, tuple[int, ...]], int | None]:
+    """Load per-segment minimizer IDs from rust-mdbg ``.sequences`` files.
 
-    Slides an l-mer window over *sequence* and looks up each l-mer in
-    *reverse_table*.  Only l-mers present in the table (those selected
-    as minimizers during graph construction) are included.  The table
-    was built from HPC sequences, so *sequence* should also be in HPC
-    space (as output by rust-mdbg).
+    Reads all ``{prefix}.*.sequences`` LZ4-compressed files.  Each
+    non-comment line has the format::
 
-    Args:
-        sequence: Segment DNA sequence, typically HPC-encoded.
-        reverse_table: lmer-string to NT-hash mapping (inverse of the
-            minimizer_table file).
-        l: l-mer length used during rust-mdbg graph construction.
+        node_name<TAB>[hash1, hash2, ...]<TAB>sequence<TAB>...
 
-    Returns:
-        Ordered tuple of NT-hash minimizer IDs for this segment.
-    """
-    ids: list[int] = []
-    for i in range(len(sequence) - l + 1):
-        h = reverse_table.get(sequence[i: i + l])
-        if h is not None:
-            ids.append(h)
-    return tuple(ids)
-
-
-def build_segment_minimizers(
-    graph: rx.PyGraph,
-    reverse_table: dict[str, int],
-    l: int,
-) -> dict[str, tuple[int, ...]]:
-    """Build a segment-name → minimizer-ID mapping for all graph nodes.
-
-    Segments whose sequence is ``*`` (not stored in the GFA) are
-    skipped with a warning and will be absent from path minimizer
-    sequences.
+    The node name matches the GFA S-record segment name exactly.  The
+    ``k`` value is extracted from the ``# k = N`` header comment in the
+    first file that contains it.
 
     Args:
-        graph: Parsed GFA graph.
-        reverse_table: lmer → NT-hash mapping derived by inverting the
-            minimizer_table (``{h: lmer for h, lmer in table.items()}``
-            → ``{lmer: h ...}``).
-        l: l-mer length.
+        prefix: rust-mdbg output prefix (e.g. ``Path("rust_mdbg_out")``).
 
     Returns:
-        Dict mapping segment name to ordered tuple of minimizer IDs.
+        Tuple of ``(segment_minimizers, k)`` where *segment_minimizers*
+        maps each segment name to its ordered tuple of NT-hash minimizer
+        IDs, and *k* is the k-mer size read from the file header
+        (``None`` if the header line is absent).
     """
+    pattern = str(prefix) + ".*.sequences"
+    files = sorted(glob.glob(pattern))
+    if not files:
+        logger.warning(
+            "No .sequences files found for prefix: %s", prefix,
+        )
+        return {}, None
+
     seg_min: dict[str, tuple[int, ...]] = {}
-    n_missing = 0
+    k: int | None = None
+
     with Progress(*_PROGRESS_COLUMNS) as progress:
         task = progress.add_task(
-            "Extracting segment minimizers", total=graph.num_nodes(),
+            "Loading segment minimizers", total=len(files),
         )
-        for idx in graph.node_indices():
-            seg: Segment = graph[idx]
-            if seg.sequence == "*":
-                n_missing += 1
-            else:
-                seg_min[seg.name] = _segment_minimizers(
-                    seg.sequence, reverse_table, l,
-                )
+        for fpath in files:
+            raw = lz4.frame.decompress(Path(fpath).read_bytes())
+            for line in io.TextIOWrapper(
+                io.BytesIO(raw), encoding="utf-8",
+            ):
+                line = line.rstrip("\n")
+                if not line:
+                    continue
+                if line.startswith("# k = ") and k is None:
+                    try:
+                        k = int(line[6:].split()[0])
+                    except ValueError:
+                        pass
+                    continue
+                if line.startswith("#"):
+                    continue
+                parts = line.split("\t")
+                if len(parts) < 2:
+                    continue
+                node_name = parts[0]
+                bracket = parts[1].strip()
+                if bracket.startswith("[") and bracket.endswith("]"):
+                    ids = tuple(
+                        int(x.strip())
+                        for x in bracket[1:-1].split(",")
+                        if x.strip()
+                    )
+                else:
+                    ids = ()
+                seg_min[node_name] = ids
             progress.advance(task)
-    if n_missing:
-        logger.warning(
-            "%d segment(s) have sequence \"*\" and are excluded "
-            "from path minimizer sequences",
-            n_missing,
-        )
-    return seg_min
+
+    logger.info(
+        "Loaded minimizers for %d segments from %s.* (k=%s)",
+        len(seg_min), prefix, k,
+    )
+    return seg_min, k
 
 
 def path_minimizer_sequence(
@@ -549,7 +576,7 @@ def path_minimizer_sequence(
         graph: Parsed GFA graph.
         path: Ordered list of node indices forming the path.
         segment_minimizers: Precomputed segment-name → minimizer IDs
-            from :func:`build_segment_minimizers`.
+            from :func:`load_segment_minimizers`.
         k: rust-mdbg k-mer size (overlap between adjacent segments is
             *k* − 1 minimizers).
 
@@ -734,6 +761,149 @@ def match_reads_to_path(
         PathMatch(read_id=pat_id, path_start=start, path_end=end)
         for start, end, pat_id in ac.search(path_min_seq)
     ]
+
+
+def _minimizer_to_bp_scale(
+    graph: rx.PyGraph,
+    seg_min: dict[str, tuple[int, ...]],
+) -> float | None:
+    """Estimate average base pairs per minimizer from assembly data.
+
+    Sums segment lengths and minimizer counts across all segments that
+    appear in both the graph and *seg_min*.  Segments with no loaded
+    minimizers are excluded from both totals.
+
+    Args:
+        graph: Parsed GFA graph.
+        seg_min: Segment name → minimizer IDs from
+            :func:`load_segment_minimizers`.
+
+    Returns:
+        Scale factor (bp per minimizer), or ``None`` if no segments
+        with minimizers were found.
+    """
+    total_bp = 0
+    total_min = 0
+    for idx in graph.node_indices():
+        seg: Segment = graph[idx]
+        mids = seg_min.get(seg.name, ())
+        if mids:
+            total_bp += seg.length
+            total_min += len(mids)
+    if total_min == 0:
+        return None
+    return total_bp / total_min
+
+
+def _path_pair_insert_sizes(
+    path_matches: list[PathMatch],
+    index: ReadIndex,
+) -> list[tuple[int, int, int]]:
+    """Enumerate all (r1_id, r2_id, minimizer_span) tuples for read pairs.
+
+    Groups match positions by read ID, then for every pair where both
+    mates appear in the current path returns the Cartesian product of
+    their hit positions.  The minimizer-space insert size is::
+
+        max(r1_end, r2_end) - min(r1_start, r2_start)
+
+    Multiple hits per read (when a read's minimizer sequence appears
+    more than once in the path) produce multiple entries — all
+    permutations are reported.
+
+    Args:
+        path_matches: All :class:`PathMatch` records from one path.
+        index: :class:`ReadIndex` with pair information.
+
+    Returns:
+        List of ``(r1_id, r2_id, minimizer_span)`` tuples, one per
+        (r1_hit × r2_hit) combination found.
+    """
+    positions: dict[int, list[tuple[int, int]]] = {}
+    for m in path_matches:
+        positions.setdefault(m.read_id, []).append(
+            (m.path_start, m.path_end)
+        )
+
+    results: list[tuple[int, int, int]] = []
+    seen_pairs: set[tuple[int, int]] = set()
+
+    for r1_id, r1_hits in positions.items():
+        r2_id = index.pairs.get(r1_id)
+        if r2_id is None or r2_id not in positions:
+            continue
+        pair_key = (min(r1_id, r2_id), max(r1_id, r2_id))
+        if pair_key in seen_pairs:
+            continue
+        seen_pairs.add(pair_key)
+        r2_hits = positions[r2_id]
+        for r1_start, r1_end in r1_hits:
+            for r2_start, r2_end in r2_hits:
+                span = max(r1_end, r2_end) - min(r1_start, r2_start)
+                results.append((r1_id, r2_id, span))
+
+    return results
+
+
+def _insert_size_stats(
+    sizes_min: list[int],
+    scale: float | None,
+) -> dict[str, object]:
+    """Compute insert size statistics in minimizer space and base pairs.
+
+    Args:
+        sizes_min: Minimizer-space insert sizes.
+        scale: Base pairs per minimizer scale factor from
+            :func:`_minimizer_to_bp_scale`, or ``None`` if unavailable.
+
+    Returns:
+        Dict with ``"observations"`` count, a ``"minimizer_space"`` sub-dict
+        (min/max/mean/median/std_dev), and optionally a ``"bp"`` sub-dict
+        with the same keys scaled by *scale* plus
+        ``"scale_bp_per_minimizer"``.  Returns an empty dict when
+        *sizes_min* is empty.
+    """
+    n = len(sizes_min)
+    if n == 0:
+        return {}
+    sorted_s = sorted(sizes_min)
+    total = sum(sorted_s)
+    mean_s = total / n
+    var_s = sum((x - mean_s) ** 2 for x in sorted_s) / n
+    median_s: float = (
+        sorted_s[n // 2]
+        if n % 2 == 1
+        else (sorted_s[n // 2 - 1] + sorted_s[n // 2]) / 2
+    )
+    stats: dict[str, object] = {
+        "observations": n,
+        "minimizer_space": {
+            "min": sorted_s[0],
+            "max": sorted_s[-1],
+            "mean": mean_s,
+            "median": median_s,
+            "std_dev": math.sqrt(var_s),
+        },
+    }
+    if scale is not None:
+        bp = [x * scale for x in sizes_min]
+        bp_sorted = sorted(bp)
+        bp_mean = sum(bp_sorted) / n
+        bp_var = sum((x - bp_mean) ** 2 for x in bp_sorted) / n
+        bp_median: float = (
+            bp_sorted[n // 2]
+            if n % 2 == 1
+            else (bp_sorted[n // 2 - 1] + bp_sorted[n // 2]) / 2
+        )
+        stats["bp"] = {
+            "scale_bp_per_minimizer": scale,
+            "min": bp_sorted[0],
+            "max": bp_sorted[-1],
+            "mean": bp_mean,
+            "median": bp_median,
+            "std_dev": math.sqrt(bp_var),
+        }
+    return stats
 
 
 # ------------------------------------------------------------------
@@ -1370,18 +1540,26 @@ def main(
     )] = None,
     minimizer_table: Annotated[Path | None, typer.Option(
         "--minimizer-table",
-        help="Path to the rust-mdbg {prefix}.minimizer_table file. "
-             "Required for read-to-path matching via Aho-Corasick; "
-             "used to reconstruct per-segment minimizer sequences",
+        help="Path to the rust-mdbg {prefix}.minimizer_table file "
+             "(hash → l-mer lookup). Optional; not required for "
+             "read-to-path matching (segment minimizers are loaded "
+             "from the .sequences files instead)",
         exists=True,
         dir_okay=False,
     )] = None,
     k: Annotated[int, typer.Option(
         "--k",
-        help="rust-mdbg k-mer size used during graph construction. "
-             "Controls the minimizer overlap between adjacent segments "
-             "(overlap = k - 1) when building path minimizer sequences",
+        help="rust-mdbg k-mer size. Used as fallback if the value "
+             "cannot be read from the .sequences file header",
     )] = 7,
+    insert_sizes_out: Annotated[Path | None, typer.Option(
+        "--insert-sizes-out",
+        help="Write per-pair insert size records to this TSV file "
+             "(columns: read1_name, read2_name, insert_size_minimizers, "
+             "insert_size_bp). Requires --read-minimizers. All "
+             "permutations of multi-position hits are reported.",
+        dir_okay=False,
+    )] = None,
 ) -> None:
     """Parse a rust-mdbg GFA output into a graph and report properties."""
     if paired_end and pe_bam is None:
@@ -1448,6 +1626,7 @@ def main(
     read_index: ReadIndex | None = None
     ac: AhoCorasick | None = None
     n_total_matches = 0
+    ins_stats: dict[str, object] = {}
 
     if read_minimizers_prefix is not None:
         raw_minimizers = load_read_minimizers(read_minimizers_prefix)
@@ -1463,34 +1642,71 @@ def main(
             err=True,
         )
 
-        if minimizer_table is not None and sampled:
-            table = load_minimizer_table(minimizer_table)
-            l = len(next(iter(table.values())))  # infer l from table
-            reverse_table: dict[str, int] = {
-                lmer: h for h, lmer in table.items()
-            }
-            seg_min = build_segment_minimizers(graph, reverse_table, l)
+        if sampled:
+            seg_min, k_from_file = load_segment_minimizers(
+                read_minimizers_prefix,
+            )
+            effective_k = k_from_file if k_from_file is not None else k
             typer.echo(
                 f"Segment minimizers: {len(seg_min):,} segments "
-                f"with sequences (l={l})",
+                f"(k={effective_k})",
+                err=True,
+            )
+
+            bp_scale = _minimizer_to_bp_scale(graph, seg_min)
+            typer.echo(
+                f"bp/minimizer scale: "
+                + (f"{bp_scale:.3f}" if bp_scale else "unavailable"),
                 err=True,
             )
 
             match_counts: dict[int, int] = {}  # read_id → hit count
-            with Progress(*_PROGRESS_COLUMNS) as progress:
-                task = progress.add_task(
-                    "Matching reads to paths", total=len(sampled),
+            all_insert_sizes_min: list[int] = []
+            insert_out_fh = (
+                open(insert_sizes_out, "w")  # noqa: WPS515
+                if insert_sizes_out is not None
+                else None
+            )
+            if insert_out_fh is not None:
+                header_cols = (
+                    "read1_name\tread2_name\t"
+                    "insert_size_minimizers"
+                    + ("\tinsert_size_bp" if bp_scale else "")
                 )
-                for path, _ in sampled:
-                    seq = path_minimizer_sequence(
-                        graph, path, seg_min, k,
+                insert_out_fh.write(header_cols + "\n")
+
+            try:
+                with Progress(*_PROGRESS_COLUMNS) as progress:
+                    task = progress.add_task(
+                        "Matching reads to paths", total=len(sampled),
                     )
-                    for m in match_reads_to_path(seq, ac):
-                        match_counts[m.read_id] = (
-                            match_counts.get(m.read_id, 0) + 1
+                    for path, _ in sampled:
+                        seq = path_minimizer_sequence(
+                            graph, path, seg_min, effective_k,
                         )
-                        n_total_matches += 1
-                    progress.advance(task)
+                        path_matches = match_reads_to_path(seq, ac)
+                        for m in path_matches:
+                            match_counts[m.read_id] = (
+                                match_counts.get(m.read_id, 0) + 1
+                            )
+                            n_total_matches += 1
+                        for r1_id, r2_id, span in _path_pair_insert_sizes(
+                            path_matches, read_index,
+                        ):
+                            all_insert_sizes_min.append(span)
+                            if insert_out_fh is not None:
+                                r1_name = read_index.names[r1_id]
+                                r2_name = read_index.names[r2_id]
+                                row = (
+                                    f"{r1_name}\t{r2_name}\t{span}"
+                                )
+                                if bp_scale is not None:
+                                    row += f"\t{span * bp_scale:.1f}"
+                                insert_out_fh.write(row + "\n")
+                        progress.advance(task)
+            finally:
+                if insert_out_fh is not None:
+                    insert_out_fh.close()
 
             n_matched_reads = len(match_counts)
             typer.echo(
@@ -1498,12 +1714,55 @@ def main(
                 f"{n_total_matches:,} total occurrences",
                 err=True,
             )
-        elif minimizer_table is None and read_minimizers_prefix is not None:
-            typer.echo(
-                "Provide --minimizer-table to enable read-to-path "
-                "Aho-Corasick matching.",
-                err=True,
-            )
+
+            ins_stats = _insert_size_stats(all_insert_sizes_min, bp_scale)
+            if ins_stats:  # noqa: SIM102
+                ms = ins_stats["minimizer_space"]
+                assert isinstance(ms, dict)
+                typer.echo(
+                    f"\nInsert size (minimizer space, "
+                    f"{ins_stats['observations']:,} observations):",
+                    err=True,
+                )
+                typer.echo(
+                    f"  min={ms['min']:,}  max={ms['max']:,}  "
+                    f"mean={ms['mean']:.1f}  "
+                    f"median={ms['median']:.1f}  "
+                    f"std_dev={ms['std_dev']:.1f}",
+                    err=True,
+                )
+                if "bp" in ins_stats:
+                    bp_s = ins_stats["bp"]
+                    assert isinstance(bp_s, dict)
+                    typer.echo(
+                        f"Insert size (base pairs, "
+                        f"scale={bp_s['scale_bp_per_minimizer']:.3f} "
+                        f"bp/minimizer):",
+                        err=True,
+                    )
+                    typer.echo(
+                        f"  min={bp_s['min']:.0f}  "
+                        f"max={bp_s['max']:.0f}  "
+                        f"mean={bp_s['mean']:.0f}  "
+                        f"median={bp_s['median']:.0f}  "
+                        f"std_dev={bp_s['std_dev']:.0f}",
+                        err=True,
+                    )
+            else:
+                typer.echo(
+                    "No paired reads matched the same path; "
+                    "insert size could not be estimated.",
+                    err=True,
+                )
+
+    min_table: dict[int, str] | None = None
+    if minimizer_table is not None:
+        min_table = load_minimizer_table(minimizer_table)
+        typer.echo(
+            f"Minimizer table: {len(min_table):,} unique minimizers "
+            f"from {minimizer_table}",
+            err=True,
+        )
 
     if json_out is not None:
         stats = _compute_summary(
@@ -1515,6 +1774,10 @@ def main(
             stats["read_index_pairs"] = len(read_index.pairs) // 2
         if n_total_matches:
             stats["path_match_occurrences"] = n_total_matches
+        if ins_stats:
+            stats["insert_size_from_minimizers"] = ins_stats
+        if min_table is not None:
+            stats["unique_minimizers"] = len(min_table)
         json_out.write_text(json.dumps(stats, indent=2) + "\n")
         typer.echo(f"Stats written to {json_out}", err=True)
 

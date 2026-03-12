@@ -47,7 +47,11 @@
       "Bash(cargo build --release)",
       "Bash(/Users/timrozday/Documents/genome-blender/bin/rust-mdbg:*)",
       "Bash(/Users/timrozday/miniforge3/envs/genome_blender_dev/bin/python:*)",
-      "Bash(/Users/timrozday/miniforge3/envs/genome_blender_dev/bin/pip install:*)"
+      "Bash(/Users/timrozday/miniforge3/envs/genome_blender_dev/bin/pip install:*)",
+      "Bash(xxd:*)",
+      "Bash(/Users/timrozday/miniforge3/envs/genome_blender_dev/bin/python3:*)",
+      "Bash(/Users/timrozday/miniforge3/envs/genome_blender_dev/bin/pytest:*)",
+      "Bash(cargo build:*)"
     ]
   }
 }
