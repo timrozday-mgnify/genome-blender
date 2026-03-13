@@ -1,7 +1,7 @@
 !/usr/bin/env bash
 set -euo pipefail
 
-INPUT_DIR="$(cd ../genome-blender_run/single_short_shallow/output && pwd)"
+INPUT_DIR="$(cd ../genome-blender_run/single_genome_full/output && pwd)"
 OUTPUT_DIR="${INPUT_DIR}/rust-mdbg"
 mkdir -p "${OUTPUT_DIR}"
 
@@ -10,7 +10,7 @@ COMBINED="${OUTPUT_DIR}/combined_reads.fastq"
 cat "${INPUT_DIR}"/*.fastq > "${COMBINED}"
 
 # rust-mdbg parameters
-K=7   # k-mer size (minimizer k-mer)
+K=5   # k-mer size (minimizer k-mer)
 L=12  # l-mer length (minimizer length)
 MINABUND=2
 
@@ -54,16 +54,18 @@ UNIQUE_MINIMIZERS=$(grep -vc '^#' "${MINIMIZER_TABLE}" 2>/dev/null || echo 0)
 echo "Unique minimizers in minimizer_table: ${UNIQUE_MINIMIZERS}"
 
 /Users/timrozday/miniforge3/envs/genome_blender_dev/bin/python "$(dirname "$0")/parse_gfa.py" \
-    -n 10000 \
+    -n 100000 \
     --top-paths 5 \
-    --sample-component-proportion 0. \
+    --sample-component-proportion 0.5 \
+    --ac-prefilter \
     --read-minimizers "${PREFIX}" \
     --minimizer-table "${MINIMIZER_TABLE}" \
     --insert-sizes-out "${PREFIX}.insert_sizes.tsv" \
-    --read-mappings-out "${PREFIX}.read_mappings.tsv" \
-    --paths-out "${PREFIX}.paths.tsv" \
     --json "${PREFIX}.graph_summary.json" \
     "${GFA}"
+
+#    --read-mappings-out "${PREFIX}.read_mappings.tsv" \
+#    --paths-out "${PREFIX}.paths.tsv" \
 
 /Users/timrozday/miniforge3/envs/genome_blender_dev/bin/python "$(dirname "$0")/read_minimizers.py" \
     --summary \
