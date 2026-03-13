@@ -18,9 +18,13 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "scripts"))
 from parse_gfa import (
     AhoCorasick,
     Link,
+    MatcherMode,
+    PathMatch,
     ReadIndex,
     Segment,
+    SeedExtender,
     WeightMode,
+    _compute_eligible,
     _overlap_length,
     _parse_tags,
     _path_pair_distances,
@@ -34,6 +38,7 @@ from parse_gfa import (
     app,
     build_aho_corasick,
     build_read_index,
+    build_seed_extender,
     build_seg_min_index,
     leaf_nodes,
     longest_simple_path,
@@ -746,11 +751,16 @@ class TestRevcompReadMatching:
         read_index = ReadIndex(
             name_to_id={"r/1": 0, "r/2": 1},
             names=["r/1", "r/2"],
-            minimizers=[r1_mids, r2_mids],
             pairs={0: 1, 1: 0},
         )
+        min_list = [("r/1", r1_mids), ("r/2", r2_mids)]
         path_minimizer_set = {int(m) for m in seq}
-        ac = build_aho_corasick(read_index, path_minimizer_set)
+        individually_passing = {
+            read_index.name_to_id[n] for n, m in min_list
+            if m and all(v in path_minimizer_set for v in m)
+        }
+        eligible = _compute_eligible(read_index.pairs, individually_passing)
+        ac = build_aho_corasick(iter(min_list), read_index, eligible)
         matches = match_reads_to_path(seq, ac)
         assert len(matches) == 2
 
@@ -774,10 +784,15 @@ class TestRevcompReadMatching:
         unrelated = ReadIndex(
             name_to_id={"r/1": 0},
             names=["r/1"],
-            minimizers=[(B, B+1, B+99)],
             pairs={},
         )
-        ac = build_aho_corasick(unrelated, path_minimizer_set)
+        min_list = [("r/1", (B, B+1, B+99))]
+        individually_passing = {
+            unrelated.name_to_id[n] for n, m in min_list
+            if m and all(v in path_minimizer_set for v in m)
+        }
+        eligible = _compute_eligible(unrelated.pairs, individually_passing)
+        ac = build_aho_corasick(iter(min_list), unrelated, eligible)
         matches = match_reads_to_path(seq, ac)
         assert len(matches) == 0
 
@@ -794,10 +809,15 @@ class TestRevcompReadMatching:
         matching = ReadIndex(
             name_to_id={"r/1": 0},
             names=["r/1"],
-            minimizers=[(B+1, B+2, B+3)],
             pairs={},
         )
-        ac = build_aho_corasick(matching, path_minimizer_set)
+        min_list = [("r/1", (B+1, B+2, B+3))]
+        individually_passing = {
+            matching.name_to_id[n] for n, m in min_list
+            if m and all(v in path_minimizer_set for v in m)
+        }
+        eligible = _compute_eligible(matching.pairs, individually_passing)
+        ac = build_aho_corasick(iter(min_list), matching, eligible)
         matches = match_reads_to_path(seq, ac)
         assert len(matches) == 1
 
@@ -815,10 +835,15 @@ class TestRevcompReadMatching:
         index = ReadIndex(
             name_to_id={"r/1": 0, "r/2": 1},
             names=["r/1", "r/2"],
-            minimizers=[(B+1, B+2, B+3), (B+2, B+3, B+99)],
             pairs={0: 1, 1: 0},
         )
-        ac = build_aho_corasick(index, path_minimizer_set)
+        min_list = [("r/1", (B+1, B+2, B+3)), ("r/2", (B+2, B+3, B+99))]
+        individually_passing = {
+            index.name_to_id[n] for n, m in min_list
+            if m and all(v in path_minimizer_set for v in m)
+        }
+        eligible = _compute_eligible(index.pairs, individually_passing)
+        ac = build_aho_corasick(iter(min_list), index, eligible)
         matches = match_reads_to_path(seq, ac)
         # r/1 must also be excluded because its pair (r/2) failed.
         assert len(matches) == 0
@@ -836,10 +861,15 @@ class TestRevcompReadMatching:
         index = ReadIndex(
             name_to_id={"r/1": 0, "r/2": 1},
             names=["r/1", "r/2"],
-            minimizers=[(B, B+1, B+2), (B+2, B+3, B+4)],
             pairs={0: 1, 1: 0},
         )
-        ac = build_aho_corasick(index, path_minimizer_set)
+        min_list = [("r/1", (B, B+1, B+2)), ("r/2", (B+2, B+3, B+4))]
+        individually_passing = {
+            index.name_to_id[n] for n, m in min_list
+            if m and all(v in path_minimizer_set for v in m)
+        }
+        eligible = _compute_eligible(index.pairs, individually_passing)
+        ac = build_aho_corasick(iter(min_list), index, eligible)
         matches = match_reads_to_path(seq, ac)
         assert len(matches) == 2
         insert_sizes = _path_pair_insert_sizes(matches, index)
@@ -866,3 +896,145 @@ class TestRevcompReadMatching:
         # be stripped — expect all 5 minimizers, not [B+2, B+3, B+4].
         seq = path_minimizer_sequence(path, seg_idx, k=3)
         assert list(map(int, seq)) == [B, B+1, B+2, B+3, B+4]
+
+
+class TestSeedExtender:
+    """Tests for the SeedExtender read matcher."""
+
+    _BASE = 0x4000_0000_0000_0000
+
+    def _make_extender(
+        self,
+        reads: dict[str, tuple[int, ...]],
+        min_chain_score: float = 1.0,
+        max_gap: int = 0,
+    ) -> tuple[ReadIndex, SeedExtender]:
+        """Build a SeedExtender directly from an in-memory read dict."""
+        index = ReadIndex(
+            name_to_id={n: i for i, n in enumerate(sorted(reads))},
+            names=sorted(reads),
+            pairs={},
+        )
+        se = build_seed_extender(
+            iter(sorted(reads.items())),
+            index,
+            min_chain_score=min_chain_score,
+            max_gap=max_gap,
+        )
+        return index, se
+
+    def test_exact_substring_match(self) -> None:
+        """A read whose minimizers appear verbatim in the path is found."""
+        B = self._BASE
+        path_seq = np.array([B, B+1, B+2, B+3, B+4], dtype=np.uint64)
+        _, se = self._make_extender({"r1": (B+1, B+2, B+3)})
+        matches = se.search_path(path_seq)
+        assert len(matches) == 1
+        assert matches[0].read_id == 0
+        assert matches[0].path_start == 1
+        assert matches[0].path_end == 4
+
+    def test_no_match_when_minimizer_absent(self) -> None:
+        """A read with minimizers not in the path produces no match."""
+        B = self._BASE
+        path_seq = np.array([B, B+1, B+2], dtype=np.uint64)
+        _, se = self._make_extender({"r1": (B+99,)})
+        matches = se.search_path(path_seq)
+        assert len(matches) == 0
+
+    def test_reversed_read_is_found(self) -> None:
+        """A read stored reversed (REVCOMP_AWARE) is found via the rev index."""
+        B = self._BASE
+        # Path in forward direction: [B, B+1, B+2, B+3]
+        path_seq = np.array([B, B+1, B+2, B+3], dtype=np.uint64)
+        # Read stored reversed: [B+3, B+2, B+1] — reversed = [B+1, B+2, B+3]
+        # which IS in the path.
+        _, se = self._make_extender({"r1": (B+3, B+2, B+1)})
+        matches = se.search_path(path_seq)
+        assert len(matches) == 1
+        assert matches[0].read_id == 0
+
+    def test_approximate_match_with_gap(self) -> None:
+        """With max_gap>0 a read with one skipped minimizer still matches."""
+        B = self._BASE
+        # Path: [B, B+1, B+2, B+3, B+4]
+        # Read: [B, B+2, B+4] — every other minimizer; gap=1 between each
+        path_seq = np.array([B, B+1, B+2, B+3, B+4], dtype=np.uint64)
+        _, se = self._make_extender(
+            {"r1": (B, B+2, B+4)}, min_chain_score=1.0, max_gap=1,
+        )
+        matches = se.search_path(path_seq)
+        assert len(matches) == 1
+
+    def test_below_threshold_no_match(self) -> None:
+        """With min_chain_score=1.0 a partial chain is rejected."""
+        B = self._BASE
+        # Path: [B, B+1, B+2, B+3]
+        # Read: [B, B+1, B+99] — last minimizer absent → only 2/3 covered
+        path_seq = np.array([B, B+1, B+2, B+3], dtype=np.uint64)
+        _, se = self._make_extender(
+            {"r1": (B, B+1, B+99)}, min_chain_score=1.0, max_gap=5,
+        )
+        matches = se.search_path(path_seq)
+        assert len(matches) == 0
+
+    def test_partial_match_above_threshold(self) -> None:
+        """With min_chain_score<1.0 a partial chain is accepted."""
+        B = self._BASE
+        path_seq = np.array([B, B+1, B+2, B+3], dtype=np.uint64)
+        # Read has 3 minimizers; only 2 appear in path → 2/3 ≈ 0.67
+        _, se = self._make_extender(
+            {"r1": (B, B+1, B+99)}, min_chain_score=0.6, max_gap=5,
+        )
+        matches = se.search_path(path_seq)
+        assert len(matches) == 1
+
+    def test_paired_reads_yield_insert_size(self) -> None:
+        """Two paired reads chained to the same path produce an insert size."""
+        B = self._BASE
+        path_seq = np.array(
+            [B, B+1, B+2, B+3, B+4, B+5, B+6, B+7], dtype=np.uint64
+        )
+        index = ReadIndex(
+            name_to_id={"r/1": 0, "r/2": 1},
+            names=["r/1", "r/2"],
+            pairs={0: 1, 1: 0},
+        )
+        se = build_seed_extender(
+            iter([("r/1", (B, B+1, B+2)), ("r/2", (B+5, B+6, B+7))]),
+            index,
+            min_chain_score=1.0,
+            max_gap=0,
+        )
+        matches = se.search_path(path_seq)
+        assert len(matches) == 2
+        insert_sizes = _path_pair_insert_sizes(matches, index)
+        assert len(insert_sizes) == 1
+        _, _, span = insert_sizes[0]
+        assert span == 8  # positions 0..8 inclusive
+
+    def test_ac_and_seed_extend_agree_on_exact_match(self) -> None:
+        """For exact matches both matchers report the same path positions."""
+        B = self._BASE
+        # Build a single-node graph with 5 minimizers.
+        g: rx.PyGraph = rx.PyGraph()
+        g.add_node(Segment("s0", "*", 50))
+        fwd = np.array([B, B+1, B+2, B+3, B+4], dtype=np.uint64)
+        seg_idx = build_seg_min_index(g, {"s0": (fwd, fwd[::-1].copy())})
+        path: list[tuple[int, bool]] = [(0, True)]
+        path_seq = path_minimizer_sequence(path, seg_idx, k=3)
+
+        read_mids = (B+1, B+2, B+3)
+        index = ReadIndex(
+            name_to_id={"r1": 0}, names=["r1"], pairs={},
+        )
+        ac = build_aho_corasick(iter([("r1", read_mids)]), index)
+        se = build_seed_extender(
+            iter([("r1", read_mids)]), index,
+            min_chain_score=1.0, max_gap=0,
+        )
+        ac_matches = ac.search_path(path_seq)
+        se_matches = se.search_path(path_seq)
+        assert len(ac_matches) == len(se_matches) == 1
+        assert ac_matches[0].path_start == se_matches[0].path_start
+        assert ac_matches[0].path_end == se_matches[0].path_end

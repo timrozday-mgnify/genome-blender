@@ -24,11 +24,11 @@ import random
 import re
 import struct
 from collections import deque
-from collections.abc import Iterator
+from collections.abc import Iterable, Iterator
 from dataclasses import dataclass, field
 from enum import Enum
 from pathlib import Path
-from typing import Annotated
+from typing import Annotated, Protocol
 
 import lz4.frame
 import numpy as np
@@ -308,45 +308,53 @@ def _iter_binary_rm(raw: bytes) -> Iterator[tuple[str, tuple[int, ...]]]:
         yield name, ids
 
 
-def load_read_minimizers(prefix: Path) -> dict[str, tuple[int, ...]]:
-    """Load per-read minimizer IDs from rust-mdbg output files.
+def _iter_binary_rm_names(raw: bytes) -> Iterator[str]:
+    """Yield read names only from binary-format bytes, skipping minimizer data."""
+    mv = memoryview(raw)
+    offset = _RM_HDR_LEN
+    total = len(raw)
+    while offset < total:
+        (name_len,) = struct.unpack_from("<I", mv, offset)
+        offset += 4
+        name = bytes(mv[offset: offset + name_len]).decode()
+        offset += name_len
+        (n,) = struct.unpack_from("<I", mv, offset)
+        offset += 4 + n * 16  # skip ids (n×8) + positions (n×8)
+        yield name
 
-    Reads all ``{prefix}.*.read_minimizers`` LZ4-compressed files.
-    Supports both binary (``RMBG`` magic) and legacy LZ4-TSV formats,
-    auto-detected per file.
+
+def _iter_tsv_rm_names(raw: bytes) -> Iterator[str]:
+    """Yield read names only from legacy LZ4-TSV bytes."""
+    for line in io.TextIOWrapper(io.BytesIO(raw), encoding="utf-8"):
+        line = line.rstrip("\n")
+        if not line or line.startswith("#"):
+            continue
+        parts = line.split("\t", 1)
+        if parts:
+            yield parts[0]
+
+
+def iter_read_minimizers(
+    prefix: Path,
+) -> Iterator[tuple[str, tuple[int, ...]]]:
+    """Stream ``(name, minimizer_ids)`` pairs from all ``.read_minimizers`` files.
+
+    Decompresses one file at a time so only one file's data resides in
+    memory simultaneously.  Supports both binary (``RMBG`` magic) and
+    legacy LZ4-TSV formats, auto-detected per file.
 
     Args:
         prefix: rust-mdbg output prefix (e.g. ``Path("rust_mdbg_out")``).
 
-    Returns:
-        Mapping of read name to ordered tuple of NT-hash minimizer IDs.
+    Yields:
+        ``(read_name, minimizer_id_tuple)`` for each read record.
     """
     pattern = str(prefix) + ".*.read_minimizers"
     files = sorted(glob.glob(pattern))
-    if not files:
-        logger.warning(
-            "No .read_minimizers files found for prefix: %s", prefix,
-        )
-        return {}
-
-    records: dict[str, tuple[int, ...]] = {}
-    with Progress(*_PROGRESS_COLUMNS) as progress:
-        task = progress.add_task(
-            "Loading read minimizers", total=len(files),
-        )
-        for fpath in files:
-            raw = lz4.frame.decompress(Path(fpath).read_bytes())
-            iter_fn = _iter_binary_rm if raw[:4] == _RM_MAGIC else _iter_tsv_rm
-            for read_id, ids in iter_fn(raw):
-                records[read_id] = ids
-                logger.debug("Read name: %s", read_id)
-            progress.advance(task)
-
-    logger.info(
-        "Loaded minimizers for %d reads from %s.*",
-        len(records), prefix,
-    )
-    return records
+    for fpath in files:
+        raw = lz4.frame.decompress(Path(fpath).read_bytes())
+        iter_fn = _iter_binary_rm if raw[:4] == _RM_MAGIC else _iter_tsv_rm
+        yield from iter_fn(raw)
 
 
 def load_minimizer_table(table_path: Path) -> dict[int, str]:
@@ -433,57 +441,68 @@ class ReadIndex:
 
     Each read is assigned a compact integer ID so that index structures
     (Aho-Corasick output lists, pair maps, position tables) store small
-    ints rather than variable-length strings.
+    ints rather than variable-length strings.  Minimizer data is kept
+    off-heap: use :func:`iter_read_minimizers` to stream it from disk.
 
     Attributes:
         name_to_id: Read name to compact integer ID.
         names: Inverse map — index is the read ID, value is the name.
-        minimizers: Per-read ordered minimizer-ID tuples, indexed by
-            read ID.
         pairs: Read ID to mate read ID for paired-end reads.  Unpaired
             reads have no entry.
     """
 
     name_to_id: dict[str, int]
     names: list[str]
-    minimizers: list[tuple[int, ...]]
     pairs: dict[int, int]
 
 
-def build_read_index(
-    read_minimizers: dict[str, tuple[int, ...]],
-) -> ReadIndex:
-    """Build an integer-indexed read registry from a minimizer dict.
+def build_read_index(prefix: Path) -> ReadIndex:
+    """Build an integer-indexed read registry from ``.read_minimizers`` files.
 
-    Reads are assigned IDs in sorted name order for reproducibility.
-    Paired-end mates are detected by stripping common name suffixes
-    and grouping reads that share the same template name.
+    Performs a names-only streaming pass — minimizer data is not loaded
+    into memory.  Reads are assigned IDs in sorted name order for
+    reproducibility.  Paired-end mates are detected by stripping common
+    name suffixes and grouping reads that share the same template name.
 
     Args:
-        read_minimizers: Mapping of read name to ordered minimizer IDs
-            as returned by :func:`load_read_minimizers`.
+        prefix: rust-mdbg output prefix (e.g. ``Path("rust_mdbg_out")``).
 
     Returns:
-        A :class:`ReadIndex` with integer IDs, minimizer lists stored
-        by index, and paired mates cross-linked.
+        A :class:`ReadIndex` with integer IDs and paired mates
+        cross-linked, but no minimizer data.  Use
+        :func:`iter_read_minimizers` to stream minimizers from disk.
     """
-    sorted_names = sorted(read_minimizers)
-    n_reads = len(sorted_names)
+    pattern = str(prefix) + ".*.read_minimizers"
+    files = sorted(glob.glob(pattern))
+    if not files:
+        logger.warning(
+            "No .read_minimizers files found for prefix: %s", prefix,
+        )
+        return ReadIndex(name_to_id={}, names=[], pairs={})
 
-    name_to_id: dict[str, int] = {}
-    names: list[str] = sorted_names
-    minimizers: list[tuple[int, ...]] = []
-    template_to_ids: dict[str, list[int]] = {}
-
+    all_names: list[str] = []
     with Progress(*_PROGRESS_COLUMNS) as progress:
-        task = progress.add_task("Building read index", total=n_reads)
-        for read_id, name in enumerate(sorted_names):
-            name_to_id[name] = read_id
-            minimizers.append(read_minimizers[name])
-            tmpl = _template_name(name)
-            logger.debug("Read name: %s  template: %s", name, tmpl)
-            template_to_ids.setdefault(tmpl, []).append(read_id)
+        task = progress.add_task("Loading read names", total=len(files))
+        for fpath in files:
+            raw = lz4.frame.decompress(Path(fpath).read_bytes())
+            iter_fn = (
+                _iter_binary_rm_names
+                if raw[:4] == _RM_MAGIC
+                else _iter_tsv_rm_names
+            )
+            all_names.extend(iter_fn(raw))
             progress.advance(task)
+
+    sorted_names = sorted(all_names)
+    name_to_id: dict[str, int] = {
+        name: i for i, name in enumerate(sorted_names)
+    }
+
+    template_to_ids: dict[str, list[int]] = {}
+    for read_id, name in enumerate(sorted_names):
+        tmpl = _template_name(name)
+        logger.debug("Read name: %s  template: %s", name, tmpl)
+        template_to_ids.setdefault(tmpl, []).append(read_id)
 
     pairs: dict[int, int] = {}
     for tmpl, ids in template_to_ids.items():
@@ -498,14 +517,9 @@ def build_read_index(
 
     logger.info(
         "Read index: %d reads, %d paired templates",
-        len(names), len(pairs) // 2,
+        len(sorted_names), len(pairs) // 2,
     )
-    return ReadIndex(
-        name_to_id=name_to_id,
-        names=names,
-        minimizers=minimizers,
-        pairs=pairs,
-    )
+    return ReadIndex(name_to_id=name_to_id, names=sorted_names, pairs=pairs)
 
 
 # ------------------------------------------------------------------
@@ -680,6 +694,41 @@ def path_minimizer_sequence(
 
 
 # ------------------------------------------------------------------
+# Matcher mode and shared protocol
+# ------------------------------------------------------------------
+
+
+class MatcherMode(str, Enum):
+    """Substring-matching strategy for read-to-path alignment."""
+
+    ac = "ac"
+    seed_extend = "seed-extend"
+
+
+class ReadMatcher(Protocol):
+    """Protocol satisfied by every read-to-path matcher.
+
+    A matcher is built once from the read minimizer data and then
+    queried once per sampled path via :meth:`search_path`.
+    """
+
+    def search_path(self, path_seq: np.ndarray) -> list[PathMatch]:
+        """Return all reads found in *path_seq*.
+
+        Args:
+            path_seq: 1-D uint64 array of minimizer IDs for one path.
+
+        Returns:
+            List of :class:`PathMatch` records (one per hit occurrence).
+        """
+        ...
+
+    def describe(self) -> str:
+        """Return a short human-readable description of the index."""
+        ...
+
+
+# ------------------------------------------------------------------
 # Aho-Corasick automaton over integer sequences
 # ------------------------------------------------------------------
 
@@ -703,10 +752,7 @@ class AhoCorasick:
 
     Usage::
 
-        ac = AhoCorasick()
-        for read_id, mids in enumerate(index.minimizers):
-            ac.add_pattern(mids, read_id)
-        ac.build()
+        ac = build_aho_corasick(iter_read_minimizers(prefix), index)
         matches = ac.search(path_minimizer_sequence(...))
     """
 
@@ -783,12 +829,57 @@ class AhoCorasick:
                 matches.append((pos - pat_len + 1, pos + 1, pat_id))
         return matches
 
+    # --- ReadMatcher protocol implementation ---
+
+    def search_path(self, path_seq: np.ndarray) -> list[PathMatch]:
+        """Return all reads found in *path_seq* using the AC automaton.
+
+        Args:
+            path_seq: 1-D uint64 array of minimizer IDs for one path.
+
+        Returns:
+            List of :class:`PathMatch` records, one per occurrence.
+        """
+        return [
+            PathMatch(read_id=pat_id, path_start=start, path_end=end)
+            for start, end, pat_id in self.search(path_seq)
+        ]
+
+    def describe(self) -> str:
+        """Return a short description of the automaton size."""
+        return f"Aho-Corasick: {len(self._nodes):,} states"
+
+
+def _compute_eligible(
+    pairs: dict[int, int],
+    individually_passing: set[int],
+) -> set[int]:
+    """Apply pair-coherence to a set of individually-passing read IDs.
+
+    Both mates of a paired-end read must pass or neither is retained.
+    Unpaired reads are retained if they individually pass.
+
+    Args:
+        pairs: Read ID to mate read ID mapping from :class:`ReadIndex`.
+        individually_passing: Read IDs that pass an upstream filter.
+
+    Returns:
+        Subset of *individually_passing* where the mate also passes
+        (or the read is unpaired).
+    """
+    return {
+        read_id for read_id in individually_passing
+        if pairs.get(read_id) in individually_passing
+        or pairs.get(read_id) is None
+    }
+
 
 def build_aho_corasick(
+    minimizer_iter: Iterable[tuple[str, tuple[int, ...]]],
     index: ReadIndex,
-    path_minimizer_set: set[int] | None = None,
+    eligible: set[int] | None = None,
 ) -> AhoCorasick:
-    """Build an Aho-Corasick automaton from all reads in *index*.
+    """Build an Aho-Corasick automaton from a streaming read minimizer source.
 
     Each read's integer ID is used as the pattern ID so match results
     can be resolved back to read names and pairs without storing strings
@@ -800,57 +891,260 @@ def build_aho_corasick(
     path direction.  A match of either orientation is recorded under the
     same read ID.
 
-    When *path_minimizer_set* is provided, a read is only added to the
-    automaton if every one of its minimizer IDs appears in the set.
-    This is a necessary condition for a match and excludes reads that
-    cannot possibly occur in any of the target paths, reducing automaton
-    size and search time.  Additionally, if a read has a registered pair,
-    both ends must individually pass the filter or neither is added; a
-    lone end can never contribute to a paired insert-size estimate.
-
     Args:
-        index: Populated :class:`ReadIndex`.
-        path_minimizer_set: Optional union of all minimizer IDs that
-            appear in any target path.  Reads with minimizers outside
-            this set are skipped.
+        minimizer_iter: Iterator yielding ``(read_name, minimizer_ids)``
+            pairs, e.g. from :func:`iter_read_minimizers`.
+        index: :class:`ReadIndex` providing the name-to-ID mapping.
+        eligible: Optional set of read IDs to include.  Only reads
+            whose integer ID is in this set are added to the automaton.
+            Use :func:`_compute_eligible` for pair-coherent pre-filtering.
 
     Returns:
         A compiled :class:`AhoCorasick` automaton ready for searching.
     """
-    # Pre-compute which reads pass the individual minimizer filter so that
-    # pair eligibility can be enforced: both ends of a pair must pass or
-    # neither is added (one end alone can never yield a paired match).
-    if path_minimizer_set is not None:
-        individually_passing: set[int] = {
-            read_id
-            for read_id, minimizers in enumerate(index.minimizers)
-            if minimizers and all(m in path_minimizer_set for m in minimizers)
-        }
-        eligible: set[int] = {
-            read_id for read_id in individually_passing
-            if index.pairs.get(read_id) in individually_passing
-            or index.pairs.get(read_id) is None
-        }
-    else:
-        eligible = None  # type: ignore[assignment]
-
     ac = AhoCorasick()
     with Progress(*_PROGRESS_COLUMNS) as progress:
         task = progress.add_task(
             "Building Aho-Corasick", total=len(index.names),
         )
-        for read_id, minimizers in enumerate(index.minimizers):
+        for name, minimizers in minimizer_iter:
+            read_id = index.name_to_id.get(name)
+            if read_id is None:
+                continue
             if minimizers:
-                if eligible is not None and read_id not in eligible:
-                    progress.advance(task)
-                    continue
-                ac.add_pattern(minimizers, read_id)
-                rev = minimizers[::-1]
-                if rev != minimizers:
-                    ac.add_pattern(rev, read_id)
+                if eligible is None or read_id in eligible:
+                    ac.add_pattern(minimizers, read_id)
+                    rev = minimizers[::-1]
+                    if rev != minimizers:
+                        ac.add_pattern(rev, read_id)
             progress.advance(task)
     ac.build()
     return ac
+
+
+# ------------------------------------------------------------------
+# Seed-and-extend matcher (minimap2-style anchoring + DP chaining)
+# ------------------------------------------------------------------
+
+# Maximum number of preceding anchors to consider per DP step.
+_CHAIN_LOOKBACK: int = 50
+# Gap open and extension costs (in anchor units, fraction of one match).
+_CHAIN_GAP_OPEN: float = 0.1
+_CHAIN_GAP_EXT: float = 0.1
+
+
+class SeedExtender:
+    """Minimizer-space seed-and-extend read matcher.
+
+    Indexes read minimizers in an inverted structure
+    (``minimizer_id → [(read_id, read_pos)]``) for forward and reversed
+    orientations separately.  At search time it collects per-read anchor
+    sets from the path and chains them with a DP algorithm similar to
+    minimap2's linear-time chaining, tolerating small gaps.
+
+    Attributes:
+        _fwd: Forward inverted index.
+        _rev: Reversed inverted index (``None`` entries excluded).
+        _read_lengths: Read ID to minimizer count.
+        _min_chain_score: Minimum fraction of read minimizers that must
+            be covered by the best chain for a match to be reported.
+        _max_gap: Maximum gap (in minimizers) allowed between consecutive
+            anchors in either the read or path coordinate.
+    """
+
+    def __init__(
+        self,
+        fwd: dict[int, list[tuple[int, int]]],
+        rev: dict[int, list[tuple[int, int]]],
+        read_lengths: dict[int, int],
+        min_chain_score: float,
+        max_gap: int,
+    ) -> None:
+        self._fwd = fwd
+        self._rev = rev
+        self._read_lengths = read_lengths
+        self._min_chain_score = min_chain_score
+        self._max_gap = max_gap
+
+    def search_path(self, path_seq: np.ndarray) -> list[PathMatch]:
+        """Return reads whose minimizers chain against *path_seq*.
+
+        For each read, anchor sets are built for both forward and reversed
+        orientations and chained independently.  Matches from either
+        orientation are reported under the same read ID.
+
+        Args:
+            path_seq: 1-D uint64 array of minimizer IDs for one path.
+
+        Returns:
+            List of :class:`PathMatch` records (one per successful chain).
+        """
+        fwd_anchors: dict[int, list[tuple[int, int]]] = {}
+        rev_anchors: dict[int, list[tuple[int, int]]] = {}
+        for path_pos, mid_raw in enumerate(path_seq):
+            mid = int(mid_raw)
+            for read_id, read_pos in self._fwd.get(mid, ()):
+                fwd_anchors.setdefault(read_id, []).append(
+                    (read_pos, path_pos)
+                )
+            for read_id, read_pos in self._rev.get(mid, ()):
+                rev_anchors.setdefault(read_id, []).append(
+                    (read_pos, path_pos)
+                )
+
+        matches: list[PathMatch] = []
+        all_ids = set(fwd_anchors) | set(rev_anchors)
+        for read_id in all_ids:
+            read_len = self._read_lengths[read_id]
+            for anchor_dict in (fwd_anchors, rev_anchors):
+                anchors = anchor_dict.get(read_id)
+                if not anchors:
+                    continue
+                m = self._chain(read_id, read_len, anchors)
+                if m is not None:
+                    matches.append(m)
+        return matches
+
+    def _chain(
+        self,
+        read_id: int,
+        read_len: int,
+        anchors: list[tuple[int, int]],
+    ) -> PathMatch | None:
+        """Find the highest-scoring chain of anchors via DP.
+
+        Anchors are sorted by (path_pos, read_pos) before chaining.
+        A gap between consecutive anchors in either coordinate incurs a
+        fractional penalty so that chains with indel-like events score
+        slightly lower than gap-free chains of the same length.
+
+        Args:
+            read_id: Integer ID of the read.
+            read_len: Number of minimizers in the read.
+            anchors: Unsorted list of ``(read_pos, path_pos)`` pairs.
+
+        Returns:
+            A :class:`PathMatch` if the best chain meets the score
+            threshold, otherwise ``None``.
+        """
+        # Sort by path position (primary), read position (secondary).
+        anchors.sort(key=lambda a: (a[1], a[0]))
+        n = len(anchors)
+        dp = [1.0] * n
+        prev = [-1] * n
+
+        for i in range(1, n):
+            rp_i, pp_i = anchors[i]
+            for j in range(i - 1, max(-1, i - _CHAIN_LOOKBACK), -1):
+                rp_j, pp_j = anchors[j]
+                if rp_j >= rp_i or pp_j >= pp_i:
+                    continue
+                read_gap = rp_i - rp_j - 1  # 0 = consecutive
+                path_gap = pp_i - pp_j - 1  # 0 = consecutive
+                if path_gap > self._max_gap or read_gap > self._max_gap:
+                    continue
+                gap_pen = (
+                    _CHAIN_GAP_OPEN * min(read_gap, path_gap)
+                    + _CHAIN_GAP_EXT * abs(read_gap - path_gap)
+                )
+                score = dp[j] + 1.0 - gap_pen
+                if score > dp[i]:
+                    dp[i] = score
+                    prev[i] = j
+
+        best_i = max(range(n), key=lambda i: dp[i])
+
+        # Trace back to find the path-coordinate span and count of the chain.
+        # The threshold is applied to the anchor count (matched minimizers),
+        # not the penalised DP score, so that gaps only affect chain selection
+        # and not the acceptance criterion.
+        i = best_i
+        path_end = anchors[i][1] + 1
+        path_start = anchors[i][1]
+        n_anchors = 0
+        while i >= 0:
+            path_start = anchors[i][1]
+            n_anchors += 1
+            i = prev[i]
+
+        if n_anchors < self._min_chain_score * read_len:
+            return None
+        return PathMatch(
+            read_id=read_id, path_start=path_start, path_end=path_end,
+        )
+
+    def describe(self) -> str:
+        """Return a short description of the index."""
+        n_fwd = sum(len(v) for v in self._fwd.values())
+        n_rev = sum(len(v) for v in self._rev.values())
+        n_reads = len(self._read_lengths)
+        return (
+            f"Seed-extend: {n_reads:,} reads, "
+            f"{n_fwd + n_rev:,} anchor entries "
+            f"({n_fwd:,} fwd + {n_rev:,} rev)"
+        )
+
+
+def build_seed_extender(
+    minimizer_iter: Iterable[tuple[str, tuple[int, ...]]],
+    index: ReadIndex,
+    eligible: set[int] | None = None,
+    min_chain_score: float = 0.8,
+    max_gap: int = 5,
+) -> SeedExtender:
+    """Build a :class:`SeedExtender` from streaming read minimizer data.
+
+    Constructs forward and reversed inverted indices
+    (``minimizer_id → [(read_id, read_pos)]``) in a single streaming pass.
+    Both orientations are indexed because REVCOMP_AWARE normalisation in
+    rust-mdbg means ~50 % of reads are stored reversed relative to their
+    true mapping direction.
+
+    Args:
+        minimizer_iter: Iterator yielding ``(read_name, minimizer_ids)``
+            pairs, e.g. from :func:`iter_read_minimizers`.
+        index: :class:`ReadIndex` providing the name-to-ID mapping.
+        eligible: Optional set of read IDs to include.
+        min_chain_score: Minimum fraction of read minimizers required in
+            the best chain for a match to be reported (0–1).
+        max_gap: Maximum allowed gap (in minimizers) between consecutive
+            anchors in either the read or path coordinate.
+
+    Returns:
+        A :class:`SeedExtender` ready for :meth:`~SeedExtender.search_path`.
+    """
+    fwd: dict[int, list[tuple[int, int]]] = {}
+    rev: dict[int, list[tuple[int, int]]] = {}
+    read_lengths: dict[int, int] = {}
+
+    with Progress(*_PROGRESS_COLUMNS) as progress:
+        task = progress.add_task(
+            "Building seed-extend index", total=len(index.names),
+        )
+        for name, minimizers in minimizer_iter:
+            read_id = index.name_to_id.get(name)
+            if read_id is None:
+                continue
+            if minimizers and (eligible is None or read_id in eligible):
+                for read_pos, mid in enumerate(minimizers):
+                    fwd.setdefault(mid, []).append((read_id, read_pos))
+                rev_mids = minimizers[::-1]
+                if rev_mids != minimizers:
+                    for read_pos, mid in enumerate(rev_mids):
+                        rev.setdefault(mid, []).append((read_id, read_pos))
+                read_lengths[read_id] = len(minimizers)
+            progress.advance(task)
+
+    logger.info(
+        "Seed-extend index: %d reads", len(read_lengths),
+    )
+    return SeedExtender(
+        fwd=fwd,
+        rev=rev,
+        read_lengths=read_lengths,
+        min_chain_score=min_chain_score,
+        max_gap=max_gap,
+    )
 
 
 # ------------------------------------------------------------------
@@ -875,22 +1169,20 @@ class PathMatch:
 
 def match_reads_to_path(
     path_min_seq: np.ndarray,
-    ac: AhoCorasick,
+    matcher: ReadMatcher,
 ) -> list[PathMatch]:
     """Find all reads whose minimizer sequences occur in *path_min_seq*.
 
     Args:
         path_min_seq: Concatenated minimizer sequence for a sampled
             graph path, from :func:`path_minimizer_sequence`.
-        ac: Compiled :class:`AhoCorasick` automaton built from all reads.
+        matcher: A compiled :class:`ReadMatcher` (e.g.
+            :class:`AhoCorasick` or :class:`SeedExtender`).
 
     Returns:
         List of :class:`PathMatch` records, one per occurrence.
     """
-    return [
-        PathMatch(read_id=pat_id, path_start=start, path_end=end)
-        for start, end, pat_id in ac.search(path_min_seq)
-    ]
+    return matcher.search_path(path_min_seq)
 
 
 def _minimizer_to_bp_scale(
@@ -1918,6 +2210,34 @@ def main(
              "path_length_bp.",
         dir_okay=False,
     )] = None,
+    min_paired_matches: Annotated[int, typer.Option(
+        "--min-paired-matches",
+        help="Keep only paths where at least this many paired-end read "
+             "pairs (both mates mapped to the same path) are found. "
+             "Applied after matching, before reporting. 0 disables "
+             "the filter. Requires --read-minimizers.",
+    )] = 5,
+    matcher: Annotated[MatcherMode, typer.Option(
+        "--matcher",
+        help="Read-to-path substring matching strategy. "
+             "'ac' uses an Aho-Corasick automaton (exact substring "
+             "matching). 'seed-extend' uses a minimap2-style inverted "
+             "minimizer index with DP chaining (approximate matching "
+             "tolerating small gaps).",
+        case_sensitive=False,
+    )] = MatcherMode.ac,
+    min_chain_score: Annotated[float, typer.Option(
+        "--min-chain-score",
+        help="[seed-extend only] Minimum fraction of read minimizers "
+             "that must be covered by the best anchor chain for a read "
+             "to be reported as matching (0.0–1.0).",
+    )] = 0.8,
+    max_chain_gap: Annotated[int, typer.Option(
+        "--max-chain-gap",
+        help="[seed-extend only] Maximum gap (in minimizer positions) "
+             "allowed between consecutive anchors in either the read or "
+             "path coordinate.",
+    )] = 5,
 ) -> None:
     """Parse a rust-mdbg GFA output into a graph and report properties."""
     if paired_end and pe_bam is None:
@@ -2003,14 +2323,12 @@ def main(
     )
 
     read_index: ReadIndex | None = None
-    ac: AhoCorasick | None = None
     n_total_matches = 0
     ins_stats: dict[str, object] = {}
     bp_scale: float | None = None
 
     if read_minimizers_prefix is not None:
-        raw_minimizers = load_read_minimizers(read_minimizers_prefix)
-        read_index = build_read_index(raw_minimizers)
+        read_index = build_read_index(read_minimizers_prefix)
         typer.echo(
             f"Read index: {len(read_index.names):,} reads, "
             f"{len(read_index.pairs) // 2:,} paired templates",
@@ -2062,28 +2380,62 @@ def main(
                 err=True,
             )
 
-            if paths_out is not None:
-                with open(paths_out, "w") as paths_fh:
-                    paths_fh.write(
-                        "path_index\tminimizers\tnodes\tpath_length_bp\n"
-                    )
-                    for path_idx, (seq, (path, bp)) in enumerate(
-                        zip(path_seqs, sampled), start=1,
-                    ):
-                        minimizers_col = ",".join(str(int(m)) for m in seq)
-                        nodes_col = ",".join(
-                            graph[node_idx].name + ("+" if fwd else "-")
-                            for node_idx, fwd in path
-                        )
-                        paths_fh.write(
-                            f"{path_idx}\t{minimizers_col}\t"
-                            f"{nodes_col}\t{bp}\n"
-                        )
-                typer.echo(
-                    f"Paths written to {paths_out}", err=True,
-                )
+        if ac_prefilter and path_minimizer_set:
+            individually_passing: set[int] = {
+                read_id
+                for name, mids in iter_read_minimizers(read_minimizers_prefix)
+                if (read_id := read_index.name_to_id.get(name)) is not None
+                and mids
+                and all(m in path_minimizer_set for m in mids)
+            }
+            eligible = _compute_eligible(read_index.pairs, individually_passing)
+        else:
+            eligible = None
+        read_matcher: ReadMatcher
+        if matcher == MatcherMode.ac:
+            read_matcher = build_aho_corasick(
+                iter_read_minimizers(read_minimizers_prefix),
+                read_index,
+                eligible,
+            )
+        else:
+            read_matcher = build_seed_extender(
+                iter_read_minimizers(read_minimizers_prefix),
+                read_index,
+                eligible,
+                min_chain_score=min_chain_score,
+                max_gap=max_chain_gap,
+            )
+        typer.echo(read_matcher.describe(), err=True)
 
-            # Report chosen paths (longest first; already sorted).
+        # --- Pre-filter paths by paired match count ----------------------------
+        if sampled and min_paired_matches > 0:
+            n_before = len(sampled)
+            filtered: list[tuple[np.ndarray, tuple[_OrientedPath, int]]] = []
+            with Progress(*_PROGRESS_COLUMNS) as progress:
+                task = progress.add_task(
+                    "Pre-filtering paths", total=n_before,
+                )
+                for seq, entry in zip(path_seqs, sampled):
+                    matches = match_reads_to_path(seq, read_matcher)
+                    n_pairs = len(
+                        _path_pair_insert_sizes(matches, read_index)
+                    )
+                    if n_pairs >= min_paired_matches:
+                        filtered.append((seq, entry))
+                    progress.advance(task)
+            path_seqs = [s for s, _ in filtered]
+            sampled = [e for _, e in filtered]
+            n_removed = n_before - len(sampled)
+            typer.echo(
+                f"Path filter (≥{min_paired_matches} paired matches): "
+                f"{len(sampled)} of {n_before} paths kept "
+                f"({n_removed} removed)",
+                err=True,
+            )
+
+        # --- Report and write paths after filtering ----------------------------
+        if sampled:
             n_paths = len(sampled)
             unique_path_nodes = {
                 node_idx
@@ -2098,13 +2450,10 @@ def main(
                 f"= {n_unique / n_total:.1%} of {n_total:,}):",
                 err=True,
             )
-            for i, (seq, (path, bp)) in enumerate(
-                zip(path_seqs, sampled),
-            ):
+            for i, (seq, (path, bp)) in enumerate(zip(path_seqs, sampled)):
                 if i == 10:
                     typer.echo(
-                        f"  ... and {n_paths - 10} more",
-                        err=True,
+                        f"  ... and {n_paths - 10} more", err=True,
                     )
                     break
                 typer.echo(
@@ -2113,14 +2462,28 @@ def main(
                     err=True,
                 )
 
-        ac = build_aho_corasick(
-            read_index,
-            path_minimizer_set if ac_prefilter else None,
-        )
-        typer.echo(
-            f"Aho-Corasick automaton: {len(ac._nodes):,} states",
-            err=True,
-        )
+            if paths_out is not None:
+                with open(paths_out, "w") as paths_fh:
+                    paths_fh.write(
+                        "path_index\tminimizers\tnodes\tpath_length_bp\n"
+                    )
+                    for path_idx, (seq, (path, bp)) in enumerate(
+                        zip(path_seqs, sampled), start=1,
+                    ):
+                        minimizers_col = ",".join(
+                            str(int(m)) for m in seq
+                        )
+                        nodes_col = ",".join(
+                            graph[node_idx].name + ("+" if fwd else "-")
+                            for node_idx, fwd in path
+                        )
+                        paths_fh.write(
+                            f"{path_idx}\t{minimizers_col}\t"
+                            f"{nodes_col}\t{bp}\n"
+                        )
+                typer.echo(
+                    f"Paths written to {paths_out}", err=True,
+                )
 
         if sampled:
             match_counts: dict[int, int] = {}  # read_id → hit count
@@ -2154,7 +2517,7 @@ def main(
                     for path_idx, (seq, (_, _)) in enumerate(
                         zip(path_seqs, sampled), start=1,
                     ):
-                        path_matches = match_reads_to_path(seq, ac)
+                        path_matches = match_reads_to_path(seq, read_matcher)
                         for m in path_matches:
                             match_counts[m.read_id] = (
                                 match_counts.get(m.read_id, 0) + 1

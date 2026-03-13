@@ -1,7 +1,7 @@
 !/usr/bin/env bash
 set -euo pipefail
 
-INPUT_DIR="$(cd ../genome-blender_run/single_genome_full/output && pwd)"
+INPUT_DIR="$(cd ../genome-blender_run/multi_genome_full/output && pwd)"
 OUTPUT_DIR="${INPUT_DIR}/rust-mdbg"
 mkdir -p "${OUTPUT_DIR}"
 
@@ -21,7 +21,7 @@ MINIMIZER_TABLE="${PREFIX}.minimizer_table"
 
 # Estimate mean read length from the first 1000 reads, then derive density.
 # The minimizer length l and density are related by:
-#   read_length * density * 1.25 = l  =>  density = l / (read_length * 1.25)
+#   read_length * density * 0.75 = l  =>  density = l / (read_length * 0.75)
 READS_STATS_JSON="${OUTPUT_DIR}/reads_stats.json"
 /Users/timrozday/miniforge3/envs/genome_blender_dev/bin/python \
     "$(dirname "$0")/reads_summary.py" "${COMBINED}" -n 1000 \
@@ -32,10 +32,10 @@ MEAN_READ_LEN=$(
 )
 DENSITY=$(
     /Users/timrozday/miniforge3/envs/genome_blender_dev/bin/python3 -c \
-        "print(f'{${L} / (${MEAN_READ_LEN} * 1.25):.4f}')"
+        "print(f'{${L} / (${MEAN_READ_LEN} * 0.75):.4f}')"
 )
 echo "Estimated mean read length: ${MEAN_READ_LEN} bp"
-echo "Using density: ${DENSITY}  (l=${L} / (${MEAN_READ_LEN} * 1.25))"
+echo "Using density: ${DENSITY}  (l=${L} / (${MEAN_READ_LEN} * 0.75))"
 
 # Run rust-mdbg directly (local build from timrozday-mgnify/rust-mdbg, mg-summary branch)
 # --dump-read-minimizers writes {PREFIX}.{thread}.read_minimizers (LZ4-compressed TSV)
@@ -55,7 +55,7 @@ echo "Unique minimizers in minimizer_table: ${UNIQUE_MINIMIZERS}"
 
 /Users/timrozday/miniforge3/envs/genome_blender_dev/bin/python "$(dirname "$0")/parse_gfa.py" \
     -n 100000 \
-    --top-paths 5 \
+    --top-paths 400 \
     --sample-component-proportion 0.5 \
     --ac-prefilter \
     --read-minimizers "${PREFIX}" \
