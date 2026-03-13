@@ -58,6 +58,7 @@ echo "Unique minimizers in minimizer_table: ${UNIQUE_MINIMIZERS}"
     --top-paths 5 \
     --sample-component-proportion 0.5 \
     --ac-prefilter \
+    --matcher exact \
     --read-minimizers "${PREFIX}" \
     --minimizer-table "${MINIMIZER_TABLE}" \
     --insert-sizes-out "${PREFIX}.insert_sizes.tsv" \
