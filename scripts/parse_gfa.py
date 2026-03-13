@@ -31,6 +31,7 @@ from pathlib import Path
 from typing import Annotated
 
 import lz4.frame
+import numpy as np
 
 import rustworkx as rx
 import typer
@@ -99,14 +100,18 @@ class Link:
     """A GFA link (edge).
 
     Attributes:
-        from_orient: Orientation of the source segment.
-        to_orient: Orientation of the target segment.
+        from_orient: Orientation of the source segment (``"+"`` or ``"-"``).
+        to_orient: Orientation of the target segment (``"+"`` or ``"-"``).
         overlap: CIGAR overlap string (e.g. ``"100M"``).
+        from_idx: Graph node index of the source segment.
+        to_idx: Graph node index of the target segment.
     """
 
     from_orient: str
     to_orient: str
     overlap: str
+    from_idx: int = 0
+    to_idx: int = 0
 
 
 def _parse_tags(fields: list[str]) -> dict[str, str]:
@@ -258,6 +263,8 @@ def _add_link(
         from_orient=from_orient,
         to_orient=to_orient,
         overlap=overlap,
+        from_idx=from_idx,
+        to_idx=to_idx,
     )
     graph.add_edge(from_idx, to_idx, link)
 
@@ -383,6 +390,13 @@ _PAIR_SUFFIX_RE = re.compile(
     r"|[ \t][12]:[^ \t]+$"  # CASAVA: " 1:N:0:BARCODE"
 )
 
+_PAIR_NUMBER_RE = re.compile(
+    r"/R?([12])$"           # /1  /2  /R1  /R2
+    r"|_R([12])$"           # _R1  _R2
+    r"|\.R?([12])$"         # .1  .2  .R1  .R2
+    r"|[ \t]([12]):[^ \t]+$"  # CASAVA: " 1:N:0:BARCODE"
+)
+
 
 def _template_name(name: str) -> str:
     """Strip paired-end suffix from *name* to get the template name.
@@ -394,6 +408,23 @@ def _template_name(name: str) -> str:
         Template name shared by both mates of a pair.
     """
     return _PAIR_SUFFIX_RE.sub("", name.split()[0])
+
+
+def _pair_number(name: str) -> str:
+    """Return the mate number (``"1"`` or ``"2"``) encoded in *name*.
+
+    Returns ``"."`` when no recognised paired-end suffix is found.
+
+    Args:
+        name: Raw read name from a FASTQ/FASTA file.
+
+    Returns:
+        ``"1"``, ``"2"``, or ``"."`` for unpaired reads.
+    """
+    m = _PAIR_NUMBER_RE.search(name)
+    if m is None:
+        return "."
+    return next(g for g in m.groups() if g is not None)
 
 
 @dataclass
@@ -482,9 +513,18 @@ def build_read_index(
 # ------------------------------------------------------------------
 
 
+_SegMinDict = dict[str, tuple[np.ndarray, np.ndarray]]
+"""Mapping of segment name to ``(fwd, rev)`` uint64 numpy arrays.
+
+Both arrays are 1-D and contiguous.  ``rev`` is the reversed copy of
+``fwd``, precomputed once so that path traversal never needs to reverse
+at query time.
+"""
+
+
 def load_segment_minimizers(
     prefix: Path,
-) -> tuple[dict[str, tuple[int, ...]], int | None]:
+) -> tuple[_SegMinDict, int | None]:
     """Load per-segment minimizer IDs from rust-mdbg ``.sequences`` files.
 
     Reads all ``{prefix}.*.sequences`` LZ4-compressed files.  Each
@@ -496,13 +536,18 @@ def load_segment_minimizers(
     ``k`` value is extracted from the ``# k = N`` header comment in the
     first file that contains it.
 
+    For each segment both the forward and the reversed minimizer arrays
+    are precomputed and stored as contiguous ``uint64`` numpy arrays so
+    that path construction never needs to perform a reversal at query
+    time.
+
     Args:
         prefix: rust-mdbg output prefix (e.g. ``Path("rust_mdbg_out")``).
 
     Returns:
         Tuple of ``(segment_minimizers, k)`` where *segment_minimizers*
-        maps each segment name to its ordered tuple of NT-hash minimizer
-        IDs, and *k* is the k-mer size read from the file header
+        maps each segment name to a ``(fwd, rev)`` pair of uint64 numpy
+        arrays, and *k* is the k-mer size read from the file header
         (``None`` if the header line is absent).
     """
     pattern = str(prefix) + ".*.sequences"
@@ -513,7 +558,7 @@ def load_segment_minimizers(
         )
         return {}, None
 
-    seg_min: dict[str, tuple[int, ...]] = {}
+    seg_min: _SegMinDict = {}
     k: int | None = None
 
     with Progress(*_PROGRESS_COLUMNS) as progress:
@@ -542,14 +587,17 @@ def load_segment_minimizers(
                 node_name = parts[0]
                 bracket = parts[1].strip()
                 if bracket.startswith("[") and bracket.endswith("]"):
-                    ids = tuple(
-                        int(x.strip())
-                        for x in bracket[1:-1].split(",")
-                        if x.strip()
+                    fwd = np.fromiter(
+                        (
+                            int(x.strip())
+                            for x in bracket[1:-1].split(",")
+                            if x.strip()
+                        ),
+                        dtype=np.uint64,
                     )
                 else:
-                    ids = ()
-                seg_min[node_name] = ids
+                    fwd = np.empty(0, dtype=np.uint64)
+                seg_min[node_name] = (fwd, fwd[::-1].copy())
             progress.advance(task)
 
     logger.info(
@@ -559,37 +607,76 @@ def load_segment_minimizers(
     return seg_min, k
 
 
-def path_minimizer_sequence(
+def build_seg_min_index(
     graph: rx.PyGraph,
-    path: list[int],
-    segment_minimizers: dict[str, tuple[int, ...]],
+    seg_min: _SegMinDict,
+) -> list[tuple[np.ndarray, np.ndarray] | None]:
+    """Build a node-index-keyed list for O(1) minimizer lookup.
+
+    Returns a list where position *i* holds the ``(fwd, rev)`` arrays
+    for graph node *i*, or ``None`` if the segment has no minimizer data.
+    The list length equals the number of graph nodes, so lookups use
+    a direct integer index rather than a string dict lookup.
+
+    Args:
+        graph: Parsed GFA graph.
+        seg_min: Output of :func:`load_segment_minimizers`.
+
+    Returns:
+        List of ``(fwd, rev)`` array pairs indexed by graph node index,
+        with ``None`` for segments absent from *seg_min*.
+    """
+    n = graph.num_nodes()
+    index: list[tuple[np.ndarray, np.ndarray] | None] = [None] * n
+    for node_idx in graph.node_indices():
+        seg: Segment = graph[node_idx]
+        pair = seg_min.get(seg.name)
+        if pair is not None:
+            index[node_idx] = pair
+    return index
+
+
+def path_minimizer_sequence(
+    path: _OrientedPath,
+    seg_min_index: list[tuple[np.ndarray, np.ndarray] | None],
     k: int,
-) -> tuple[int, ...]:
+) -> np.ndarray:
     """Build the minimizer sequence for a sampled graph path.
 
     Adjacent segments in a rust-mdbg path share *k* − 1 minimizers
     (the graph is a k-mer de Bruijn graph over minimizer sequences).
-    The overlapping prefix of each segment after the first is therefore
-    dropped before concatenation.
+    The overlapping prefix of each segment after the first is dropped
+    before concatenation.
+
+    Because rust-mdbg stores nodes in their canonical (normalised) form
+    (``REVCOMP_AWARE = true``), about half of all nodes are stored in
+    reversed order relative to the traversal direction.  The reversed
+    copy is precomputed in *seg_min_index* so this function selects
+    ``fwd`` or ``rev`` by integer index with no runtime reversal.
 
     Args:
-        graph: Parsed GFA graph.
-        path: Ordered list of node indices forming the path.
-        segment_minimizers: Precomputed segment-name → minimizer IDs
-            from :func:`load_segment_minimizers`.
+        path: Ordered list of ``(node_idx, is_forward)`` pairs as
+            returned by :func:`_random_simple_path`.
+        seg_min_index: Node-index-keyed list of ``(fwd, rev)`` uint64
+            arrays from :func:`build_seg_min_index`.
         k: rust-mdbg k-mer size (overlap between adjacent segments is
             *k* − 1 minimizers).
 
     Returns:
-        Ordered tuple of minimizer IDs spanning the entire path.
+        1-D uint64 numpy array of minimizer IDs spanning the entire
+        path in traversal order.
     """
-    result: list[int] = []
     overlap = k - 1
-    for i, node_idx in enumerate(path):
-        seg: Segment = graph[node_idx]
-        ids = segment_minimizers.get(seg.name, ())
-        result.extend(ids if i == 0 else ids[overlap:])
-    return tuple(result)
+    parts: list[np.ndarray] = []
+    for node_idx, is_forward in path:
+        pair = seg_min_index[node_idx]
+        if pair is None:
+            continue
+        arr = pair[0] if is_forward else pair[1]
+        parts.append(arr if not parts else arr[overlap:])
+    if not parts:
+        return np.empty(0, dtype=np.uint64)
+    return np.concatenate(parts)
 
 
 # ------------------------------------------------------------------
@@ -697,19 +784,56 @@ class AhoCorasick:
         return matches
 
 
-def build_aho_corasick(index: ReadIndex) -> AhoCorasick:
+def build_aho_corasick(
+    index: ReadIndex,
+    path_minimizer_set: set[int] | None = None,
+) -> AhoCorasick:
     """Build an Aho-Corasick automaton from all reads in *index*.
 
     Each read's integer ID is used as the pattern ID so match results
     can be resolved back to read names and pairs without storing strings
     in the automaton.  Reads with empty minimizer sequences are skipped.
 
+    Both the forward and reversed minimizer sequences are indexed for
+    each read, because REVCOMP_AWARE normalisation in rust-mdbg means
+    ~50 % of reads are stored in reversed orientation relative to the
+    path direction.  A match of either orientation is recorded under the
+    same read ID.
+
+    When *path_minimizer_set* is provided, a read is only added to the
+    automaton if every one of its minimizer IDs appears in the set.
+    This is a necessary condition for a match and excludes reads that
+    cannot possibly occur in any of the target paths, reducing automaton
+    size and search time.  Additionally, if a read has a registered pair,
+    both ends must individually pass the filter or neither is added; a
+    lone end can never contribute to a paired insert-size estimate.
+
     Args:
         index: Populated :class:`ReadIndex`.
+        path_minimizer_set: Optional union of all minimizer IDs that
+            appear in any target path.  Reads with minimizers outside
+            this set are skipped.
 
     Returns:
         A compiled :class:`AhoCorasick` automaton ready for searching.
     """
+    # Pre-compute which reads pass the individual minimizer filter so that
+    # pair eligibility can be enforced: both ends of a pair must pass or
+    # neither is added (one end alone can never yield a paired match).
+    if path_minimizer_set is not None:
+        individually_passing: set[int] = {
+            read_id
+            for read_id, minimizers in enumerate(index.minimizers)
+            if minimizers and all(m in path_minimizer_set for m in minimizers)
+        }
+        eligible: set[int] = {
+            read_id for read_id in individually_passing
+            if index.pairs.get(read_id) in individually_passing
+            or index.pairs.get(read_id) is None
+        }
+    else:
+        eligible = None  # type: ignore[assignment]
+
     ac = AhoCorasick()
     with Progress(*_PROGRESS_COLUMNS) as progress:
         task = progress.add_task(
@@ -717,7 +841,13 @@ def build_aho_corasick(index: ReadIndex) -> AhoCorasick:
         )
         for read_id, minimizers in enumerate(index.minimizers):
             if minimizers:
+                if eligible is not None and read_id not in eligible:
+                    progress.advance(task)
+                    continue
                 ac.add_pattern(minimizers, read_id)
+                rev = minimizers[::-1]
+                if rev != minimizers:
+                    ac.add_pattern(rev, read_id)
             progress.advance(task)
     ac.build()
     return ac
@@ -744,7 +874,7 @@ class PathMatch:
 
 
 def match_reads_to_path(
-    path_min_seq: tuple[int, ...],
+    path_min_seq: np.ndarray,
     ac: AhoCorasick,
 ) -> list[PathMatch]:
     """Find all reads whose minimizer sequences occur in *path_min_seq*.
@@ -765,18 +895,18 @@ def match_reads_to_path(
 
 def _minimizer_to_bp_scale(
     graph: rx.PyGraph,
-    seg_min: dict[str, tuple[int, ...]],
+    seg_min_index: list[tuple[np.ndarray, np.ndarray] | None],
 ) -> float | None:
     """Estimate average base pairs per minimizer from assembly data.
 
     Sums segment lengths and minimizer counts across all segments that
-    appear in both the graph and *seg_min*.  Segments with no loaded
+    have minimizer data in *seg_min_index*.  Segments with no loaded
     minimizers are excluded from both totals.
 
     Args:
         graph: Parsed GFA graph.
-        seg_min: Segment name → minimizer IDs from
-            :func:`load_segment_minimizers`.
+        seg_min_index: Node-index-keyed list of ``(fwd, rev)`` arrays
+            from :func:`build_seg_min_index`.
 
     Returns:
         Scale factor (bp per minimizer), or ``None`` if no segments
@@ -785,11 +915,10 @@ def _minimizer_to_bp_scale(
     total_bp = 0
     total_min = 0
     for idx in graph.node_indices():
-        seg: Segment = graph[idx]
-        mids = seg_min.get(seg.name, ())
-        if mids:
-            total_bp += seg.length
-            total_min += len(mids)
+        pair = seg_min_index[idx]
+        if pair is not None and len(pair[0]):
+            total_bp += graph[idx].length
+            total_min += len(pair[0])
     if total_min == 0:
         return None
     return total_bp / total_min
@@ -912,6 +1041,46 @@ def _insert_size_stats(
 
 _CIGAR_RE = re.compile(r"(\d+)[MIDNSHP=X]")
 
+# Oriented path: list of (node_idx, is_forward) pairs where
+# is_forward=True means minimizers are used in stored order,
+# is_forward=False means they are reversed.
+_OrientedPath = list[tuple[int, bool]]
+
+
+def _opp(orient: str) -> str:
+    """Return the opposite orientation character."""
+    return "-" if orient == "+" else "+"
+
+
+def _next_orient(
+    cur_idx: int,
+    cur_orient: str,
+    link: Link,
+) -> str | None:
+    """Return the orientation of the neighbour reachable via *link*.
+
+    A GFA L-record encodes a bidirected edge with two valid traversals:
+
+    * Forward: ``from_idx(from_orient) → to_idx(to_orient)``
+    * Backward: ``to_idx(opp(to_orient)) → from_idx(opp(from_orient))``
+
+    Returns ``None`` when *link* is not usable from ``(cur_idx, cur_orient)``.
+
+    Args:
+        cur_idx: Current node index.
+        cur_orient: Current traversal orientation (``"+"`` or ``"-"``).
+        link: Edge data from the GFA L-record.
+
+    Returns:
+        The orientation string for the next node, or ``None`` if the edge
+        cannot be traversed from the given state.
+    """
+    if cur_idx == link.from_idx and cur_orient == link.from_orient:
+        return link.to_orient
+    if cur_idx == link.to_idx and cur_orient == _opp(link.to_orient):
+        return _opp(link.from_orient)
+    return None
+
 
 def _overlap_length(cigar: str) -> float:
     """Return the total length of a CIGAR overlap string.
@@ -943,6 +1112,46 @@ def leaf_nodes(graph: rx.PyGraph) -> list[int]:
         idx for idx in graph.node_indices()
         if graph.degree(idx) == 1
     ]
+
+
+def large_component_nodes(
+    graph: rx.PyGraph,
+    min_proportion: float,
+) -> tuple[set[int], list[set[int]]]:
+    """Return node indices in the largest components covering *min_proportion*.
+
+    Components are sorted by total base-pair span (sum of segment lengths)
+    and added largest-first until the cumulative node count reaches or
+    exceeds ``min_proportion * graph.num_nodes()``.  When *min_proportion*
+    is 0 all components are returned.
+
+    Args:
+        graph: The assembled sequence graph.
+        min_proportion: Fraction of total nodes that selected components
+            must collectively cover (0.0–1.0).  Pass 0.0 to select all.
+
+    Returns:
+        Tuple of ``(selected_nodes, selected_components)`` where
+        *selected_nodes* is the union of all selected component node sets
+        and *selected_components* is the list of chosen components ordered
+        largest-first by total base-pair span.
+    """
+    components = sorted(
+        rx.connected_components(graph),
+        key=lambda c: sum(graph[idx].length for idx in c),
+        reverse=True,
+    )
+    if min_proportion <= 0.0:
+        return set().union(*components) if components else set(), components
+    threshold = math.ceil(min_proportion * graph.num_nodes())
+    selected: set[int] = set()
+    chosen: list[set[int]] = []
+    for comp in components:
+        selected |= comp
+        chosen.append(comp)
+        if len(selected) >= threshold:
+            break
+    return selected, chosen
 
 
 def _pick_by_kmer(
@@ -985,23 +1194,21 @@ def _random_simple_path(
     graph: rx.PyGraph,
     start_nodes: list[int],
     weight_mode: str,
-) -> list[int]:
+) -> _OrientedPath:
     """Sample a random simple path by greedy random walk.
 
     Start from a randomly chosen leaf node, then repeatedly
     extend to an unvisited neighbour, chosen according to
-    *weight_mode*:
+    *weight_mode*.  Each step tracks the traversal orientation
+    of the next node by consulting the GFA edge orientations
+    stored in each :class:`Link`.  This is necessary because
+    rust-mdbg stores k-mer nodes in their canonical (normalised)
+    form, so some nodes must be reversed when concatenating
+    minimizer sequences.
 
-    - ``"kmer"`` — weight by destination node's k-mer count
-      (``Segment.kmer_count``); falls back to 1.0 when the
-      tag is absent.
-    - ``"overlap"`` — weight by the overlap length (sum of
-      all lengths in the CIGAR string on the connecting edge).
-    - ``"unweighted"`` — uniform random choice.
-
-    ``graph.adj(node)`` returns ``{neighbour_idx: edge_data}``
-    which provides both the neighbour index and the ``Link``
-    edge data in one call, making all weight modes efficient.
+    The start orientation is derived from the first incident edge:
+    leaf nodes have exactly one edge, so the valid traversal
+    direction is unambiguous.
 
     Args:
         graph: The graph to walk.
@@ -1010,23 +1217,61 @@ def _random_simple_path(
             ``"unweighted"``.
 
     Returns:
-        Ordered list of node indices forming the path.
+        Ordered list of ``(node_idx, is_forward)`` pairs where
+        ``is_forward=True`` means the node's stored minimizer
+        sequence is used as-is and ``False`` means it is reversed.
     """
     pick = _PICK_FN.get(weight_mode, _pick_uniformly)
     start = random.choice(start_nodes)
-    path = [start]
-    visited = {start}
+
+    # Determine start orientation from the first incident edge.
+    adj_start = graph.adj(start)
+    if adj_start:
+        first_link: Link = next(iter(adj_start.values()))
+        start_orient = (
+            first_link.from_orient
+            if first_link.from_idx == start
+            else _opp(first_link.to_orient)
+        )
+    else:
+        start_orient = "+"
+
+    path: _OrientedPath = [(start, start_orient == "+")]
+    visited: set[int] = {start}
 
     while True:
-        neighbours = {
-            n: edge
-            for n, edge in graph.adj(path[-1]).items()
-            if n not in visited
-        }
-        if not neighbours:
+        cur_idx, cur_fwd = path[-1]
+        cur_orient = "+" if cur_fwd else "-"
+
+        # Build candidate neighbours respecting bidirected edge semantics.
+        # Prefer orientation-valid neighbours; fall back to any unvisited
+        # neighbour if none are reachable (handles non-standard topologies).
+        valid: dict[int, tuple[Link, str]] = {}
+        fallback: dict[int, Link] = {}
+        for nbr_idx, link in graph.adj(cur_idx).items():
+            if nbr_idx in visited:
+                continue
+            nbr_orient = _next_orient(cur_idx, cur_orient, link)
+            if nbr_orient is not None:
+                valid[nbr_idx] = (link, nbr_orient)
+            else:
+                fallback[nbr_idx] = link
+
+        if valid:
+            chosen = pick(
+                graph,
+                list(valid.keys()),
+                {k: v[0] for k, v in valid.items()},
+            )
+            _, chosen_orient = valid[chosen]
+        elif fallback:
+            chosen = pick(graph, list(fallback.keys()), fallback)
+            chosen_orient = "+"
+        else:
             break
-        path.append(pick(graph, list(neighbours.keys()), neighbours))
-        visited.add(path[-1])
+
+        path.append((chosen, chosen_orient == "+"))
+        visited.add(chosen)
 
     return path
 
@@ -1035,37 +1280,53 @@ def _iter_sampled_paths(
     graph: rx.PyGraph,
     n_samples: int,
     weight_mode: str = "kmer",
-) -> Iterator[tuple[list[int], int]]:
+    eligible_nodes: set[int] | None = None,
+) -> Iterator[tuple[_OrientedPath, int]]:
     """Yield ``(path, bp_length)`` for *n_samples* random simple paths.
 
     Walks start from leaf nodes (degree == 1).  If the graph has no
     leaves, all nodes are used as start candidates instead.
+
+    When *eligible_nodes* is provided, only nodes in that set are used
+    as start candidates.  Because components are disjoint, walks stay
+    within the eligible components automatically.
 
     Args:
         graph: The assembled sequence graph.
         n_samples: Number of paths to sample.
         weight_mode: Neighbour selection weighting —
             ``"kmer"``, ``"overlap"``, or ``"unweighted"``.
+        eligible_nodes: Optional set of node indices to restrict sampling
+            to.  When ``None``, all nodes are eligible.
 
     Yields:
-        ``(path, bp_length)`` where *path* is an ordered list of node
-        indices and *bp_length* is the sum of their segment lengths.
+        ``(path, bp_length)`` where *path* is an oriented path
+        (list of ``(node_idx, is_forward)`` tuples) and *bp_length*
+        is the sum of their segment lengths.
     """
     leaves = leaf_nodes(graph)
+    if eligible_nodes is not None:
+        leaves = [n for n in leaves if n in eligible_nodes]
     if leaves:
         start_nodes = leaves
     else:
-        logger.warning(
-            "Graph has no leaf nodes (all degrees > 1); "
-            "using all nodes as start candidates."
+        fallback = (
+            list(eligible_nodes)
+            if eligible_nodes is not None
+            else list(graph.node_indices())
         )
-        start_nodes = list(graph.node_indices())
+        logger.warning(
+            "No eligible leaf nodes (all degrees > 1); "
+            "using %d eligible nodes as start candidates.",
+            len(fallback),
+        )
+        start_nodes = fallback
 
     with Progress(*_PROGRESS_COLUMNS) as progress:
         task = progress.add_task("Sampling paths", total=n_samples)
         for _ in range(n_samples):
             path = _random_simple_path(graph, start_nodes, weight_mode)
-            bp = sum(graph[idx].length for idx in path)
+            bp = sum(graph[idx].length for idx, _ in path)
             yield path, bp
             progress.advance(task)
 
@@ -1074,6 +1335,7 @@ def sample_path_lengths(
     graph: rx.PyGraph,
     n_samples: int,
     weight_mode: str = "kmer",
+    eligible_nodes: set[int] | None = None,
 ) -> list[int]:
     """Sample random simple paths and return their bp lengths.
 
@@ -1082,18 +1344,25 @@ def sample_path_lengths(
         n_samples: Number of paths to sample.
         weight_mode: Neighbour selection weighting —
             ``"kmer"``, ``"overlap"``, or ``"unweighted"``.
+        eligible_nodes: Optional set of node indices to restrict sampling
+            to.  When ``None``, all nodes are eligible.
 
     Returns:
         List of path lengths in base pairs.
     """
-    return [bp for _, bp in _iter_sampled_paths(graph, n_samples, weight_mode)]
+    return [
+        bp for _, bp in _iter_sampled_paths(
+            graph, n_samples, weight_mode, eligible_nodes,
+        )
+    ]
 
 
 def sample_paths(
     graph: rx.PyGraph,
     n_samples: int,
     weight_mode: str = "kmer",
-) -> list[tuple[list[int], int]]:
+    eligible_nodes: set[int] | None = None,
+) -> list[tuple[_OrientedPath, int]]:
     """Sample random simple paths and return them with their bp lengths.
 
     Like :func:`sample_path_lengths` but also returns the path node
@@ -1104,11 +1373,15 @@ def sample_paths(
         n_samples: Number of paths to sample.
         weight_mode: Neighbour selection weighting —
             ``"kmer"``, ``"overlap"``, or ``"unweighted"``.
+        eligible_nodes: Optional set of node indices to restrict sampling
+            to.  When ``None``, all nodes are eligible.
 
     Returns:
         List of ``(path, bp_length)`` pairs.
     """
-    return list(_iter_sampled_paths(graph, n_samples, weight_mode))
+    return list(
+        _iter_sampled_paths(graph, n_samples, weight_mode, eligible_nodes)
+    )
 
 
 # ------------------------------------------------------------------
@@ -1185,7 +1458,7 @@ def _load_pe_pairs(bam_path: Path) -> dict[str, tuple[str, str]]:
 
 def _path_pair_distances(
     graph: rx.PyGraph,
-    path: list[int],
+    path: _OrientedPath,
     pair_seg_indices: list[tuple[int, int]],
 ) -> list[int]:
     """Return bp distances for read pairs found within a path.
@@ -1200,14 +1473,16 @@ def _path_pair_distances(
 
     Args:
         graph: The assembled sequence graph.
-        path: Ordered list of node indices forming the path.
+        path: Oriented path as a list of ``(node_idx, is_forward)``
+            tuples.
         pair_seg_indices: List of ``(R1_node_idx, R2_node_idx)``
             pairs to search for.
 
     Returns:
         List of bp distances, one per pair found in the path.
     """
-    node_pos = {node: i for i, node in enumerate(path)}
+    node_indices = [idx for idx, _ in path]
+    node_pos = {node: i for i, node in enumerate(node_indices)}
     distances: list[int] = []
 
     for seg1_idx, seg2_idx in pair_seg_indices:
@@ -1217,7 +1492,7 @@ def _path_pair_distances(
         j = node_pos[seg2_idx]
         if i > j:
             i, j = j, i
-        dist = sum(graph[path[k]].length for k in range(i, j + 1))
+        dist = sum(graph[node_indices[k]].length for k in range(i, j + 1))
         distances.append(dist)
 
     return distances
@@ -1329,10 +1604,21 @@ def _compute_summary(
     component_sizes = sorted(
         (len(c) for c in components), reverse=True,
     )
-    result["connected_components"] = len(components)
-    result["largest_component_nodes"] = component_sizes[0]
-    if len(component_sizes) > 1:
-        result["smallest_component_nodes"] = component_sizes[-1]
+    n_comp = len(component_sizes)
+    comp_mean = sum(component_sizes) / n_comp
+    comp_variance = sum((x - comp_mean) ** 2 for x in component_sizes) / n_comp
+    mid = n_comp // 2
+    comp_median: float = (
+        component_sizes[mid]
+        if n_comp % 2 == 1
+        else (component_sizes[mid - 1] + component_sizes[mid]) / 2
+    )
+    result["connected_components"] = n_comp
+    result["component_nodes_min"] = component_sizes[-1]
+    result["component_nodes_max"] = component_sizes[0]
+    result["component_nodes_mean"] = comp_mean
+    result["component_nodes_median"] = comp_median
+    result["component_nodes_std_dev"] = math.sqrt(comp_variance)
 
     segments: list[Segment] = [
         graph[idx] for idx in graph.node_indices()
@@ -1423,13 +1709,14 @@ def print_summary(
     if s["nodes"] == 0:
         return
 
-    print(f"Connected components: {s['connected_components']}")
-    print(f"Largest component:  {s['largest_component_nodes']} nodes")
-    if "smallest_component_nodes" in s:
-        print(
-            f"Smallest component: "
-            f"{s['smallest_component_nodes']} nodes"
-        )
+    print(
+        f"Connected components: n={s['connected_components']}, "
+        f"min={s['component_nodes_min']}, "
+        f"max={s['component_nodes_max']}, "
+        f"mean={s['component_nodes_mean']:.0f}, "  # type: ignore[str-format]
+        f"median={s['component_nodes_median']:.0f}, "  # type: ignore[str-format]
+        f"std_dev={s['component_nodes_std_dev']:.0f}"  # type: ignore[str-format]
+    )
 
     print(f"Total assembly span: {s['total_assembly_bp']:,} bp")
     print(
@@ -1484,6 +1771,43 @@ def print_summary(
             print(f"  max:      {ins['max']:,}")
             print(f"  mean:     {ins['mean']:,.0f}")
             print(f"  variance: {ins['variance']:,.0f}")
+
+
+def _report_chosen_components(
+    graph: rx.PyGraph,
+    chosen_comps: list[set[int]],
+    seg_min_index: list[tuple[np.ndarray, np.ndarray] | None] | None = None,
+) -> None:
+    """Print a per-component size table (nodes, bp, optionally minimizers).
+
+    Args:
+        graph: Parsed GFA graph.
+        chosen_comps: Components to display, ordered largest-first by bp.
+        seg_min_index: When provided, minimizer counts per segment are
+            summed and displayed as an additional column.
+    """
+    n_total = graph.num_nodes()
+    for i, comp in enumerate(chosen_comps):
+        if i == 10:
+            typer.echo(
+                f"  ... and {len(chosen_comps) - 10} more",
+                err=True,
+            )
+            break
+        comp_bp = sum(graph[idx].length for idx in comp)
+        line = (
+            f"  [{i + 1}] {len(comp):,} nodes, "
+            f"{comp_bp:,} bp "
+            f"= {len(comp) / n_total:.1%} of total"
+        )
+        if seg_min_index is not None:
+            comp_min = sum(
+                len(seg_min_index[idx][0])
+                for idx in comp
+                if idx < len(seg_min_index) and seg_min_index[idx] is not None
+            )
+            line += f", {comp_min:,} minimizers"
+        typer.echo(line, err=True)
 
 
 # ------------------------------------------------------------------
@@ -1560,6 +1884,40 @@ def main(
              "permutations of multi-position hits are reported.",
         dir_okay=False,
     )] = None,
+    top_paths: Annotated[int, typer.Option(
+        "--top-paths",
+        help="Number of longest sampled paths to use for read mapping "
+             "and insert-size estimation. 0 = use all sampled paths.",
+    )] = 10,
+    sample_component_proportion: Annotated[float, typer.Option(
+        "--sample-component-proportion",
+        help="Sample paths only from the largest connected components "
+             "whose combined node count covers at least this fraction "
+             "of all graph nodes (0.0–1.0). Set to 0 (default) to "
+             "sample from all components.",
+    )] = 0.0,
+    ac_prefilter: Annotated[bool, typer.Option(
+        "--ac-prefilter/--no-ac-prefilter",
+        help="Before building the Aho-Corasick index, discard reads "
+             "whose minimizers are not all present in the union of "
+             "minimizer sets from the sampled paths. Reduces automaton "
+             "size but may incorrectly exclude paired-end reads when one "
+             "mate falls outside the sampled paths.",
+    )] = False,
+    read_mappings_out: Annotated[Path | None, typer.Option(
+        "--read-mappings-out",
+        help="Write a TSV of all read-to-path mappings to this file. "
+             "Columns: read_name, pair (1/2/.), path_index (1-based).",
+        dir_okay=False,
+    )] = None,
+    paths_out: Annotated[Path | None, typer.Option(
+        "--paths-out",
+        help="Write a TSV of the chosen paths to this file. "
+             "Columns: path_index (1-based), minimizers "
+             "(comma-separated IDs), nodes (comma-separated name+/-), "
+             "path_length_bp.",
+        dir_okay=False,
+    )] = None,
 ) -> None:
     """Parse a rust-mdbg GFA output into a graph and report properties."""
     if paired_end and pe_bam is None:
@@ -1579,8 +1937,9 @@ def main(
 
     # When minimizer matching is requested we need the actual paths,
     # not just their lengths, so sample once and derive both.
-    sampled: list[tuple[list[int], int]] | None = None
+    sampled: list[tuple[_OrientedPath, int]] | None = None
     path_lengths: list[int] | None = None
+    chosen_comps: list[set[int]] = []
 
     if no_sample:
         logger.debug("Path sampling skipped by --no-sample.")
@@ -1590,7 +1949,27 @@ def main(
             err=True,
         )
     else:
-        sampled = sample_paths(graph, samples, weight_str)
+        _en, chosen_comps = large_component_nodes(
+            graph, sample_component_proportion,
+        )
+        eligible_nodes: set[int] | None = _en if sample_component_proportion > 0.0 else None
+        n_total = graph.num_nodes()
+        n_chosen_nodes = sum(len(c) for c in chosen_comps)
+        _prop_label = (
+            f" (>= {sample_component_proportion:.0%} threshold)"
+            if sample_component_proportion > 0.0 else ""
+        )
+        typer.echo(
+            f"Sampling from {len(chosen_comps)} component(s), "
+            f"{n_chosen_nodes:,} nodes "
+            f"= {n_chosen_nodes / n_total:.1%} of {n_total:,} total"
+            f"{_prop_label}"
+            + (":" if read_minimizers_prefix is None else ""),
+            err=True,
+        )
+        if read_minimizers_prefix is None:
+            _report_chosen_components(graph, chosen_comps)
+        sampled = sample_paths(graph, samples, weight_str, eligible_nodes)
         path_lengths = [bp for _, bp in sampled]
 
     pair_distances: list[int] | None = None
@@ -1627,6 +2006,7 @@ def main(
     ac: AhoCorasick | None = None
     n_total_matches = 0
     ins_stats: dict[str, object] = {}
+    bp_scale: float | None = None
 
     if read_minimizers_prefix is not None:
         raw_minimizers = load_read_minimizers(read_minimizers_prefix)
@@ -1636,12 +2016,16 @@ def main(
             f"{len(read_index.pairs) // 2:,} paired templates",
             err=True,
         )
-        ac = build_aho_corasick(read_index)
-        typer.echo(
-            f"Aho-Corasick automaton: {len(ac._nodes):,} states",
-            err=True,
-        )
 
+        if sampled and top_paths:
+            sampled = sorted(sampled, key=lambda p: p[1], reverse=True)[
+                :top_paths
+            ]
+
+        # Precompute path sequences and build the union minimizer set so
+        # that AC construction can skip reads that cannot match any path.
+        path_seqs: list[np.ndarray] = []
+        path_minimizer_set: set[int] | None = None
         if sampled:
             seg_min, k_from_file = load_segment_minimizers(
                 read_minimizers_prefix,
@@ -1653,13 +2037,92 @@ def main(
                 err=True,
             )
 
-            bp_scale = _minimizer_to_bp_scale(graph, seg_min)
+            seg_min_index = build_seg_min_index(graph, seg_min)
+            bp_scale = _minimizer_to_bp_scale(graph, seg_min_index)
             typer.echo(
                 f"bp/minimizer scale: "
                 + (f"{bp_scale:.3f}" if bp_scale else "unavailable"),
                 err=True,
             )
 
+            if chosen_comps:
+                typer.echo(
+                    f"Chosen components ({len(chosen_comps)} total):",
+                    err=True,
+                )
+                _report_chosen_components(graph, chosen_comps, seg_min_index)
+
+            for path, _ in sampled:
+                seq = path_minimizer_sequence(path, seg_min_index, effective_k)
+                path_seqs.append(seq)
+            path_minimizer_set = {int(m) for seq in path_seqs for m in seq}
+            typer.echo(
+                f"Union minimizer set: {len(path_minimizer_set):,} "
+                f"distinct minimizers across {len(sampled)} paths",
+                err=True,
+            )
+
+            if paths_out is not None:
+                with open(paths_out, "w") as paths_fh:
+                    paths_fh.write(
+                        "path_index\tminimizers\tnodes\tpath_length_bp\n"
+                    )
+                    for path_idx, (seq, (path, bp)) in enumerate(
+                        zip(path_seqs, sampled), start=1,
+                    ):
+                        minimizers_col = ",".join(str(int(m)) for m in seq)
+                        nodes_col = ",".join(
+                            graph[node_idx].name + ("+" if fwd else "-")
+                            for node_idx, fwd in path
+                        )
+                        paths_fh.write(
+                            f"{path_idx}\t{minimizers_col}\t"
+                            f"{nodes_col}\t{bp}\n"
+                        )
+                typer.echo(
+                    f"Paths written to {paths_out}", err=True,
+                )
+
+            # Report chosen paths (longest first; already sorted).
+            n_paths = len(sampled)
+            unique_path_nodes = {
+                node_idx
+                for path, _ in sampled
+                for node_idx, _ in path
+            }
+            n_unique = len(unique_path_nodes)
+            n_total = graph.num_nodes()
+            typer.echo(
+                f"\nChosen paths ({n_paths} total, "
+                f"covering {n_unique:,} unique nodes "
+                f"= {n_unique / n_total:.1%} of {n_total:,}):",
+                err=True,
+            )
+            for i, (seq, (path, bp)) in enumerate(
+                zip(path_seqs, sampled),
+            ):
+                if i == 10:
+                    typer.echo(
+                        f"  ... and {n_paths - 10} more",
+                        err=True,
+                    )
+                    break
+                typer.echo(
+                    f"  [{i + 1}] {len(seq):,} minimizers, "
+                    f"{bp:,} bp, {len(path)} nodes",
+                    err=True,
+                )
+
+        ac = build_aho_corasick(
+            read_index,
+            path_minimizer_set if ac_prefilter else None,
+        )
+        typer.echo(
+            f"Aho-Corasick automaton: {len(ac._nodes):,} states",
+            err=True,
+        )
+
+        if sampled:
             match_counts: dict[int, int] = {}  # read_id → hit count
             all_insert_sizes_min: list[int] = []
             insert_out_fh = (
@@ -1675,21 +2138,35 @@ def main(
                 )
                 insert_out_fh.write(header_cols + "\n")
 
+            mappings_out_fh = (
+                open(read_mappings_out, "w")  # noqa: WPS515
+                if read_mappings_out is not None
+                else None
+            )
+            if mappings_out_fh is not None:
+                mappings_out_fh.write("read_name\tpair\tpath_index\n")
+
             try:
                 with Progress(*_PROGRESS_COLUMNS) as progress:
                     task = progress.add_task(
                         "Matching reads to paths", total=len(sampled),
                     )
-                    for path, _ in sampled:
-                        seq = path_minimizer_sequence(
-                            graph, path, seg_min, effective_k,
-                        )
+                    for path_idx, (seq, (_, _)) in enumerate(
+                        zip(path_seqs, sampled), start=1,
+                    ):
                         path_matches = match_reads_to_path(seq, ac)
                         for m in path_matches:
                             match_counts[m.read_id] = (
                                 match_counts.get(m.read_id, 0) + 1
                             )
                             n_total_matches += 1
+                            if mappings_out_fh is not None:
+                                rname = read_index.names[m.read_id]
+                                mappings_out_fh.write(
+                                    f"{rname}\t"
+                                    f"{_pair_number(rname)}\t"
+                                    f"{path_idx}\n"
+                                )
                         for r1_id, r2_id, span in _path_pair_insert_sizes(
                             path_matches, read_index,
                         ):
@@ -1707,6 +2184,8 @@ def main(
             finally:
                 if insert_out_fh is not None:
                     insert_out_fh.close()
+                if mappings_out_fh is not None:
+                    mappings_out_fh.close()
 
             n_matched_reads = len(match_counts)
             typer.echo(
