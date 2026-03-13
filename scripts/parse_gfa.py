@@ -441,36 +441,70 @@ class ReadIndex:
 
     Each read is assigned a compact integer ID so that index structures
     (Aho-Corasick output lists, pair maps, position tables) store small
-    ints rather than variable-length strings.  Minimizer data is kept
-    off-heap: use :func:`iter_read_minimizers` to stream it from disk.
+    ints rather than variable-length strings.
+
+    Read names are written to a name-index file by
+    :func:`build_read_index` and can be loaded back with
+    :func:`load_name_index` when output requires them.  After the
+    matcher is built, ``name_to_id`` should be cleared (``name_to_id.clear()``)
+    to release the string keys from memory.
 
     Attributes:
-        name_to_id: Read name to compact integer ID.
-        names: Inverse map — index is the read ID, value is the name.
+        n_reads: Total number of reads indexed.
+        name_to_id: Read name to compact integer ID.  Clear after the
+            matcher is built to free string memory.
         pairs: Read ID to mate read ID for paired-end reads.  Unpaired
             reads have no entry.
     """
 
+    n_reads: int
     name_to_id: dict[str, int]
-    names: list[str]
     pairs: dict[int, int]
 
 
-def build_read_index(prefix: Path) -> ReadIndex:
+def _write_name_index(sorted_names: list[str], path: Path) -> None:
+    """Write read names to an LZ4-compressed line-per-name file.
+
+    Line number *i* (0-based) is the name for read ID *i*.
+
+    Args:
+        sorted_names: Read names in ascending sort order.
+        path: Destination path for the compressed index file.
+    """
+    content = "\n".join(sorted_names).encode()
+    path.write_bytes(lz4.frame.compress(content))
+
+
+def load_name_index(path: Path) -> list[str]:
+    """Load a name index written by :func:`_write_name_index`.
+
+    Args:
+        path: Path to the LZ4-compressed name-index file.
+
+    Returns:
+        List of read names where index *i* is the name for read ID *i*.
+    """
+    content = lz4.frame.decompress(path.read_bytes())
+    return content.decode().splitlines()
+
+
+def build_read_index(prefix: Path, name_index_path: Path) -> ReadIndex:
     """Build an integer-indexed read registry from ``.read_minimizers`` files.
 
     Performs a names-only streaming pass — minimizer data is not loaded
-    into memory.  Reads are assigned IDs in sorted name order for
-    reproducibility.  Paired-end mates are detected by stripping common
-    name suffixes and grouping reads that share the same template name.
+    into memory.  Reads are assigned IDs in sorted name order.  The
+    sorted name list is written to *name_index_path* (LZ4-compressed,
+    one name per line) and then freed; only ``name_to_id`` and ``pairs``
+    are retained in the returned :class:`ReadIndex`.
 
     Args:
         prefix: rust-mdbg output prefix (e.g. ``Path("rust_mdbg_out")``).
+        name_index_path: Destination for the name-index file.
 
     Returns:
-        A :class:`ReadIndex` with integer IDs and paired mates
-        cross-linked, but no minimizer data.  Use
-        :func:`iter_read_minimizers` to stream minimizers from disk.
+        A :class:`ReadIndex` with ``n_reads``, ``name_to_id``, and
+        ``pairs``.  Call ``name_to_id.clear()`` once the matcher is
+        built to release string memory.
     """
     pattern = str(prefix) + ".*.read_minimizers"
     files = sorted(glob.glob(pattern))
@@ -478,7 +512,8 @@ def build_read_index(prefix: Path) -> ReadIndex:
         logger.warning(
             "No .read_minimizers files found for prefix: %s", prefix,
         )
-        return ReadIndex(name_to_id={}, names=[], pairs={})
+        _write_name_index([], name_index_path)
+        return ReadIndex(n_reads=0, name_to_id={}, pairs={})
 
     all_names: list[str] = []
     with Progress(*_PROGRESS_COLUMNS) as progress:
@@ -494,6 +529,10 @@ def build_read_index(prefix: Path) -> ReadIndex:
             progress.advance(task)
 
     sorted_names = sorted(all_names)
+    del all_names  # free unsorted list before building the dict
+    _write_name_index(sorted_names, name_index_path)
+    logger.info("Name index written to %s (%d reads)", name_index_path, len(sorted_names))
+
     name_to_id: dict[str, int] = {
         name: i for i, name in enumerate(sorted_names)
     }
@@ -503,6 +542,7 @@ def build_read_index(prefix: Path) -> ReadIndex:
         tmpl = _template_name(name)
         logger.debug("Read name: %s  template: %s", name, tmpl)
         template_to_ids.setdefault(tmpl, []).append(read_id)
+    del sorted_names  # free the sorted list; dict keys are the canonical copy
 
     pairs: dict[int, int] = {}
     for tmpl, ids in template_to_ids.items():
@@ -515,11 +555,12 @@ def build_read_index(prefix: Path) -> ReadIndex:
                 tmpl, len(ids),
             )
 
+    n_reads = len(name_to_id)
     logger.info(
         "Read index: %d reads, %d paired templates",
-        len(sorted_names), len(pairs) // 2,
+        n_reads, len(pairs) // 2,
     )
-    return ReadIndex(name_to_id=name_to_id, names=sorted_names, pairs=pairs)
+    return ReadIndex(n_reads=n_reads, name_to_id=name_to_id, pairs=pairs)
 
 
 # ------------------------------------------------------------------
@@ -905,7 +946,7 @@ def build_aho_corasick(
     ac = AhoCorasick()
     with Progress(*_PROGRESS_COLUMNS) as progress:
         task = progress.add_task(
-            "Building Aho-Corasick", total=len(index.names),
+            "Building Aho-Corasick", total=index.n_reads,
         )
         for name, minimizers in minimizer_iter:
             read_id = index.name_to_id.get(name)
@@ -1119,7 +1160,7 @@ def build_seed_extender(
 
     with Progress(*_PROGRESS_COLUMNS) as progress:
         task = progress.add_task(
-            "Building seed-extend index", total=len(index.names),
+            "Building seed-extend index", total=index.n_reads,
         )
         for name, minimizers in minimizer_iter:
             read_id = index.name_to_id.get(name)
@@ -2328,17 +2369,15 @@ def main(
     bp_scale: float | None = None
 
     if read_minimizers_prefix is not None:
-        read_index = build_read_index(read_minimizers_prefix)
+        _name_index_path = Path(
+            str(read_minimizers_prefix) + ".read_name_index"
+        )
+        read_index = build_read_index(read_minimizers_prefix, _name_index_path)
         typer.echo(
-            f"Read index: {len(read_index.names):,} reads, "
+            f"Read index: {read_index.n_reads:,} reads, "
             f"{len(read_index.pairs) // 2:,} paired templates",
             err=True,
         )
-
-        if sampled and top_paths:
-            sampled = sorted(sampled, key=lambda p: p[1], reverse=True)[
-                :top_paths
-            ]
 
         # Precompute path sequences and build the union minimizer set so
         # that AC construction can skip reads that cannot match any path.
@@ -2407,32 +2446,48 @@ def main(
                 max_gap=max_chain_gap,
             )
         typer.echo(read_matcher.describe(), err=True)
+        read_index.name_to_id.clear()
+        logger.info("name_to_id cleared; string keys released from memory")
 
-        # --- Pre-filter paths by paired match count ----------------------------
-        if sampled and min_paired_matches > 0:
-            n_before = len(sampled)
-            filtered: list[tuple[np.ndarray, tuple[_OrientedPath, int]]] = []
+        # --- Score all paths, filter by paired matches, rank, select top N ----
+        # Matches are cached here so the reporting loop below reuses them.
+        cached_matches: list[list[PathMatch]] = []
+        path_pair_counts: list[int] = []
+        if sampled:
+            _scored: list[
+                tuple[int, int, np.ndarray, tuple[_OrientedPath, int], list[PathMatch]]
+            ] = []
             with Progress(*_PROGRESS_COLUMNS) as progress:
                 task = progress.add_task(
-                    "Pre-filtering paths", total=n_before,
+                    "Scoring paths by paired matches", total=len(sampled),
                 )
                 for seq, entry in zip(path_seqs, sampled):
-                    matches = match_reads_to_path(seq, read_matcher)
-                    n_pairs = len(
-                        _path_pair_insert_sizes(matches, read_index)
-                    )
-                    if n_pairs >= min_paired_matches:
-                        filtered.append((seq, entry))
+                    pm = match_reads_to_path(seq, read_matcher)
+                    n_pairs = len(_path_pair_insert_sizes(pm, read_index))
+                    _scored.append((n_pairs, entry[1], seq, entry, pm))
                     progress.advance(task)
-            path_seqs = [s for s, _ in filtered]
-            sampled = [e for _, e in filtered]
-            n_removed = n_before - len(sampled)
-            typer.echo(
-                f"Path filter (≥{min_paired_matches} paired matches): "
-                f"{len(sampled)} of {n_before} paths kept "
-                f"({n_removed} removed)",
-                err=True,
-            )
+
+            if min_paired_matches > 0:
+                n_before = len(_scored)
+                _scored = [t for t in _scored if t[0] >= min_paired_matches]
+                n_removed = n_before - len(_scored)
+                typer.echo(
+                    f"Path filter (≥{min_paired_matches} paired matches): "
+                    f"{len(_scored)} of {n_before} paths kept "
+                    f"({n_removed} removed)",
+                    err=True,
+                )
+
+            # Sort by paired match count descending; length descending as tiebreaker.
+            _scored.sort(key=lambda t: (t[0], t[1]), reverse=True)
+            if top_paths:
+                _scored = _scored[:top_paths]
+
+            path_seqs = [t[2] for t in _scored]
+            sampled = [t[3] for t in _scored]
+            cached_matches = [t[4] for t in _scored]
+            path_pair_counts = [t[0] for t in _scored]
+            del _scored
 
         # --- Report and write paths after filtering ----------------------------
         if sampled:
@@ -2450,7 +2505,9 @@ def main(
                 f"= {n_unique / n_total:.1%} of {n_total:,}):",
                 err=True,
             )
-            for i, (seq, (path, bp)) in enumerate(zip(path_seqs, sampled)):
+            for i, (seq, (path, bp), n_pairs) in enumerate(
+                zip(path_seqs, sampled, path_pair_counts)
+            ):
                 if i == 10:
                     typer.echo(
                         f"  ... and {n_paths - 10} more", err=True,
@@ -2458,7 +2515,8 @@ def main(
                     break
                 typer.echo(
                     f"  [{i + 1}] {len(seq):,} minimizers, "
-                    f"{bp:,} bp, {len(path)} nodes",
+                    f"{bp:,} bp, {len(path)} nodes, "
+                    f"{n_pairs} paired matches",
                     err=True,
                 )
 
@@ -2486,6 +2544,14 @@ def main(
                 )
 
         if sampled:
+            # Load name strings from disk only if output files need them;
+            # held only for the duration of the matching loop then released.
+            _need_names = (
+                read_mappings_out is not None or insert_sizes_out is not None
+            )
+            _output_names: list[str] = (
+                load_name_index(_name_index_path) if _need_names else []
+            )
             match_counts: dict[int, int] = {}  # read_id → hit count
             all_insert_sizes_min: list[int] = []
             insert_out_fh = (
@@ -2514,17 +2580,16 @@ def main(
                     task = progress.add_task(
                         "Matching reads to paths", total=len(sampled),
                     )
-                    for path_idx, (seq, (_, _)) in enumerate(
-                        zip(path_seqs, sampled), start=1,
+                    for path_idx, (seq, (_, _), path_matches) in enumerate(
+                        zip(path_seqs, sampled, cached_matches), start=1,
                     ):
-                        path_matches = match_reads_to_path(seq, read_matcher)
                         for m in path_matches:
                             match_counts[m.read_id] = (
                                 match_counts.get(m.read_id, 0) + 1
                             )
                             n_total_matches += 1
                             if mappings_out_fh is not None:
-                                rname = read_index.names[m.read_id]
+                                rname = _output_names[m.read_id]
                                 mappings_out_fh.write(
                                     f"{rname}\t"
                                     f"{_pair_number(rname)}\t"
@@ -2535,8 +2600,8 @@ def main(
                         ):
                             all_insert_sizes_min.append(span)
                             if insert_out_fh is not None:
-                                r1_name = read_index.names[r1_id]
-                                r2_name = read_index.names[r2_id]
+                                r1_name = _output_names[r1_id]
+                                r2_name = _output_names[r2_id]
                                 row = (
                                     f"{r1_name}\t{r2_name}\t{span}"
                                 )
@@ -2549,6 +2614,7 @@ def main(
                     insert_out_fh.close()
                 if mappings_out_fh is not None:
                     mappings_out_fh.close()
+                del _output_names  # release name strings from memory
 
             n_matched_reads = len(match_counts)
             typer.echo(
@@ -2612,7 +2678,7 @@ def main(
         )
         stats["gfa"] = str(gfa)
         if read_index is not None:
-            stats["read_index_reads"] = len(read_index.names)
+            stats["read_index_reads"] = read_index.n_reads
             stats["read_index_pairs"] = len(read_index.pairs) // 2
         if n_total_matches:
             stats["path_match_occurrences"] = n_total_matches

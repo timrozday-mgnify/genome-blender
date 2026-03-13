@@ -55,7 +55,7 @@ echo "Unique minimizers in minimizer_table: ${UNIQUE_MINIMIZERS}"
 
 /Users/timrozday/miniforge3/envs/genome_blender_dev/bin/python "$(dirname "$0")/parse_gfa.py" \
     -n 100000 \
-    --top-paths 400 \
+    --top-paths 5 \
     --sample-component-proportion 0.5 \
     --ac-prefilter \
     --read-minimizers "${PREFIX}" \

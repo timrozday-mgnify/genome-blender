@@ -25,6 +25,7 @@ from parse_gfa import (
     SeedExtender,
     WeightMode,
     _compute_eligible,
+    load_name_index,
     _overlap_length,
     _parse_tags,
     _path_pair_distances,
@@ -749,8 +750,8 @@ class TestRevcompReadMatching:
         r1_mids = (B, B+1, B+2)
         r2_mids = (B+5, B+6, B+7)
         read_index = ReadIndex(
+            n_reads=2,
             name_to_id={"r/1": 0, "r/2": 1},
-            names=["r/1", "r/2"],
             pairs={0: 1, 1: 0},
         )
         min_list = [("r/1", r1_mids), ("r/2", r2_mids)]
@@ -782,8 +783,8 @@ class TestRevcompReadMatching:
 
         # Read whose last minimizer (B+99) is NOT in the path.
         unrelated = ReadIndex(
+            n_reads=1,
             name_to_id={"r/1": 0},
-            names=["r/1"],
             pairs={},
         )
         min_list = [("r/1", (B, B+1, B+99))]
@@ -807,8 +808,8 @@ class TestRevcompReadMatching:
         path_minimizer_set = {int(m) for m in seq}
 
         matching = ReadIndex(
+            n_reads=1,
             name_to_id={"r/1": 0},
-            names=["r/1"],
             pairs={},
         )
         min_list = [("r/1", (B+1, B+2, B+3))]
@@ -833,8 +834,8 @@ class TestRevcompReadMatching:
 
         # r/1 passes the filter; r/2 has B+99 which is absent from the path.
         index = ReadIndex(
+            n_reads=2,
             name_to_id={"r/1": 0, "r/2": 1},
-            names=["r/1", "r/2"],
             pairs={0: 1, 1: 0},
         )
         min_list = [("r/1", (B+1, B+2, B+3)), ("r/2", (B+2, B+3, B+99))]
@@ -859,8 +860,8 @@ class TestRevcompReadMatching:
         path_minimizer_set = {int(m) for m in seq}
 
         index = ReadIndex(
+            n_reads=2,
             name_to_id={"r/1": 0, "r/2": 1},
-            names=["r/1", "r/2"],
             pairs={0: 1, 1: 0},
         )
         min_list = [("r/1", (B, B+1, B+2)), ("r/2", (B+2, B+3, B+4))]
@@ -911,8 +912,8 @@ class TestSeedExtender:
     ) -> tuple[ReadIndex, SeedExtender]:
         """Build a SeedExtender directly from an in-memory read dict."""
         index = ReadIndex(
+            n_reads=len(reads),
             name_to_id={n: i for i, n in enumerate(sorted(reads))},
-            names=sorted(reads),
             pairs={},
         )
         se = build_seed_extender(
@@ -996,8 +997,8 @@ class TestSeedExtender:
             [B, B+1, B+2, B+3, B+4, B+5, B+6, B+7], dtype=np.uint64
         )
         index = ReadIndex(
+            n_reads=2,
             name_to_id={"r/1": 0, "r/2": 1},
-            names=["r/1", "r/2"],
             pairs={0: 1, 1: 0},
         )
         se = build_seed_extender(
@@ -1026,7 +1027,7 @@ class TestSeedExtender:
 
         read_mids = (B+1, B+2, B+3)
         index = ReadIndex(
-            name_to_id={"r1": 0}, names=["r1"], pairs={},
+            n_reads=1, name_to_id={"r1": 0}, pairs={},
         )
         ac = build_aho_corasick(iter([("r1", read_mids)]), index)
         se = build_seed_extender(
