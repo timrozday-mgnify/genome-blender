@@ -27,10 +27,11 @@ from genome_blender.models import (
 
 logger = logging.getLogger(__name__)
 
-# Optional Rust extension for parallel error assembly (opt 1)
+# Optional Rust extension: parallel HMM quality sampling + error assembly
 try:
     from genome_blender_core import (  # type: ignore[import-not-found]
         apply_errors_batch as _apply_errors_batch_rust,
+        sample_and_apply_errors_batch as _sample_and_apply_errors_batch_rust,
     )
     _HAS_RUST = True
     logger.debug("genome_blender_core Rust extension loaded")
@@ -469,6 +470,35 @@ def apply_errors_to_sequence(
     )
 
 
+def _get_calibration_params(
+    calibration: QualityCalibration | None,
+) -> tuple[str, list[float]]:
+    """Extract calibration type string and parameter list for the Rust extension."""
+    if calibration is None or isinstance(calibration, PhredCalibration):
+        return ("phred", [])
+    if isinstance(calibration, LogLinearCalibration):
+        return (
+            "log-linear",
+            [
+                calibration.intercept,
+                calibration.slope,
+                calibration.floor,
+                calibration.ceiling,
+            ],
+        )
+    if isinstance(calibration, SigmoidCalibration):
+        return (
+            "sigmoid",
+            [
+                calibration.steepness,
+                calibration.midpoint,
+                calibration.floor,
+                calibration.ceiling,
+            ],
+        )
+    return ("phred", [])
+
+
 def _apply_errors_rust(
     flat_reads: list[Read],
     all_q_scores: list[torch.Tensor],
@@ -548,6 +578,62 @@ def _apply_errors_rust(
     return modified, n_errors_total, n_bases_total
 
 
+def _combined_rust(
+    flat_reads: list[Read],
+    profile: ErrorModelProfile,
+    rng: torch.Generator,
+    calibration: QualityCalibration | None,
+    error_rate_scale: float,
+) -> tuple[list[Read], int, int]:
+    """Call the combined Rust HMM + error assembly path.
+
+    Returns (modified_reads, n_errors_total, n_bases_total).
+    """
+    initial = profile.initial_logits.float().tolist()
+    transition = profile.transition_logits.float().reshape(-1).tolist()
+    emission = profile.emission_logits.float().reshape(-1).tolist()
+    num_states = profile.num_states
+    num_quality_values = int(profile.emission_logits.shape[1])
+
+    cal_type, cal_params = _get_calibration_params(calibration)
+    base_seed = int(
+        torch.randint(0, 2**62, (1,), generator=rng).item()
+    )
+    sequences = [r.sequence for r in flat_reads]
+
+    results = _sample_and_apply_errors_batch_rust(
+        sequences,
+        initial,
+        transition,
+        emission,
+        num_states,
+        num_quality_values,
+        float(profile.substitution_ratio),
+        float(profile.insertion_ratio),
+        float(error_rate_scale),
+        cal_type,
+        cal_params,
+        base_seed,
+    )
+
+    modified: list[Read] = []
+    n_errors_total = 0
+    n_bases_total = 0
+    for read, (new_seq, new_qual, cigar_raw) in zip(flat_reads, results):
+        cigar: list[tuple[int, int]] = [
+            (int(op), int(ln)) for op, ln in cigar_raw
+        ]
+        n_bases_total += len(read.sequence)
+        n_errors_total += sum(ln for op, ln in cigar if op != 0)
+        modified.append(Read(
+            name=read.name,
+            sequence=new_seq,
+            quality=new_qual,
+            cigar=cigar,
+        ))
+    return modified, n_errors_total, n_bases_total
+
+
 def apply_error_model(
     read_batch: ReadBatch,
     profile: ErrorModelProfile | None,
@@ -587,30 +673,27 @@ def apply_error_model(
         assert read_batch.single is not None
         flat_reads = list(read_batch.single)
 
-    read_lengths = [len(r.sequence) for r in flat_reads]
-    logger.debug(
-        "Sampling HMM quality scores for %d reads "
-        "(max length %d)...",
-        len(read_lengths),
-        max(read_lengths) if read_lengths else 0,
-    )
-    all_q_scores = batch_sample_quality_scores(
-        profile, read_lengths,
-    )
-    logger.debug("Quality score sampling complete")
-
     modified: list[Read] = []
     n_errors_total = 0
     n_bases_total = 0
 
     if _HAS_RUST:
-        modified, n_errors_total, n_bases_total = (
-            _apply_errors_rust(
-                flat_reads, all_q_scores, profile,
-                rng, calibration, error_rate_scale,
-            )
+        # Combined Rust path: HMM sampling + error assembly in one parallel call
+        modified, n_errors_total, n_bases_total = _combined_rust(
+            flat_reads, profile, rng, calibration, error_rate_scale,
         )
     else:
+        read_lengths = [len(r.sequence) for r in flat_reads]
+        logger.debug(
+            "Sampling HMM quality scores for %d reads "
+            "(max length %d)...",
+            len(read_lengths),
+            max(read_lengths) if read_lengths else 0,
+        )
+        all_q_scores = batch_sample_quality_scores(
+            profile, read_lengths,
+        )
+        logger.debug("Quality score sampling complete")
         with progress_task(
             len(flat_reads), "Applying errors",
         ) as step:

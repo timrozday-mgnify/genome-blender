@@ -10,6 +10,7 @@ crate-type = ["cdylib"]
 [dependencies]
 pyo3 = { version = "0.25", features = ["extension-module"] }
 rayon = "1.10"
+rand = { version = "0.8", features = ["small_rng"] }
 
 [profile.release]
 lto = "thin"
