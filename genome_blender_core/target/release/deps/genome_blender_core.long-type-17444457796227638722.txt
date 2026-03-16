@@ -1,0 +1,1 @@
+Result<Vec<(String, String, Vec<(u8, u32)>)>, PyErr>: FromParallelIterator<(String, String, Vec<(u8, u32)>)>

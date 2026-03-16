@@ -98,76 +98,110 @@ def sample_fragments(
             accepted = 0
             rejected = 0
             max_attempts = n_frags * 20
-            attempts = 0
+            total_attempts = 0
+            # Batch size: oversample to absorb rejections
+            _batch = max(min(n_frags * 2, 4096), 64)
+            _fixed_len = (
+                max(1, int(fragment_mean))
+                if frag_dist is None
+                else None
+            )
 
             while (
-                accepted < n_frags and attempts < max_attempts
+                accepted < n_frags
+                and total_attempts < max_attempts
             ):
-                attempts += 1
-
-                contig_idx = torch.multinomial(
-                    contig_weights, 1, generator=rng,
-                ).item()
-                record = records[contig_idx]
-                contig_len = len(record.seq)
-
-                if frag_dist is None:
-                    frag_len = max(1, int(fragment_mean))
-                else:
-                    frag_len = int(
-                        frag_dist.sample().clamp(min=1).item()
+                batch = min(
+                    _batch, max_attempts - total_attempts,
+                )
+                contig_idxs = torch.multinomial(
+                    contig_weights, batch,
+                    replacement=True, generator=rng,
+                )
+                if _fixed_len is not None:
+                    frag_lens = torch.full(
+                        (batch,), _fixed_len,
+                        dtype=torch.long,
                     )
-                if frag_len > contig_len:
-                    rejected += 1
-                    continue
-
-                max_start = contig_len - frag_len
-                start = torch.randint(
-                    0, max_start + 1, (1,), generator=rng,
-                ).item()
-                end = start + frag_len
-
-                strand = (
-                    "+"
-                    if torch.rand(
-                        1, generator=rng,
-                    ).item() < 0.5
-                    else "-"
+                else:
+                    frag_lens = (
+                        frag_dist.sample((batch,))
+                        .clamp(min=1).long()
+                    )
+                start_rands = torch.rand(
+                    batch, generator=rng,
+                )
+                strand_rands = torch.rand(
+                    batch, generator=rng,
+                )
+                gc_rands = (
+                    torch.rand(batch, generator=rng)
+                    if gc_bias_strength > 0
+                    else None
                 )
 
-                seq_str = str(record.seq[start:end])
-                if strand == "-":
-                    seq_str = reverse_complement(seq_str)
+                for i in range(batch):
+                    total_attempts += 1
+                    if total_attempts > max_attempts:
+                        break
 
-                if gc_bias_strength > 0:
-                    gc = gc_fraction(seq_str)
-                    p_keep = math.exp(
-                        -gc_bias_strength * (gc - 0.5) ** 2
-                    )
-                    if (
-                        torch.rand(
-                            1, generator=rng,
-                        ).item() > p_keep
-                    ):
+                    ci = int(contig_idxs[i].item())
+                    record = records[ci]
+                    contig_len = len(record.seq)
+                    frag_len = int(frag_lens[i].item())
+
+                    if frag_len > contig_len:
                         rejected += 1
                         continue
 
-                fragments.append(Fragment(
-                    genome_id=genome_id,
-                    contig_id=record.id,
-                    start=start,
-                    end=end,
-                    strand=strand,
-                    sequence=seq_str,
-                ))
-                accepted += 1
-                step()
+                    max_start = contig_len - frag_len
+                    start = min(
+                        int(
+                            start_rands[i].item()
+                            * (max_start + 1)
+                        ),
+                        max_start,
+                    )
+                    end = start + frag_len
+                    strand = (
+                        "+"
+                        if strand_rands[i].item() < 0.5
+                        else "-"
+                    )
+
+                    seq_str = str(record.seq[start:end])
+                    if strand == "-":
+                        seq_str = reverse_complement(seq_str)
+
+                    if gc_bias_strength > 0:
+                        gc = gc_fraction(seq_str)
+                        p_keep = math.exp(
+                            -gc_bias_strength
+                            * (gc - 0.5) ** 2
+                        )
+                        assert gc_rands is not None
+                        if gc_rands[i].item() > p_keep:
+                            rejected += 1
+                            continue
+
+                    fragments.append(Fragment(
+                        genome_id=genome_id,
+                        contig_id=record.id,
+                        start=start,
+                        end=end,
+                        strand=strand,
+                        sequence=seq_str,
+                    ))
+                    accepted += 1
+                    step()
+                    if accepted >= n_frags:
+                        break
 
             logger.debug(
                 "  %s: accepted %d/%d fragments "
                 "(%d rejected, %d attempts)",
                 genome_id, accepted, n_frags,
-                rejected, attempts,
+                rejected, total_attempts,
             )
 
             if accepted < n_frags:

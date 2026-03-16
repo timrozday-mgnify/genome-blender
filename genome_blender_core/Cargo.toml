@@ -1,0 +1,17 @@
+[package]
+name = "genome_blender_core"
+version = "0.1.0"
+edition = "2021"
+
+[lib]
+name = "genome_blender_core"
+crate-type = ["cdylib"]
+
+[dependencies]
+pyo3 = { version = "0.25", features = ["extension-module"] }
+rayon = "1.10"
+
+[profile.release]
+lto = "thin"
+codegen-units = 1
+opt-level = 3

@@ -4,14 +4,14 @@ from __future__ import annotations
 
 import math
 
-from Bio.Seq import Seq
-
 _BASES = "ACGT"
+
+_RC_TABLE = str.maketrans("ACGTacgt", "TGCAtgca")
 
 
 def reverse_complement(sequence: str) -> str:
     """Return the reverse complement of a DNA sequence."""
-    return str(Seq(sequence).reverse_complement())
+    return sequence.translate(_RC_TABLE)[::-1]
 
 
 def gc_fraction(sequence: str) -> float:

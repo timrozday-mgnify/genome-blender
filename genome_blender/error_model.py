@@ -27,6 +27,28 @@ from genome_blender.models import (
 
 logger = logging.getLogger(__name__)
 
+# Optional Rust extension for parallel error assembly (opt 1)
+try:
+    from genome_blender_core import (  # type: ignore[import-not-found]
+        apply_errors_batch as _apply_errors_batch_rust,
+    )
+    _HAS_RUST = True
+    logger.debug("genome_blender_core Rust extension loaded")
+except ImportError:
+    _HAS_RUST = False
+    logger.debug(
+        "genome_blender_core not found; "
+        "using pure-Python error assembly"
+    )
+
+# Precomputed substitution alternatives for each base (opt 7)
+_SUBSTITUTION_ALTS: dict[str, list[str]] = {
+    b: [x for x in "ACGT" if x != b] for b in "ACGT"
+}
+
+# Cache for DiscreteHMM objects keyed by (profile_id, duration) (opt 5)
+_hmm_cache: dict[tuple[int, int], DiscreteHMM] = {}
+
 # Noise scales for per-run variability perturbation
 _QCAL_NOISE_SCALES: dict[str, float] = {
     "intercept": 0.15,
@@ -144,10 +166,10 @@ def _build_emission_logits(
         Tensor of shape ``(num_states, num_quality_values)``.
     """
     q_values = torch.arange(
-        num_quality_values, dtype=torch.float64,
+        num_quality_values, dtype=torch.float32,
     )
     logits = torch.zeros(
-        num_states, num_quality_values, dtype=torch.float64,
+        num_states, num_quality_values, dtype=torch.float32,
     )
     for s in range(num_states):
         logits[s] = (
@@ -169,7 +191,7 @@ def _build_sticky_transitions(
         Tensor of shape ``(num_states, num_states)``.
     """
     logits = torch.full(
-        (num_states, num_states), -2.0, dtype=torch.float64,
+        (num_states, num_states), -2.0, dtype=torch.float32,
     )
     for s in range(num_states):
         logits[s, s] = self_logit
@@ -196,7 +218,7 @@ def default_illumina_profile() -> ErrorModelProfile:
     quality_spreads = [3.0, 3.0, 4.0, 4.0, 3.0]
 
     initial_logits = torch.tensor(
-        [2.0, 1.0, -1.0, -3.0, -5.0], dtype=torch.float64,
+        [2.0, 1.0, -1.0, -3.0, -5.0], dtype=torch.float32,
     )
     transition_logits = _build_sticky_transitions(
         num_states, self_logit=3.5, neighbour_logit=0.5,
@@ -228,7 +250,7 @@ def default_pacbio_profile() -> ErrorModelProfile:
     quality_spreads = [3.0, 3.0, 3.0, 3.0, 2.0]
 
     initial_logits = torch.tensor(
-        [1.0, 2.0, 1.0, -1.0, -3.0], dtype=torch.float64,
+        [1.0, 2.0, 1.0, -1.0, -3.0], dtype=torch.float32,
     )
     transition_logits = _build_sticky_transitions(
         num_states, self_logit=3.0, neighbour_logit=0.8,
@@ -260,7 +282,7 @@ def default_nanopore_profile() -> ErrorModelProfile:
     quality_spreads = [3.0, 3.0, 3.0, 3.0, 2.0]
 
     initial_logits = torch.tensor(
-        [0.5, 1.5, 1.0, -0.5, -2.0], dtype=torch.float64,
+        [0.5, 1.5, 1.0, -0.5, -2.0], dtype=torch.float32,
     )
     transition_logits = _build_sticky_transitions(
         num_states, self_logit=2.5, neighbour_logit=1.0,
@@ -309,14 +331,17 @@ def batch_sample_quality_scores(
     max_len = max(read_lengths)
     batch_size = len(read_lengths)
 
-    hmm = DiscreteHMM(
-        initial_logits=profile.initial_logits,
-        transition_logits=profile.transition_logits,
-        observation_dist=PyroCategorical(
-            logits=profile.emission_logits,
-        ),
-        duration=max_len,
-    )
+    cache_key = (id(profile), max_len)
+    if cache_key not in _hmm_cache:
+        _hmm_cache[cache_key] = DiscreteHMM(
+            initial_logits=profile.initial_logits,
+            transition_logits=profile.transition_logits,
+            observation_dist=PyroCategorical(
+                logits=profile.emission_logits,
+            ),
+            duration=max_len,
+        )
+    hmm = _hmm_cache[cache_key]
 
     all_scores = hmm.sample(sample_shape=(batch_size,))
 
@@ -400,10 +425,10 @@ def apply_errors_to_sequence(
             etype = error_types_list[pos]
             if etype == 0:
                 # Substitution
-                original = sequence[pos].upper()
-                alts = [
-                    b for b in _BASES if b != original
-                ]
+                alts = _SUBSTITUTION_ALTS.get(
+                    sequence[pos].upper(),
+                    _SUBSTITUTION_ALTS["A"],
+                )
                 modified_bases.append(
                     alts[sub_choices_list[pos]],
                 )
@@ -442,6 +467,85 @@ def apply_errors_to_sequence(
         "".join(qual_chars),
         cigar_tuples,
     )
+
+
+def _apply_errors_rust(
+    flat_reads: list[Read],
+    all_q_scores: list[torch.Tensor],
+    profile: ErrorModelProfile,
+    rng: torch.Generator,
+    calibration: QualityCalibration | None,
+    error_rate_scale: float,
+) -> tuple[list[Read], int, int]:
+    """Batch-compute all random decisions then call the Rust extension.
+
+    Returns (modified_reads, n_errors_total, n_bases_total).
+    """
+    lengths = [len(r.sequence) for r in flat_reads]
+    total_len = sum(lengths)
+
+    # Concatenate quality scores across all reads (already truncated
+    # to each read's length by batch_sample_quality_scores)
+    all_q_cat = torch.cat(
+        [q[:lengths[i]] for i, q in enumerate(all_q_scores)]
+    )
+
+    # Vectorised error probability for the whole batch at once
+    if calibration is not None:
+        p_error = calibration(all_q_cat)
+    else:
+        p_error = 10.0 ** (-all_q_cat.float() / 10.0)
+    if error_rate_scale != 1.0:
+        p_error = (p_error * error_rate_scale).clamp(max=1.0)
+
+    is_error = torch.rand(total_len, generator=rng) < p_error
+
+    error_type_weights = torch.tensor(
+        [
+            profile.substitution_ratio,
+            profile.insertion_ratio,
+            profile.deletion_ratio,
+        ],
+        dtype=torch.float32,
+    )
+    error_types = torch.multinomial(
+        error_type_weights.expand(total_len, -1),
+        1, generator=rng,
+    ).squeeze(-1)
+
+    sub_choices = torch.randint(0, 3, (total_len,), generator=rng)
+    ins_bases = torch.randint(0, 4, (total_len,), generator=rng)
+    q_ints = all_q_cat.to(torch.int64)
+
+    # Convert to plain Python lists for PyO3 (one pass each)
+    sequences = [r.sequence for r in flat_reads]
+    results = _apply_errors_batch_rust(
+        sequences,
+        q_ints.tolist(),
+        is_error.tolist(),
+        error_types.tolist(),
+        sub_choices.tolist(),
+        ins_bases.tolist(),
+        lengths,
+    )
+
+    modified: list[Read] = []
+    n_errors_total = 0
+    n_bases_total = 0
+    for read, (new_seq, new_qual, cigar_raw) in zip(flat_reads, results):
+        # Rust returns cigar as list of (op:int, length:int)
+        cigar: list[tuple[int, int]] = [
+            (int(op), int(ln)) for op, ln in cigar_raw
+        ]
+        n_bases_total += len(read.sequence)
+        n_errors_total += sum(ln for op, ln in cigar if op != 0)
+        modified.append(Read(
+            name=read.name,
+            sequence=new_seq,
+            quality=new_qual,
+            cigar=cigar,
+        ))
+    return modified, n_errors_total, n_bases_total
 
 
 def apply_error_model(
@@ -498,27 +602,36 @@ def apply_error_model(
     modified: list[Read] = []
     n_errors_total = 0
     n_bases_total = 0
-    with progress_task(
-        len(flat_reads), "Applying errors",
-    ) as step:
-        for read, q_scores in zip(flat_reads, all_q_scores):
-            new_seq, new_qual, cigar = (
-                apply_errors_to_sequence(
-                    read.sequence, q_scores, profile, rng,
-                    calibration, error_rate_scale,
+
+    if _HAS_RUST:
+        modified, n_errors_total, n_bases_total = (
+            _apply_errors_rust(
+                flat_reads, all_q_scores, profile,
+                rng, calibration, error_rate_scale,
+            )
+        )
+    else:
+        with progress_task(
+            len(flat_reads), "Applying errors",
+        ) as step:
+            for read, q_scores in zip(flat_reads, all_q_scores):
+                new_seq, new_qual, cigar = (
+                    apply_errors_to_sequence(
+                        read.sequence, q_scores, profile, rng,
+                        calibration, error_rate_scale,
+                    )
                 )
-            )
-            n_bases_total += len(read.sequence)
-            n_errors_total += sum(
-                length for op, length in cigar if op != 0
-            )
-            modified.append(Read(
-                name=read.name,
-                sequence=new_seq,
-                quality=new_qual,
-                cigar=cigar,
-            ))
-            step()
+                n_bases_total += len(read.sequence)
+                n_errors_total += sum(
+                    length for op, length in cigar if op != 0
+                )
+                modified.append(Read(
+                    name=read.name,
+                    sequence=new_seq,
+                    quality=new_qual,
+                    cigar=cigar,
+                ))
+                step()
 
     if n_bases_total > 0:
         logger.debug(

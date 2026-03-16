@@ -53,7 +53,10 @@
       "Bash(/Users/timrozday/miniforge3/envs/genome_blender_dev/bin/pytest:*)",
       "Bash(cargo build:*)",
       "WebFetch(domain:ftp.ebi.ac.uk)",
-      "Bash(curl:*)"
+      "Bash(curl:*)",
+      "Bash(which cargo:*)",
+      "Bash(pip show:*)",
+      "Bash(cd /Users/timrozday/Documents/genome-blender/genome_blender_core && maturin develop --release 2>&1)"
     ]
   }
 }
