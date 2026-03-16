@@ -15,6 +15,7 @@ Usage::
 
 from __future__ import annotations
 
+import bisect
 import glob
 import gzip
 import io
@@ -882,8 +883,6 @@ def path_minimizer_sequence(
 class MatcherMode(str, Enum):
     """Substring-matching strategy for read-to-path alignment."""
 
-    ac = "ac"
-    seed_extend = "seed-extend"
     exact = "exact"
     pseudo_match = "pseudo-match"
 
@@ -912,630 +911,7 @@ class ReadMatcher(Protocol):
 
 
 # ------------------------------------------------------------------
-# Aho-Corasick automaton over integer sequences
-# ------------------------------------------------------------------
-
-
-@dataclass
-class _AcNode:
-    """Single node in the Aho-Corasick trie."""
-
-    goto: dict[int, int] = field(default_factory=dict)
-    failure: int = 0
-    # Each entry: (pattern_id, pattern_length) emitted at this state.
-    output: list[tuple[int, int]] = field(default_factory=list)
-
-
-class AhoCorasick:
-    """Aho-Corasick automaton for exact substring matching.
-
-    Operates over arbitrary integer sequences (e.g. NT-hash minimizer
-    IDs) rather than characters.  Trie transitions use dicts so the
-    integer alphabet can be arbitrarily sparse.
-
-    Usage::
-
-        ac = build_aho_corasick(iter_read_minimizers(prefix), index)
-        matches = ac.search(path_minimizer_sequence(...))
-    """
-
-    def __init__(self) -> None:
-        self._nodes: list[_AcNode] = [_AcNode()]
-
-    def _new_node(self) -> int:
-        self._nodes.append(_AcNode())
-        return len(self._nodes) - 1
-
-    def add_pattern(self, pattern: tuple[int, ...], pattern_id: int) -> None:
-        """Insert *pattern* into the trie, tagged with *pattern_id*.
-
-        Args:
-            pattern: Sequence of integer minimizer IDs.
-            pattern_id: Caller-assigned identifier emitted on a match
-                (use the read's integer ID from :class:`ReadIndex`).
-        """
-        state = 0
-        for symbol in pattern:
-            if symbol not in self._nodes[state].goto:
-                self._nodes[state].goto[symbol] = self._new_node()
-            state = self._nodes[state].goto[symbol]
-        self._nodes[state].output.append((pattern_id, len(pattern)))
-
-    def build(self) -> None:
-        """Compute failure links and propagate outputs via BFS.
-
-        Must be called once after all :meth:`add_pattern` calls and
-        before any :meth:`search` calls.
-        """
-        q: deque[int] = deque()
-        for child in self._nodes[0].goto.values():
-            self._nodes[child].failure = 0
-            q.append(child)
-
-        while q:
-            state = q.popleft()
-            node = self._nodes[state]
-            for symbol, next_state in node.goto.items():
-                child = self._nodes[next_state]
-                fall = node.failure
-                while fall != 0 and symbol not in self._nodes[fall].goto:
-                    fall = self._nodes[fall].failure
-                child.failure = self._nodes[fall].goto.get(symbol, 0)
-                if child.failure == next_state:
-                    child.failure = 0
-                child.output = (
-                    child.output + self._nodes[child.failure].output
-                )
-                q.append(next_state)
-
-    def search(
-        self,
-        text: tuple[int, ...],
-    ) -> list[tuple[int, int, int]]:
-        """Find all pattern occurrences in *text*.
-
-        Args:
-            text: Sequence of integer minimizer IDs to search.
-
-        Returns:
-            List of ``(start, end, pattern_id)`` tuples where
-            ``text[start:end]`` matches the pattern for *pattern_id*.
-            Results are ordered by end position.
-        """
-        state = 0
-        matches: list[tuple[int, int, int]] = []
-        for pos, symbol in enumerate(text):
-            while state != 0 and symbol not in self._nodes[state].goto:
-                state = self._nodes[state].failure
-            state = self._nodes[state].goto.get(symbol, 0)
-            for pat_id, pat_len in self._nodes[state].output:
-                matches.append((pos - pat_len + 1, pos + 1, pat_id))
-        return matches
-
-    # --- ReadMatcher protocol implementation ---
-
-    def search_path(self, path_seq: np.ndarray) -> list[PathMatch]:
-        """Return all reads found in *path_seq* using the AC automaton.
-
-        Args:
-            path_seq: 1-D uint64 array of minimizer IDs for one path.
-
-        Returns:
-            List of :class:`PathMatch` records, one per occurrence.
-        """
-        return [
-            PathMatch(read_id=pat_id, path_start=start, path_end=end)
-            for start, end, pat_id in self.search(path_seq)
-        ]
-
-    def describe(self) -> str:
-        """Return a short description of the automaton size."""
-        return f"Aho-Corasick: {len(self._nodes):,} states"
-
-
-def _compute_eligible(
-    pairs: dict[int, int],
-    individually_passing: set[int],
-) -> set[int]:
-    """Apply pair-coherence to a set of individually-passing read IDs.
-
-    Both mates of a paired-end read must pass or neither is retained.
-    Unpaired reads are retained if they individually pass.
-
-    Args:
-        pairs: Read ID to mate read ID mapping from :class:`ReadIndex`.
-        individually_passing: Read IDs that pass an upstream filter.
-
-    Returns:
-        Subset of *individually_passing* where the mate also passes
-        (or the read is unpaired).
-    """
-    return {
-        read_id for read_id in individually_passing
-        if pairs.get(read_id) in individually_passing
-        or pairs.get(read_id) is None
-    }
-
-
-def build_aho_corasick(
-    minimizer_iter: Iterable[tuple[str, tuple[int, ...]]],
-    index: ReadIndex,
-    eligible: set[int] | None = None,
-) -> AhoCorasick:
-    """Build an Aho-Corasick automaton from a streaming read minimizer source.
-
-    Each read's integer ID is used as the pattern ID so match results
-    can be resolved back to read names and pairs without storing strings
-    in the automaton.  Reads with empty minimizer sequences are skipped.
-
-    Both the forward and reversed minimizer sequences are indexed for
-    each read, because REVCOMP_AWARE normalisation in rust-mdbg means
-    ~50 % of reads are stored in reversed orientation relative to the
-    path direction.  A match of either orientation is recorded under the
-    same read ID.
-
-    Args:
-        minimizer_iter: Iterator yielding ``(read_name, minimizer_ids)``
-            pairs, e.g. from :func:`iter_read_minimizers`.
-        index: :class:`ReadIndex` providing the name-to-ID mapping.
-        eligible: Optional set of read IDs to include.  Only reads
-            whose integer ID is in this set are added to the automaton.
-            Use :func:`_compute_eligible` for pair-coherent pre-filtering.
-
-    Returns:
-        A compiled :class:`AhoCorasick` automaton ready for searching.
-    """
-    ac = AhoCorasick()
-    with Progress(*_PROGRESS_COLUMNS) as progress:
-        task = progress.add_task(
-            "Building Aho-Corasick", total=index.n_reads,
-        )
-        for name, minimizers in minimizer_iter:
-            read_id = index.name_to_id.get(name)
-            if read_id is None:
-                continue
-            if minimizers:
-                if eligible is None or read_id in eligible:
-                    ac.add_pattern(minimizers, read_id)
-                    rev = minimizers[::-1]
-                    if rev != minimizers:
-                        ac.add_pattern(rev, read_id)
-            progress.advance(task)
-    ac.build()
-    return ac
-
-
-# ------------------------------------------------------------------
-# Seed-and-extend matcher (minimap2-style anchoring + DP chaining)
-# ------------------------------------------------------------------
-
-# Maximum number of preceding anchors to consider per DP step.
-_CHAIN_LOOKBACK: int = 50
-# Gap open and extension costs (in anchor units, fraction of one match).
-_CHAIN_GAP_OPEN: float = 0.1
-_CHAIN_GAP_EXT: float = 0.1
-
-
-class SeedExtender:
-    """Minimizer-space seed-and-extend read matcher.
-
-    Indexes read minimizers in an inverted structure
-    (``minimizer_id → [(read_id, read_pos)]``) for forward and reversed
-    orientations separately.  At search time it collects per-read anchor
-    sets from the path and chains them with a DP algorithm similar to
-    minimap2's linear-time chaining, tolerating small gaps.
-
-    Attributes:
-        _fwd: Forward inverted index.
-        _rev: Reversed inverted index (``None`` entries excluded).
-        _read_lengths: Read ID to minimizer count.
-        _min_chain_score: Minimum fraction of read minimizers that must
-            be covered by the best chain for a match to be reported.
-        _max_gap: Maximum gap (in minimizers) allowed between consecutive
-            anchors in either the read or path coordinate.
-    """
-
-    def __init__(
-        self,
-        fwd: dict[int, list[tuple[int, int]]],
-        rev: dict[int, list[tuple[int, int]]],
-        read_lengths: dict[int, int],
-        min_chain_score: float,
-        max_gap: int,
-    ) -> None:
-        self._fwd = fwd
-        self._rev = rev
-        self._read_lengths = read_lengths
-        self._min_chain_score = min_chain_score
-        self._max_gap = max_gap
-
-    def search_path(self, path_seq: np.ndarray) -> list[PathMatch]:
-        """Return reads whose minimizers chain against *path_seq*.
-
-        For each read, anchor sets are built for both forward and reversed
-        orientations and chained independently.  Matches from either
-        orientation are reported under the same read ID.
-
-        Args:
-            path_seq: 1-D uint64 array of minimizer IDs for one path.
-
-        Returns:
-            List of :class:`PathMatch` records (one per successful chain).
-        """
-        fwd_anchors: dict[int, list[tuple[int, int]]] = {}
-        rev_anchors: dict[int, list[tuple[int, int]]] = {}
-        for path_pos, mid_raw in enumerate(path_seq):
-            mid = int(mid_raw)
-            for read_id, read_pos in self._fwd.get(mid, ()):
-                fwd_anchors.setdefault(read_id, []).append(
-                    (read_pos, path_pos)
-                )
-            for read_id, read_pos in self._rev.get(mid, ()):
-                rev_anchors.setdefault(read_id, []).append(
-                    (read_pos, path_pos)
-                )
-
-        matches: list[PathMatch] = []
-        all_ids = set(fwd_anchors) | set(rev_anchors)
-        for read_id in all_ids:
-            read_len = self._read_lengths[read_id]
-            for anchor_dict in (fwd_anchors, rev_anchors):
-                anchors = anchor_dict.get(read_id)
-                if not anchors:
-                    continue
-                m = self._chain(read_id, read_len, anchors)
-                if m is not None:
-                    matches.append(m)
-        return matches
-
-    def _chain(
-        self,
-        read_id: int,
-        read_len: int,
-        anchors: list[tuple[int, int]],
-    ) -> PathMatch | None:
-        """Find the highest-scoring chain of anchors via DP.
-
-        Anchors are sorted by (path_pos, read_pos) before chaining.
-        A gap between consecutive anchors in either coordinate incurs a
-        fractional penalty so that chains with indel-like events score
-        slightly lower than gap-free chains of the same length.
-
-        Args:
-            read_id: Integer ID of the read.
-            read_len: Number of minimizers in the read.
-            anchors: Unsorted list of ``(read_pos, path_pos)`` pairs.
-
-        Returns:
-            A :class:`PathMatch` if the best chain meets the score
-            threshold, otherwise ``None``.
-        """
-        # Sort by path position (primary), read position (secondary).
-        anchors.sort(key=lambda a: (a[1], a[0]))
-        n = len(anchors)
-        dp = [1.0] * n
-        prev = [-1] * n
-
-        for i in range(1, n):
-            rp_i, pp_i = anchors[i]
-            for j in range(i - 1, max(-1, i - _CHAIN_LOOKBACK), -1):
-                rp_j, pp_j = anchors[j]
-                if rp_j >= rp_i or pp_j >= pp_i:
-                    continue
-                read_gap = rp_i - rp_j - 1  # 0 = consecutive
-                path_gap = pp_i - pp_j - 1  # 0 = consecutive
-                if path_gap > self._max_gap or read_gap > self._max_gap:
-                    continue
-                gap_pen = (
-                    _CHAIN_GAP_OPEN * min(read_gap, path_gap)
-                    + _CHAIN_GAP_EXT * abs(read_gap - path_gap)
-                )
-                score = dp[j] + 1.0 - gap_pen
-                if score > dp[i]:
-                    dp[i] = score
-                    prev[i] = j
-
-        best_i = max(range(n), key=lambda i: dp[i])
-
-        # Trace back to find the path-coordinate span and count of the chain.
-        # The threshold is applied to the anchor count (matched minimizers),
-        # not the penalised DP score, so that gaps only affect chain selection
-        # and not the acceptance criterion.
-        i = best_i
-        path_end = anchors[i][1] + 1
-        path_start = anchors[i][1]
-        n_anchors = 0
-        while i >= 0:
-            path_start = anchors[i][1]
-            n_anchors += 1
-            i = prev[i]
-
-        if n_anchors < self._min_chain_score * read_len:
-            return None
-        return PathMatch(
-            read_id=read_id, path_start=path_start, path_end=path_end,
-        )
-
-    def describe(self) -> str:
-        """Return a short description of the index."""
-        n_fwd = sum(len(v) for v in self._fwd.values())
-        n_rev = sum(len(v) for v in self._rev.values())
-        n_reads = len(self._read_lengths)
-        return (
-            f"Seed-extend: {n_reads:,} reads, "
-            f"{n_fwd + n_rev:,} anchor entries "
-            f"({n_fwd:,} fwd + {n_rev:,} rev)"
-        )
-
-
-def build_seed_extender(
-    minimizer_iter: Iterable[tuple[str, tuple[int, ...]]],
-    index: ReadIndex,
-    eligible: set[int] | None = None,
-    min_chain_score: float = 0.8,
-    max_gap: int = 5,
-) -> SeedExtender:
-    """Build a :class:`SeedExtender` from streaming read minimizer data.
-
-    Constructs forward and reversed inverted indices
-    (``minimizer_id → [(read_id, read_pos)]``) in a single streaming pass.
-    Both orientations are indexed because REVCOMP_AWARE normalisation in
-    rust-mdbg means ~50 % of reads are stored reversed relative to their
-    true mapping direction.
-
-    Args:
-        minimizer_iter: Iterator yielding ``(read_name, minimizer_ids)``
-            pairs, e.g. from :func:`iter_read_minimizers`.
-        index: :class:`ReadIndex` providing the name-to-ID mapping.
-        eligible: Optional set of read IDs to include.
-        min_chain_score: Minimum fraction of read minimizers required in
-            the best chain for a match to be reported (0–1).
-        max_gap: Maximum allowed gap (in minimizers) between consecutive
-            anchors in either the read or path coordinate.
-
-    Returns:
-        A :class:`SeedExtender` ready for :meth:`~SeedExtender.search_path`.
-    """
-    fwd: dict[int, list[tuple[int, int]]] = {}
-    rev: dict[int, list[tuple[int, int]]] = {}
-    read_lengths: dict[int, int] = {}
-
-    with Progress(*_PROGRESS_COLUMNS) as progress:
-        task = progress.add_task(
-            "Building seed-extend index", total=index.n_reads,
-        )
-        for name, minimizers in minimizer_iter:
-            read_id = index.name_to_id.get(name)
-            if read_id is None:
-                continue
-            if minimizers and (eligible is None or read_id in eligible):
-                for read_pos, mid in enumerate(minimizers):
-                    fwd.setdefault(mid, []).append((read_id, read_pos))
-                rev_mids = minimizers[::-1]
-                if rev_mids != minimizers:
-                    for read_pos, mid in enumerate(rev_mids):
-                        rev.setdefault(mid, []).append((read_id, read_pos))
-                read_lengths[read_id] = len(minimizers)
-            progress.advance(task)
-
-    logger.info(
-        "Seed-extend index: %d reads", len(read_lengths),
-    )
-    return SeedExtender(
-        fwd=fwd,
-        rev=rev,
-        read_lengths=read_lengths,
-        min_chain_score=min_chain_score,
-        max_gap=max_gap,
-    )
-
-
-# ------------------------------------------------------------------
-# Exact path matcher (index paths, stream reads)
-# ------------------------------------------------------------------
-
-
-def _build_path_index(
-    path_seqs: list[np.ndarray],
-) -> dict[int, list[tuple[int, int]]]:
-    """Build an inverted index from sampled path minimizer sequences.
-
-    Args:
-        path_seqs: Minimizer ID arrays for each sampled path.
-
-    Returns:
-        Mapping of minimizer ID to ``[(path_idx, path_pos)]`` positions
-        where that minimizer occurs across all paths.
-    """
-    idx: dict[int, list[tuple[int, int]]] = {}
-    for path_idx, seq in enumerate(path_seqs):
-        for path_pos, mid_raw in enumerate(seq):
-            m = int(mid_raw)
-            idx.setdefault(m, []).append((path_idx, path_pos))
-    return idx
-
-
-def _exact_match_read(
-    read_arr: np.ndarray,
-    path_seqs: list[np.ndarray],
-    path_index: dict[int, list[tuple[int, int]]],
-    read_id: int,
-) -> list[tuple[int, PathMatch]]:
-    """Find all exact occurrences of *read_arr* in any sampled path.
-
-    Uses the first and last minimizers as O(1) pre-filters before
-    calling :func:`numpy.array_equal` for full verification, so most
-    mismatches are rejected before the full comparison.
-
-    Args:
-        read_arr: 1-D uint64 array of minimizer IDs for the read.
-        path_seqs: List of path minimizer arrays.
-        path_index: Inverted index from :func:`_build_path_index`.
-        read_id: Integer read ID to embed in match records.
-
-    Returns:
-        List of ``(path_idx, PathMatch)`` for every exact occurrence.
-    """
-    L = len(read_arr)
-    if L == 0:
-        return []
-    first_mid = int(read_arr[0])
-    last_mid = int(read_arr[L - 1])
-    results: list[tuple[int, PathMatch]] = []
-    for path_idx, path_pos in path_index.get(first_mid, []):
-        end_pos = path_pos + L
-        seq = path_seqs[path_idx]
-        if end_pos > len(seq):
-            continue
-        if seq[end_pos - 1] != last_mid:
-            continue
-        if np.array_equal(seq[path_pos:end_pos], read_arr):
-            results.append((
-                path_idx,
-                PathMatch(
-                    read_id=read_id,
-                    path_start=path_pos,
-                    path_end=end_pos,
-                ),
-            ))
-    return results
-
-
-class ExactPathMatcher:
-    """Exact read-to-path matcher that indexes paths rather than reads.
-
-    Inverts the usual approach: builds an inverted index over the
-    (small) sampled path minimizer sequences, then does a **single
-    streaming pass** over the (large) read minimizer files, verifying
-    each read against candidate path positions with numpy array
-    comparison.
-
-    Memory footprint is ``O(total path minimizers + one read)`` rather
-    than ``O(total read minimizers)``, making it practical for large
-    metagenome datasets where the Aho-Corasick trie is too large to
-    build in memory.
-
-    Both forward and reversed read orientations are checked because
-    rust-mdbg uses ``REVCOMP_AWARE`` normalisation.
-
-    :meth:`search_path` returns pre-computed results and must be called
-    once per path **in the same order** as the *path_seqs* list supplied
-    to :func:`build_exact_path_matcher`.
-
-    Attributes:
-        _per_path_matches: Per-path :class:`PathMatch` lists computed
-            during the single streaming pass.
-        _n_total: Total number of read–path match events recorded.
-        _search_idx: Next index for sequential :meth:`search_path` calls.
-    """
-
-    def __init__(
-        self,
-        per_path_matches: list[list[PathMatch]],
-        n_total: int,
-    ) -> None:
-        self._per_path_matches = per_path_matches
-        self._n_total = n_total
-        self._search_idx = 0
-
-    def search_path(self, path_seq: np.ndarray) -> list[PathMatch]:
-        """Return the pre-computed matches for the next path in sequence.
-
-        The *path_seq* argument is accepted for protocol compatibility
-        but is ignored — matches were computed during the streaming
-        pass in :func:`build_exact_path_matcher`.
-
-        Args:
-            path_seq: Ignored; present for :class:`ReadMatcher` protocol
-                compatibility.
-
-        Returns:
-            List of :class:`PathMatch` records for this path.
-        """
-        result = self._per_path_matches[self._search_idx]
-        self._search_idx += 1
-        return result
-
-    def describe(self) -> str:
-        """Return a short description of the index."""
-        n_paths = len(self._per_path_matches)
-        return (
-            f"Exact path matcher: {n_paths} paths indexed, "
-            f"{self._n_total:,} total match events"
-        )
-
-
-def build_exact_path_matcher(
-    path_seqs: list[np.ndarray],
-    minimizer_iter: Iterable[tuple[str, tuple[int, ...]]],
-    index: ReadIndex,
-    eligible: set[int] | None = None,
-) -> ExactPathMatcher:
-    """Build an :class:`ExactPathMatcher` in a single streaming read pass.
-
-    Indexes the path minimizer sequences (small, already in memory) and
-    streams the read minimizer files (large), so peak memory usage is
-    ``O(total path minimizers + one read)`` rather than
-    ``O(total read minimizers)``.
-
-    Both forward and reversed orientations of each read are checked.
-    Multiple occurrences of the same read in the same path (or across
-    different paths) are all reported.
-
-    Args:
-        path_seqs: Minimizer sequences for the sampled paths, in the
-            same order that :meth:`~ExactPathMatcher.search_path` will
-            be called.
-        minimizer_iter: Iterator yielding ``(read_name, minimizer_ids)``
-            pairs (e.g. from :func:`iter_read_minimizers`).
-        index: :class:`ReadIndex` providing the name-to-ID mapping.
-        eligible: Optional set of read IDs to include; others are
-            skipped.
-
-    Returns:
-        An :class:`ExactPathMatcher` with all matches pre-computed,
-        ready for sequential :meth:`~ExactPathMatcher.search_path` calls.
-    """
-    path_index = _build_path_index(path_seqs)
-    per_path: list[list[PathMatch]] = [[] for _ in path_seqs]
-    n_total = 0
-
-    with Progress(*_PROGRESS_COLUMNS) as progress:
-        task = progress.add_task(
-            "Exact path matching", total=index.n_reads,
-        )
-        for read_name, read_mids in minimizer_iter:
-            read_id = index.name_to_id.get(read_name)
-            if read_id is None:
-                continue
-            progress.advance(task)
-            if eligible is not None and read_id not in eligible:
-                continue
-            if not read_mids:
-                continue
-            read_arr = np.array(read_mids, dtype=np.uint64)
-            rev_arr = read_arr[::-1].copy()
-            orientations = (
-                (read_arr, rev_arr)
-                if not np.array_equal(read_arr, rev_arr)
-                else (read_arr,)
-            )
-            for arr in orientations:
-                for path_idx, match in _exact_match_read(
-                    arr, path_seqs, path_index, read_id,
-                ):
-                    per_path[path_idx].append(match)
-                    n_total += 1
-
-    logger.info(
-        "Exact path matching: %d total match events across %d paths",
-        n_total, len(path_seqs),
-    )
-    return ExactPathMatcher(per_path, n_total)
-
-
-# ------------------------------------------------------------------
-# Pseudo-match matcher (unordered k-mer set membership)
+# Ordered-match matcher (ordered k-mer subsequence, index paths)
 # ------------------------------------------------------------------
 
 
@@ -1563,6 +939,292 @@ def _compute_k_levels(min_len: int, max_len: int, n_levels: int) -> list[int]:
     return result
 
 
+def _floor_k_level(read_len: int, k_levels: list[int]) -> int | None:
+    """Return the largest k in k_levels that does not exceed read_len.
+
+    Args:
+        read_len: Number of minimizers in the read.
+        k_levels: Sorted ascending list of candidate k values.
+
+    Returns:
+        Largest k ≤ read_len, or None if every level exceeds read_len.
+    """
+    best: int | None = None
+    for k in k_levels:
+        if k <= read_len:
+            best = k
+    return best
+
+
+def _build_ordered_path_index(
+    path_seqs: list[np.ndarray],
+    k_levels: list[int],
+) -> dict[int, dict[tuple[int, ...], dict[int, list[int]]]]:
+    """Build a positional inverted index for ordered k-mer matching.
+
+    For each k level and each k-mer that appears in any path, records the
+    sorted list of positions where that k-mer occurs within each path.
+
+    Args:
+        path_seqs: Minimizer ID arrays for the sampled paths.
+        k_levels: Distinct k values to index.
+
+    Returns:
+        Mapping ``k → kmer_tuple → {path_idx: [sorted positions]}``.
+    """
+    index: dict[int, dict[tuple[int, ...], dict[int, list[int]]]] = {}
+    for k in k_levels:
+        k_index: dict[tuple[int, ...], dict[int, list[int]]] = {}
+        for path_idx, seq in enumerate(path_seqs):
+            n = len(seq)
+            if n < k:
+                continue
+            for pos in range(n - k + 1):
+                kmer = tuple(int(m) for m in seq[pos:pos + k])
+                k_index.setdefault(kmer, {}).setdefault(path_idx, []).append(pos)
+        index[k] = k_index
+    return index
+
+
+def _ordered_match_read(
+    read_mids: tuple[int, ...],
+    path_index: dict[int, dict[tuple[int, ...], dict[int, list[int]]]],
+    k_levels: list[int],
+    read_id: int,
+    path_lens: list[int],
+) -> list[tuple[int, PathMatch]]:
+    """Return paths where read k-mers appear in the same order as in the read.
+
+    Uses the k level whose size is the largest value ≤ the number of read
+    minimizers (floor assignment).  Candidate paths are those containing all
+    read k-mers (set intersection); each candidate is then verified by a
+    greedy left-to-right scan that requires path positions to be strictly
+    increasing (subsequence check).
+
+    Args:
+        read_mids: Ordered minimizer IDs for the read.
+        path_index: Positional inverted index from
+            :func:`_build_ordered_path_index`.
+        k_levels: Sorted list of indexed k values.
+        read_id: Integer read ID to embed in match records.
+        path_lens: Minimizer lengths of each path (for ``PathMatch`` bounds).
+
+    Returns:
+        List of ``(path_idx, PathMatch)`` for every ordered occurrence.
+    """
+    k = _floor_k_level(len(read_mids), k_levels)
+    if k is None:
+        return []
+    n = len(read_mids)
+    read_kmers = [tuple(read_mids[i:i + k]) for i in range(n - k + 1)]
+    if not read_kmers:
+        return []
+    k_index = path_index.get(k, {})
+
+    # Candidate paths: those that contain every read k-mer.
+    candidate_paths: set[int] | None = None
+    for km in read_kmers:
+        hits = k_index.get(km)
+        if hits is None:
+            return []
+        if candidate_paths is None:
+            candidate_paths = set(hits.keys())
+        else:
+            candidate_paths &= hits.keys()
+        if not candidate_paths:
+            return []
+
+    matches: list[tuple[int, PathMatch]] = []
+    for path_idx in candidate_paths:
+        # Greedy subsequence check: for each read k-mer in order, advance
+        # to the smallest path position that is strictly after the last.
+        last_pos = -1
+        valid = True
+        for km in read_kmers:
+            positions = k_index[km][path_idx]
+            idx = bisect.bisect_right(positions, last_pos)
+            if idx >= len(positions):
+                valid = False
+                break
+            last_pos = positions[idx]
+        if valid:
+            matches.append((
+                path_idx,
+                PathMatch(
+                    read_id=read_id,
+                    path_start=0,
+                    path_end=path_lens[path_idx],
+                ),
+            ))
+    return matches
+
+
+class OrderedMatchMatcher:
+    """Read-to-path matcher using ordered k-mer subsequence matching.
+
+    Indexes sampled paths at multiple k-mer sizes spanning the range of
+    observed read lengths.  For each read the k value is floored to the
+    nearest indexed level; a read matches a path when every k-mer formed
+    from its minimizer sequence appears in that path **in the same
+    left-to-right order** (i.e. the read k-mer sequence is a subsequence
+    of the path k-mer sequence).
+
+    Both forward and reversed read orientations are tested; each
+    ``(read_id, path_idx)`` pair is emitted at most once.
+
+    Pre-computed results are served sequentially via :meth:`search_path`
+    in the same order as the *path_seqs* passed to
+    :func:`build_ordered_matcher`.
+
+    Attributes:
+        _per_path_matches: Per-path :class:`PathMatch` lists.
+        _n_total: Total read–path match events recorded.
+        _k_levels: K values used for the multi-level index.
+        _n_reads_indexed: Reads processed during the build pass.
+        _search_idx: Next sequential index for :meth:`search_path`.
+    """
+
+    def __init__(
+        self,
+        per_path_matches: list[list[PathMatch]],
+        n_total: int,
+        k_levels: list[int],
+        n_reads_indexed: int,
+    ) -> None:
+        self._per_path_matches = per_path_matches
+        self._n_total = n_total
+        self._k_levels = k_levels
+        self._n_reads_indexed = n_reads_indexed
+        self._search_idx = 0
+
+    def search_path(self, path_seq: np.ndarray) -> list[PathMatch]:
+        """Return pre-computed matches for the next path in sequence.
+
+        Args:
+            path_seq: Ignored; present for :class:`ReadMatcher` protocol
+                compatibility.
+
+        Returns:
+            List of :class:`PathMatch` records for this path.
+        """
+        result = self._per_path_matches[self._search_idx]
+        self._search_idx += 1
+        return result
+
+    def describe(self) -> str:
+        """Return a short human-readable description of the index."""
+        k_str = ", ".join(str(k) for k in self._k_levels)
+        return (
+            f"Ordered-match: {len(self._k_levels)} k levels [{k_str}], "
+            f"{self._n_reads_indexed:,} reads indexed, "
+            f"{self._n_total:,} total match events"
+        )
+
+
+def build_ordered_matcher(
+    path_seqs: list[np.ndarray],
+    minimizer_iter_factory: Callable[[], Iterable[tuple[str, tuple[int, ...]]]],
+    index: ReadIndex,
+    eligible: set[int] | None = None,
+    n_levels: int = 5,
+) -> OrderedMatchMatcher:
+    """Build an :class:`OrderedMatchMatcher` with a two-pass streaming approach.
+
+    Pass 1 scans read lengths to determine the k-level boundaries.
+    The path positional index is then built for those levels.  Pass 2 streams
+    reads again and checks each against the path index via ordered k-mer
+    subsequence matching.
+
+    Both forward and reversed orientations are tested; each
+    ``(read_id, path_idx)`` pair is recorded at most once.
+
+    Args:
+        path_seqs: Minimizer sequences for the sampled paths.
+        minimizer_iter_factory: Callable that returns a fresh
+            ``(read_name, minimizer_ids)`` iterator on each invocation;
+            called twice for the two streaming passes.
+        index: :class:`ReadIndex` providing the name-to-ID mapping.
+        eligible: Optional set of read IDs to include; others skipped.
+        n_levels: Number of distinct k values to index, evenly spaced
+            from the minimum to the maximum observed read length.
+
+    Returns:
+        An :class:`OrderedMatchMatcher` with all matches pre-computed,
+        ready for sequential :meth:`~OrderedMatchMatcher.search_path` calls.
+    """
+    # -- Pass 1: determine the read-length range for k-level boundaries ------
+    min_len = 10 ** 9
+    max_len = 0
+    with Progress(*_PROGRESS_COLUMNS) as progress:
+        task = progress.add_task(
+            "Scanning read lengths (ordered-match)", total=index.n_reads,
+        )
+        for read_name, read_mids in minimizer_iter_factory():
+            read_id = index.name_to_id.get(read_name)
+            if read_id is None:
+                continue
+            n = len(read_mids)
+            if n > 0 and (eligible is None or read_id in eligible):
+                if n < min_len:
+                    min_len = n
+                if n > max_len:
+                    max_len = n
+            progress.advance(task)
+
+    if max_len == 0:
+        logger.warning("No eligible reads with minimizers found; returning empty matcher.")
+        return OrderedMatchMatcher([[] for _ in path_seqs], 0, [], 0)
+
+    k_levels = _compute_k_levels(min_len, max_len, n_levels)
+    logger.info("Ordered-match k levels: %s", k_levels)
+
+    # -- Build the path positional k-mer index for each level ----------------
+    path_index = _build_ordered_path_index(path_seqs, k_levels)
+    path_lens = [len(seq) for seq in path_seqs]
+
+    # -- Pass 2: stream reads and match against the path index ---------------
+    per_path: list[list[PathMatch]] = [[] for _ in path_seqs]
+    seen_matches: set[tuple[int, int]] = set()
+    n_total = 0
+    n_indexed = 0
+    with Progress(*_PROGRESS_COLUMNS) as progress:
+        task = progress.add_task(
+            "Building ordered-match index", total=index.n_reads,
+        )
+        for read_name, read_mids in minimizer_iter_factory():
+            read_id = index.name_to_id.get(read_name)
+            if read_id is None:
+                continue
+            progress.advance(task)
+            if eligible is not None and read_id not in eligible:
+                continue
+            if not read_mids:
+                continue
+            n_indexed += 1
+            rev_mids: tuple[int, ...] = read_mids[::-1]
+            orientations = (read_mids, rev_mids) if rev_mids != read_mids else (read_mids,)
+            for mids in orientations:
+                for path_idx, match in _ordered_match_read(
+                    mids, path_index, k_levels, read_id, path_lens,
+                ):
+                    key = (read_id, path_idx)
+                    if key not in seen_matches:
+                        seen_matches.add(key)
+                        per_path[path_idx].append(match)
+                        n_total += 1
+
+    logger.info(
+        "Ordered-match: %d total match events across %d paths, %d reads indexed",
+        n_total, len(path_seqs), n_indexed,
+    )
+    return OrderedMatchMatcher(per_path, n_total, k_levels, n_indexed)
+
+
+# ------------------------------------------------------------------
+# Pseudo-match matcher (unordered k-mer set membership)
+# ------------------------------------------------------------------
+
+
 def _build_pseudo_path_index(
     path_seqs: list[np.ndarray],
     k_levels: list[int],
@@ -1586,23 +1248,6 @@ def _build_pseudo_path_index(
                 kmer_map.setdefault(kmer, set()).add(path_idx)
         index[k] = kmer_map
     return index
-
-
-def _floor_k_level(read_len: int, k_levels: list[int]) -> int | None:
-    """Return the largest k in k_levels that does not exceed read_len.
-
-    Args:
-        read_len: Number of minimizers in the read.
-        k_levels: Sorted ascending list of candidate k values.
-
-    Returns:
-        Largest k ≤ read_len, or None if every level exceeds read_len.
-    """
-    best: int | None = None
-    for k in k_levels:
-        if k <= read_len:
-            best = k
-    return best
 
 
 def _pseudo_match_read(
@@ -1843,8 +1488,7 @@ def match_reads_to_path(
     Args:
         path_min_seq: Concatenated minimizer sequence for a sampled
             graph path, from :func:`path_minimizer_sequence`.
-        matcher: A compiled :class:`ReadMatcher` (e.g.
-            :class:`AhoCorasick` or :class:`SeedExtender`).
+        matcher: A compiled :class:`ReadMatcher`.
 
     Returns:
         List of :class:`PathMatch` records, one per occurrence.
@@ -2863,14 +2507,6 @@ def main(
              "of all graph nodes (0.0–1.0). Set to 0 (default) to "
              "sample from all components.",
     )] = 0.0,
-    ac_prefilter: Annotated[bool, typer.Option(
-        "--ac-prefilter/--no-ac-prefilter",
-        help="Before building the Aho-Corasick index, discard reads "
-             "whose minimizers are not all present in the union of "
-             "minimizer sets from the sampled paths. Reduces automaton "
-             "size but may incorrectly exclude paired-end reads when one "
-             "mate falls outside the sampled paths.",
-    )] = False,
     read_mappings_out: Annotated[Path | None, typer.Option(
         "--read-mappings-out",
         help="Write a TSV of all read-to-path mappings to this file. "
@@ -2895,19 +2531,14 @@ def main(
     matcher: Annotated[MatcherMode, typer.Option(
         "--matcher",
         help="Read-to-path matching strategy. "
-             "'ac' uses an Aho-Corasick automaton (exact substring "
-             "matching, indexes reads — high memory for large read sets). "
-             "'seed-extend' uses a minimap2-style inverted minimizer "
-             "index with DP chaining (exact matching, indexes reads). "
-             "'exact' indexes paths instead of reads and streams reads "
-             "one at a time for numpy array verification — same results "
-             "as 'ac' but O(path minimizers) memory instead of "
-             "O(read minimizers); recommended for large metagenomes. "
-             "'pseudo-match' builds a multi-level k-mer set index over "
-             "paths; a read matches when all its k-mers are present in "
-             "the path regardless of order (two streaming passes).",
+             "'exact' builds a multi-level k-mer positional index over paths "
+             "and matches reads whose k-mer sequence is a subsequence of the "
+             "path k-mer sequence (ordered, two streaming passes). "
+             "'pseudo-match' builds a multi-level k-mer set index over paths; "
+             "a read matches when all its k-mers are present in the path "
+             "regardless of order (two streaming passes).",
         case_sensitive=False,
-    )] = MatcherMode.ac,
+    )] = MatcherMode.pseudo_match,
     pseudo_match_levels: Annotated[int, typer.Option(
         "--pseudo-match-levels",
         help="Number of k-mer size levels for the 'pseudo-match' matcher. "
@@ -3027,10 +2658,8 @@ def main(
             err=True,
         )
 
-        # Precompute path sequences and build the union minimizer set so
-        # that AC construction can skip reads that cannot match any path.
+        # Precompute path sequences for the matcher.
         path_seqs: list[np.ndarray] = []
-        path_minimizer_set: set[int] | None = None
         if sampled:
             seg_min, k_from_file = load_segment_minimizers(
                 read_minimizers_prefix,
@@ -3060,54 +2689,22 @@ def main(
             for path, _ in sampled:
                 seq = path_minimizer_sequence(path, seg_min_index, effective_k)
                 path_seqs.append(seq)
-            path_minimizer_set = {int(m) for seq in path_seqs for m in seq}
-            typer.echo(
-                f"Union minimizer set: {len(path_minimizer_set):,} "
-                f"distinct minimizers across {len(sampled)} paths",
-                err=True,
-            )
             del seg_min_index  # not accessed again after path sequences are built
 
-        if ac_prefilter and path_minimizer_set:
-            individually_passing: set[int] = {
-                read_id
-                for name, mids in iter_read_minimizers(read_minimizers_prefix)
-                if (read_id := read_index.name_to_id.get(name)) is not None
-                and mids
-                and all(m in path_minimizer_set for m in mids)
-            }
-            eligible = _compute_eligible(read_index.pairs, individually_passing)
-        else:
-            eligible = None
         read_matcher: ReadMatcher
         if matcher == MatcherMode.exact:
-            read_matcher = build_exact_path_matcher(
+            read_matcher = build_ordered_matcher(
                 path_seqs,
-                iter_read_minimizers(read_minimizers_prefix),
+                lambda: iter_read_minimizers(read_minimizers_prefix),
                 read_index,
-                eligible,
+                n_levels=pseudo_match_levels,
             )
-        elif matcher == MatcherMode.ac:
-            read_matcher = build_aho_corasick(
-                iter_read_minimizers(read_minimizers_prefix),
-                read_index,
-                eligible,
-            )
-        elif matcher == MatcherMode.pseudo_match:
+        else:
             read_matcher = build_pseudo_matcher(
                 path_seqs,
                 lambda: iter_read_minimizers(read_minimizers_prefix),
                 read_index,
-                eligible,
                 n_levels=pseudo_match_levels,
-            )
-        else:
-            read_matcher = build_seed_extender(
-                iter_read_minimizers(read_minimizers_prefix),
-                read_index,
-                eligible,
-                min_chain_score=1.0,
-                max_gap=0,
             )
         typer.echo(read_matcher.describe(), err=True)
         read_index.name_to_id.clear()

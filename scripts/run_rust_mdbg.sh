@@ -1,4 +1,4 @@
-!/usr/bin/env bash
+#!/usr/bin/env bash
 set -euo pipefail
 
 INPUT_DIR="$(cd ../genome-blender_run/multi_genome_full/output && pwd)"
@@ -15,31 +15,41 @@ PAIRED_END=1
 # which allows --interleaved-pairs arithmetic pairing in parse_gfa.py.
 COMBINED="${OUTPUT_DIR}/combined_reads.fastq"
 
+_open() { case "$1" in *.gz) zcat "$1";; *) cat "$1";; esac; }
+_write() { case "${COMBINED}" in *.gz) gzip -c;; *) cat;; esac > "${COMBINED}"; }
+
 if [[ "${PAIRED_END}" -eq 1 ]]; then
     # Detect gzipped output from genome-blender (default: .fastq.gz)
-    R1_FILES=( "${INPUT_DIR}"/*_R1.fastq.gz "${INPUT_DIR}"/*_R1.fastq )
-    R2_FILES=( "${INPUT_DIR}"/*_R2.fastq.gz "${INPUT_DIR}"/*_R2.fastq )
-    # Pick whichever glob expanded (prefer .gz)
-    R1=""; for f in "${R1_FILES[@]}"; do [[ -f "$f" ]] && R1="$f" && break; done
-    R2=""; for f in "${R2_FILES[@]}"; do [[ -f "$f" ]] && R2="$f" && break; done
+    R1=""; for f in "${INPUT_DIR}"/*_R1.fastq.gz "${INPUT_DIR}"/*_R1.fastq; do
+        [[ -f "$f" ]] && R1="$f" && break; done
+    R2=""; for f in "${INPUT_DIR}"/*_R2.fastq.gz "${INPUT_DIR}"/*_R2.fastq; do
+        [[ -f "$f" ]] && R2="$f" && break; done
     if [[ -z "${R1}" || -z "${R2}" ]]; then
         echo "ERROR: could not find R1/R2 FASTQ files in ${INPUT_DIR}" >&2
         exit 1
     fi
+    # Name the combined file to match the input extension
+    case "${R1}" in *.gz) COMBINED="${OUTPUT_DIR}/combined_reads.fastq.gz";;
+                    *)    COMBINED="${OUTPUT_DIR}/combined_reads.fastq";; esac
     echo "Interleaving paired-end reads: ${R1}  +  ${R2}"
     # Interleave: collapse each file to one tab-separated line per record,
     # then alternate records from R1 and R2, then expand back to 4 lines each.
-    _open() { case "$1" in *.gz) zcat "$1";; *) cat "$1";; esac; }
     paste <(paste - - - - < <(_open "${R1}")) \
           <(paste - - - - < <(_open "${R2}")) \
     | awk -F'\t' '{print $1; print $2; print $3; print $4;
                    print $5; print $6; print $7; print $8}' \
-    > "${COMBINED}"
+    | _write
 else
-    # Single-end: accept .fastq.gz or .fastq
-    { for f in "${INPUT_DIR}"/*.fastq.gz; do [[ -f "$f" ]] && zcat "$f"; done
-      for f in "${INPUT_DIR}"/*.fastq;    do [[ -f "$f" ]] && cat  "$f"; done
-    } > "${COMBINED}"
+    # Single-end: prefer .fastq.gz, fall back to .fastq
+    SE_GZ=( "${INPUT_DIR}"/*.fastq.gz )
+    SE_PLAIN=( "${INPUT_DIR}"/*.fastq )
+    if [[ -f "${SE_GZ[0]}" ]]; then
+        COMBINED="${OUTPUT_DIR}/combined_reads.fastq.gz"
+        cat "${SE_GZ[@]}" | _write
+    else
+        COMBINED="${OUTPUT_DIR}/combined_reads.fastq"
+        cat "${SE_PLAIN[@]}" | _write
+    fi
 fi
 
 # rust-mdbg parameters
