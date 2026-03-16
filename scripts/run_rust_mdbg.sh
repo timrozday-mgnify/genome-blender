@@ -15,7 +15,7 @@ PAIRED_END=1
 # which allows --interleaved-pairs arithmetic pairing in parse_gfa.py.
 COMBINED="${OUTPUT_DIR}/combined_reads.fastq"
 
-_open() { case "$1" in *.gz) zcat "$1";; *) cat "$1";; esac; }
+_open() { case "$1" in *.gz) gunzip -c "$1";; *) cat "$1";; esac; }
 _write() { case "${COMBINED}" in *.gz) gzip -c;; *) cat;; esac > "${COMBINED}"; }
 
 if [[ "${PAIRED_END}" -eq 1 ]]; then

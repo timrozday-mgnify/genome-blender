@@ -32,7 +32,8 @@ from enum import Enum
 from pathlib import Path
 from typing import Annotated, Protocol
 
-import lz4.frame
+import lmdb  # type: ignore[import-untyped]
+import lz4.frame  # type: ignore[import-untyped]
 import numpy as np
 
 import rustworkx as rx
@@ -704,134 +705,6 @@ def build_read_index(
     return ReadIndex(n_reads=n_reads, name_to_id=name_to_id, pairs=pairs)
 
 
-# ------------------------------------------------------------------
-# Segment minimizers
-# ------------------------------------------------------------------
-
-
-_SegMinDict = dict[str, tuple[np.ndarray, np.ndarray]]
-"""Mapping of segment name to ``(fwd, rev)`` uint64 numpy arrays.
-
-Both arrays are 1-D and contiguous.  ``rev`` is the reversed copy of
-``fwd``, precomputed once so that path traversal never needs to reverse
-at query time.
-"""
-
-
-def load_segment_minimizers(
-    prefix: Path,
-) -> tuple[_SegMinDict, int | None]:
-    """Load per-segment minimizer IDs from rust-mdbg ``.sequences`` files.
-
-    Reads all ``{prefix}.*.sequences`` LZ4-compressed files.  Each
-    non-comment line has the format::
-
-        node_name<TAB>[hash1, hash2, ...]<TAB>sequence<TAB>...
-
-    The node name matches the GFA S-record segment name exactly.  The
-    ``k`` value is extracted from the ``# k = N`` header comment in the
-    first file that contains it.
-
-    For each segment both the forward and the reversed minimizer arrays
-    are precomputed and stored as contiguous ``uint64`` numpy arrays so
-    that path construction never needs to perform a reversal at query
-    time.
-
-    Args:
-        prefix: rust-mdbg output prefix (e.g. ``Path("rust_mdbg_out")``).
-
-    Returns:
-        Tuple of ``(segment_minimizers, k)`` where *segment_minimizers*
-        maps each segment name to a ``(fwd, rev)`` pair of uint64 numpy
-        arrays, and *k* is the k-mer size read from the file header
-        (``None`` if the header line is absent).
-    """
-    pattern = str(prefix) + ".*.sequences"
-    files = sorted(glob.glob(pattern))
-    if not files:
-        logger.warning(
-            "No .sequences files found for prefix: %s", prefix,
-        )
-        return {}, None
-
-    seg_min: _SegMinDict = {}
-    k: int | None = None
-
-    with Progress(*_PROGRESS_COLUMNS) as progress:
-        task = progress.add_task(
-            "Loading segment minimizers", total=len(files),
-        )
-        for fpath in files:
-            raw = lz4.frame.decompress(Path(fpath).read_bytes())
-            for line in io.TextIOWrapper(
-                io.BytesIO(raw), encoding="utf-8",
-            ):
-                line = line.rstrip("\n")
-                if not line:
-                    continue
-                if line.startswith("# k = ") and k is None:
-                    try:
-                        k = int(line[6:].split()[0])
-                    except ValueError:
-                        pass
-                    continue
-                if line.startswith("#"):
-                    continue
-                parts = line.split("\t")
-                if len(parts) < 2:
-                    continue
-                node_name = parts[0]
-                bracket = parts[1].strip()
-                if bracket.startswith("[") and bracket.endswith("]"):
-                    fwd = np.fromiter(
-                        (
-                            int(x.strip())
-                            for x in bracket[1:-1].split(",")
-                            if x.strip()
-                        ),
-                        dtype=np.uint64,
-                    )
-                else:
-                    fwd = np.empty(0, dtype=np.uint64)
-                seg_min[node_name] = (fwd, fwd[::-1].copy())
-            progress.advance(task)
-
-    logger.info(
-        "Loaded minimizers for %d segments from %s.* (k=%s)",
-        len(seg_min), prefix, k,
-    )
-    return seg_min, k
-
-
-def build_seg_min_index(
-    graph: rx.PyGraph,
-    seg_min: _SegMinDict,
-) -> list[tuple[np.ndarray, np.ndarray] | None]:
-    """Build a node-index-keyed list for O(1) minimizer lookup.
-
-    Returns a list where position *i* holds the ``(fwd, rev)`` arrays
-    for graph node *i*, or ``None`` if the segment has no minimizer data.
-    The list length equals the number of graph nodes, so lookups use
-    a direct integer index rather than a string dict lookup.
-
-    Args:
-        graph: Parsed GFA graph.
-        seg_min: Output of :func:`load_segment_minimizers`.
-
-    Returns:
-        List of ``(fwd, rev)`` array pairs indexed by graph node index,
-        with ``None`` for segments absent from *seg_min*.
-    """
-    n = graph.num_nodes()
-    index: list[tuple[np.ndarray, np.ndarray] | None] = [None] * n
-    for node_idx in graph.node_indices():
-        seg: Segment = graph[node_idx]
-        pair = seg_min.get(seg.name)
-        if pair is not None:
-            index[node_idx] = pair
-    return index
-
-
 def path_minimizer_sequence(
     path: _OrientedPath,
     seg_min_index: list[tuple[np.ndarray, np.ndarray] | None],
@@ -854,7 +727,7 @@ def path_minimizer_sequence(
         path: Ordered list of ``(node_idx, is_forward)`` pairs as
             returned by :func:`_random_simple_path`.
         seg_min_index: Node-index-keyed list of ``(fwd, rev)`` uint64
-            arrays from :func:`build_seg_min_index`.
+            arrays from :func:`build_seg_min_index_from_lmdb`.
         k: rust-mdbg k-mer size (overlap between adjacent segments is
             *k* − 1 minimizers).
 
@@ -873,6 +746,331 @@ def path_minimizer_sequence(
     if not parts:
         return np.empty(0, dtype=np.uint64)
     return np.concatenate(parts)
+
+
+# ------------------------------------------------------------------
+# Unified on-disk LMDB index
+# ------------------------------------------------------------------
+
+_LMDB_MAP_SIZE: int = 128 * 1024**3   # 128 GiB virtual address space
+_LMDB_MAX_DBS: int = 6
+
+_DB_META  = b"meta"   # metadata
+_DB_READS = b"reads"  # read_name → packed u64 minimizer IDs
+_DB_SEGS  = b"segs"   # seg_name  → packed u64 fwd minimizer IDs
+_DB_KINV  = b"kinv"   # (k, kmer) → packed (read_id u32, read_pos u32) pairs
+_DB_KCNT  = b"kcnt"   # (read_id u32, k u8) → n_distinct_kmers u16
+
+_META_K_LEVELS = b"k_levels"
+_META_N_READS  = b"n_reads"
+_META_SEG_K    = b"seg_k"
+_META_N_LEVELS = b"n_levels"
+
+
+def _kinv_key(k: int, kmer: tuple[int, ...]) -> bytes:
+    """Pack a k-mer into an LMDB kinv key."""
+    return struct.pack(f"<B{k}Q", k, *kmer)
+
+
+def _kcnt_key(read_id: int, k: int) -> bytes:
+    """Pack a (read_id, k) pair into an LMDB kcnt key."""
+    return struct.pack("<IB", read_id, k)
+
+
+def _check_lmdb_valid(
+    db_path: Path, n_reads: int, n_levels: int,
+) -> tuple[bool, list[int], int | None]:
+    """Return (is_valid, k_levels, seg_k) from an existing LMDB index.
+
+    Returns (False, [], None) if the index is absent, corrupt, or
+    was built with different *n_reads* / *n_levels* parameters.
+
+    Args:
+        db_path: LMDB environment directory.
+        n_reads: Expected number of reads (from :class:`ReadIndex`).
+        n_levels: Expected number of k levels.
+
+    Returns:
+        Tuple of (is_valid, k_levels, seg_k).
+    """
+    if not db_path.exists():
+        return False, [], None
+    try:
+        env = lmdb.open(
+            str(db_path), readonly=True, lock=False,
+            max_dbs=_LMDB_MAX_DBS, map_size=_LMDB_MAP_SIZE,
+        )
+        meta_db = env.open_db(_DB_META)
+        with env.begin() as txn:
+            nr  = txn.get(_META_N_READS,  db=meta_db)
+            kl  = txn.get(_META_K_LEVELS, db=meta_db)
+            nl  = txn.get(_META_N_LEVELS, db=meta_db)
+            sk  = txn.get(_META_SEG_K,    db=meta_db)
+        env.close()
+        if not (nr and kl and nl):
+            return False, [], None
+        if struct.unpack("<Q", nr)[0] != n_reads:
+            return False, [], None
+        if struct.unpack("<H", nl)[0] != n_levels:
+            return False, [], None
+        k_levels: list[int] = json.loads(kl.decode())
+        raw_sk = struct.unpack("<h", sk)[0] if sk else -1
+        seg_k: int | None = raw_sk if raw_sk != -1 else None
+        return True, k_levels, seg_k
+    except Exception as exc:
+        logger.warning("Cannot read LMDB index at %s: %s", db_path, exc)
+        return False, [], None
+
+
+def build_lmdb_index(
+    db_path: Path,
+    read_prefix: Path,
+    index: ReadIndex,
+    n_levels: int = 5,
+) -> tuple[list[int], int | None]:
+    """Build (or reuse) the unified on-disk LMDB index.
+
+    Stores three datasets in named sub-databases within one LMDB
+    environment:
+
+    * ``reads`` — per-read minimizer ID arrays from ``.read_minimizers``.
+    * ``segs``  — per-segment forward minimizer arrays from ``.sequences``.
+    * ``kinv`` / ``kcnt`` — inverted k-mer index for read-to-path matching.
+
+    If *db_path* already contains a valid index (matching *n_reads* and
+    *n_levels*) it is returned without rebuilding.
+
+    Args:
+        db_path: Destination directory for the LMDB environment.
+        read_prefix: rust-mdbg output prefix.
+        index: :class:`ReadIndex` supplying the name-to-ID mapping.
+        n_levels: Number of k-mer size levels for the matching index.
+
+    Returns:
+        Tuple of ``(k_levels, seg_k)``.
+    """
+    valid, k_levels, seg_k = _check_lmdb_valid(
+        db_path, index.n_reads, n_levels,
+    )
+    if valid:
+        logger.info(
+            "Reusing LMDB index at %s (k_levels=%s, seg_k=%s)",
+            db_path, k_levels, seg_k,
+        )
+        return k_levels, seg_k
+
+    logger.info("Building LMDB index at %s", db_path)
+    db_path.mkdir(parents=True, exist_ok=True)
+    env = lmdb.open(
+        str(db_path),
+        map_size=_LMDB_MAP_SIZE,
+        max_dbs=_LMDB_MAX_DBS,
+        sync=False,
+        writemap=True,
+    )
+    reads_db = env.open_db(_DB_READS)
+    segs_db  = env.open_db(_DB_SEGS)
+    kinv_db  = env.open_db(_DB_KINV)
+    kcnt_db  = env.open_db(_DB_KCNT)
+    meta_db  = env.open_db(_DB_META)
+
+    _BATCH = 20_000
+
+    # -- Stage 1: .read_minimizers → reads sub-db; track length range --------
+    min_len = 10 ** 9
+    max_len = 0
+    rm_files = sorted(glob.glob(str(read_prefix) + ".*.read_minimizers"))
+    compact_map = _maybe_load_compact_map(read_prefix)
+
+    with Progress(*_PROGRESS_COLUMNS) as progress:
+        task = progress.add_task(
+            "LMDB: read minimizers", total=len(rm_files),
+        )
+        for fpath in rm_files:
+            raw = lz4.frame.decompress(Path(fpath).read_bytes())
+            with env.begin(write=True) as txn:
+                for read_name, mids in _iter_binary_rm(raw, compact_map):
+                    read_id = index.name_to_id.get(read_name)
+                    if read_id is None:
+                        continue
+                    n = len(mids)
+                    if n:
+                        min_len = min(min_len, n)
+                        max_len = max(max_len, n)
+                    val = struct.pack(f"<{n}Q", *mids) if n else b""
+                    txn.put(read_name.encode(), val, db=reads_db)
+            progress.advance(task)
+
+    # -- Stage 2: .sequences → segs sub-db; extract k -----------------------
+    seg_k_found: int | None = None
+    seq_files = sorted(glob.glob(str(read_prefix) + ".*.sequences"))
+
+    with Progress(*_PROGRESS_COLUMNS) as progress:
+        task = progress.add_task(
+            "LMDB: segment minimizers", total=len(seq_files),
+        )
+        for fpath in seq_files:
+            raw = lz4.frame.decompress(Path(fpath).read_bytes())
+            with env.begin(write=True) as txn:
+                for line in io.TextIOWrapper(io.BytesIO(raw), encoding="utf-8"):
+                    line = line.rstrip("\n")
+                    if not line:
+                        continue
+                    if line.startswith("# k = ") and seg_k_found is None:
+                        try:
+                            seg_k_found = int(line[6:].split()[0])
+                        except ValueError:
+                            pass
+                        continue
+                    if line.startswith("#"):
+                        continue
+                    parts = line.split("\t")
+                    if len(parts) < 2:
+                        continue
+                    bracket = parts[1].strip()
+                    seg_mids = (
+                        [int(x.strip()) for x in bracket[1:-1].split(",") if x.strip()]
+                        if bracket.startswith("[") and bracket.endswith("]")
+                        else []
+                    )
+                    val = struct.pack(f"<{len(seg_mids)}Q", *seg_mids) if seg_mids else b""
+                    txn.put(parts[0].encode(), val, db=segs_db)
+            progress.advance(task)
+
+    # -- Stage 3: reads sub-db → kinv + kcnt sub-dbs ------------------------
+    if max_len == 0:
+        logger.warning("No reads with minimizers; k-mer index will be empty.")
+        k_levels = []
+    else:
+        k_levels = _compute_k_levels(min_len, max_len, n_levels)
+    logger.info("LMDB k levels: %s", k_levels)
+
+    if k_levels:
+        inv_acc: dict[bytes, list[int]] = {}
+        cnt_acc: dict[bytes, int] = {}
+        n_processed = 0
+
+        with Progress(*_PROGRESS_COLUMNS) as progress:
+            task = progress.add_task(
+                "LMDB: k-mer index", total=index.n_reads,
+            )
+            with env.begin() as rtxn:
+                cursor = rtxn.cursor(db=reads_db)
+                for name_bytes, val_bytes in cursor:
+                    read_name = name_bytes.decode()
+                    read_id = index.name_to_id.get(read_name)
+                    if read_id is None:
+                        progress.advance(task)
+                        continue
+                    n = len(val_bytes) // 8
+                    mids: tuple[int, ...] = (
+                        struct.unpack(f"<{n}Q", val_bytes) if n else ()
+                    )
+                    k = _floor_k_level(n, k_levels)
+                    if k is not None and mids:
+                        seen: dict[tuple[int, ...], int] = {}
+                        for pos in range(n - k + 1):
+                            km = tuple(mids[pos:pos + k])
+                            if km not in seen:
+                                seen[km] = pos
+                        for km, pos in seen.items():
+                            ikey = _kinv_key(k, km)
+                            entry = inv_acc.setdefault(ikey, [])
+                            entry.append(read_id)
+                            entry.append(pos)
+                        cnt_acc[_kcnt_key(read_id, k)] = len(seen)
+                    n_processed += 1
+                    progress.advance(task)
+
+                    if n_processed % _BATCH == 0:
+                        with env.begin(write=True) as wtxn:
+                            for ikey, flat in inv_acc.items():
+                                existing = wtxn.get(ikey, db=kinv_db) or b""
+                                wtxn.put(
+                                    ikey,
+                                    existing + struct.pack(f"<{len(flat)}I", *flat),
+                                    db=kinv_db,
+                                )
+                            for ckey, cnt in cnt_acc.items():
+                                wtxn.put(
+                                    ckey,
+                                    struct.pack("<H", min(cnt, 65535)),
+                                    db=kcnt_db,
+                                )
+                        inv_acc.clear()
+                        cnt_acc.clear()
+
+        if inv_acc or cnt_acc:
+            with env.begin(write=True) as wtxn:
+                for ikey, flat in inv_acc.items():
+                    existing = wtxn.get(ikey, db=kinv_db) or b""
+                    wtxn.put(
+                        ikey,
+                        existing + struct.pack(f"<{len(flat)}I", *flat),
+                        db=kinv_db,
+                    )
+                for ckey, cnt in cnt_acc.items():
+                    wtxn.put(
+                        ckey, struct.pack("<H", min(cnt, 65535)), db=kcnt_db,
+                    )
+
+    # -- Stage 4: metadata ---------------------------------------------------
+    with env.begin(write=True) as txn:
+        txn.put(_META_K_LEVELS, json.dumps(k_levels).encode(), db=meta_db)
+        txn.put(_META_N_READS,  struct.pack("<Q", index.n_reads),  db=meta_db)
+        txn.put(_META_SEG_K,
+                struct.pack("<h", seg_k_found if seg_k_found is not None else -1),
+                db=meta_db)
+        txn.put(_META_N_LEVELS, struct.pack("<H", n_levels), db=meta_db)
+
+    env.sync()
+    env.close()
+    logger.info("LMDB index built at %s", db_path)
+    return k_levels, seg_k_found
+
+
+def build_seg_min_index_from_lmdb(
+    graph: rx.PyGraph,
+    lmdb_env: lmdb.Environment,
+) -> list[tuple[np.ndarray, np.ndarray] | None]:
+    """Build a node-indexed segment minimizer list directly from the LMDB index.
+
+    Replaces :func:`load_segment_minimizers` + :func:`build_seg_min_index`
+    by querying the ``segs`` sub-database rather than re-reading the
+    ``.sequences`` files, eliminating the intermediate in-memory dict.
+
+    Args:
+        graph: Parsed GFA graph.
+        lmdb_env: Open LMDB environment (from :func:`build_lmdb_index`).
+
+    Returns:
+        List of ``(fwd, rev)`` uint64 array pairs indexed by graph node
+        index, with ``None`` for segments absent from the index.
+    """
+    segs_db = lmdb_env.open_db(_DB_SEGS)
+    n = graph.num_nodes()
+    result: list[tuple[np.ndarray, np.ndarray] | None] = [None] * n
+    n_found = 0
+
+    with lmdb_env.begin() as txn:
+        for node_idx in graph.node_indices():
+            seg: Segment = graph[node_idx]
+            val = txn.get(seg.name.encode(), db=segs_db)
+            if val is None:
+                continue
+            n_mids = len(val) // 8
+            if n_mids:
+                fwd = np.frombuffer(val, dtype=np.uint64).copy()
+                result[node_idx] = (fwd, fwd[::-1].copy())
+            else:
+                empty = np.empty(0, dtype=np.uint64)
+                result[node_idx] = (empty, empty)
+            n_found += 1
+
+    logger.info(
+        "Loaded minimizers for %d/%d segments from LMDB", n_found, n,
+    )
+    return result
 
 
 # ------------------------------------------------------------------
@@ -956,109 +1154,6 @@ def _floor_k_level(read_len: int, k_levels: list[int]) -> int | None:
     return best
 
 
-def _build_ordered_path_index(
-    path_seqs: list[np.ndarray],
-    k_levels: list[int],
-) -> dict[int, dict[tuple[int, ...], dict[int, list[int]]]]:
-    """Build a positional inverted index for ordered k-mer matching.
-
-    For each k level and each k-mer that appears in any path, records the
-    sorted list of positions where that k-mer occurs within each path.
-
-    Args:
-        path_seqs: Minimizer ID arrays for the sampled paths.
-        k_levels: Distinct k values to index.
-
-    Returns:
-        Mapping ``k → kmer_tuple → {path_idx: [sorted positions]}``.
-    """
-    index: dict[int, dict[tuple[int, ...], dict[int, list[int]]]] = {}
-    for k in k_levels:
-        k_index: dict[tuple[int, ...], dict[int, list[int]]] = {}
-        for path_idx, seq in enumerate(path_seqs):
-            n = len(seq)
-            if n < k:
-                continue
-            for pos in range(n - k + 1):
-                kmer = tuple(int(m) for m in seq[pos:pos + k])
-                k_index.setdefault(kmer, {}).setdefault(path_idx, []).append(pos)
-        index[k] = k_index
-    return index
-
-
-def _ordered_match_read(
-    read_mids: tuple[int, ...],
-    path_index: dict[int, dict[tuple[int, ...], dict[int, list[int]]]],
-    k_levels: list[int],
-    read_id: int,
-    path_lens: list[int],
-) -> list[tuple[int, PathMatch]]:
-    """Return paths where read k-mers appear in the same order as in the read.
-
-    Uses the k level whose size is the largest value ≤ the number of read
-    minimizers (floor assignment).  Candidate paths are those containing all
-    read k-mers (set intersection); each candidate is then verified by a
-    greedy left-to-right scan that requires path positions to be strictly
-    increasing (subsequence check).
-
-    Args:
-        read_mids: Ordered minimizer IDs for the read.
-        path_index: Positional inverted index from
-            :func:`_build_ordered_path_index`.
-        k_levels: Sorted list of indexed k values.
-        read_id: Integer read ID to embed in match records.
-        path_lens: Minimizer lengths of each path (for ``PathMatch`` bounds).
-
-    Returns:
-        List of ``(path_idx, PathMatch)`` for every ordered occurrence.
-    """
-    k = _floor_k_level(len(read_mids), k_levels)
-    if k is None:
-        return []
-    n = len(read_mids)
-    read_kmers = [tuple(read_mids[i:i + k]) for i in range(n - k + 1)]
-    if not read_kmers:
-        return []
-    k_index = path_index.get(k, {})
-
-    # Candidate paths: those that contain every read k-mer.
-    candidate_paths: set[int] | None = None
-    for km in read_kmers:
-        hits = k_index.get(km)
-        if hits is None:
-            return []
-        if candidate_paths is None:
-            candidate_paths = set(hits.keys())
-        else:
-            candidate_paths &= hits.keys()
-        if not candidate_paths:
-            return []
-
-    matches: list[tuple[int, PathMatch]] = []
-    for path_idx in candidate_paths:
-        # Greedy subsequence check: for each read k-mer in order, advance
-        # to the smallest path position that is strictly after the last.
-        last_pos = -1
-        valid = True
-        for km in read_kmers:
-            positions = k_index[km][path_idx]
-            idx = bisect.bisect_right(positions, last_pos)
-            if idx >= len(positions):
-                valid = False
-                break
-            last_pos = positions[idx]
-        if valid:
-            matches.append((
-                path_idx,
-                PathMatch(
-                    read_id=read_id,
-                    path_start=0,
-                    path_end=path_lens[path_idx],
-                ),
-            ))
-    return matches
-
-
 class OrderedMatchMatcher:
     """Read-to-path matcher using ordered k-mer subsequence matching.
 
@@ -1123,180 +1218,125 @@ class OrderedMatchMatcher:
 
 def build_ordered_matcher(
     path_seqs: list[np.ndarray],
-    minimizer_iter_factory: Callable[[], Iterable[tuple[str, tuple[int, ...]]]],
+    lmdb_env: lmdb.Environment,
+    k_levels: list[int],
     index: ReadIndex,
     eligible: set[int] | None = None,
-    n_levels: int = 5,
 ) -> OrderedMatchMatcher:
-    """Build an :class:`OrderedMatchMatcher` with a two-pass streaming approach.
+    """Build an :class:`OrderedMatchMatcher` by querying the on-disk LMDB index.
 
-    Pass 1 scans read lengths to determine the k-level boundaries.
-    The path positional index is then built for those levels.  Pass 2 streams
-    reads again and checks each against the path index via ordered k-mer
-    subsequence matching.
+    For each sampled path at each k level, builds an in-memory positional
+    k-mer map, then queries the LMDB inverted index for candidate reads.
+    Each candidate is verified by a greedy subsequence check: the read's
+    k-mers (in their original order, reconstructed from LMDB positions)
+    must appear at strictly increasing positions in the path.
 
-    Both forward and reversed orientations are tested; each
-    ``(read_id, path_idx)`` pair is recorded at most once.
+    No streaming over read minimizer files is performed after the LMDB
+    index has been built.
 
     Args:
         path_seqs: Minimizer sequences for the sampled paths.
-        minimizer_iter_factory: Callable that returns a fresh
-            ``(read_name, minimizer_ids)`` iterator on each invocation;
-            called twice for the two streaming passes.
-        index: :class:`ReadIndex` providing the name-to-ID mapping.
+        lmdb_env: Open LMDB environment from :func:`build_lmdb_index`.
+        k_levels: K values loaded from LMDB metadata.
+        index: :class:`ReadIndex` for read-count reporting.
         eligible: Optional set of read IDs to include; others skipped.
-        n_levels: Number of distinct k values to index, evenly spaced
-            from the minimum to the maximum observed read length.
 
     Returns:
         An :class:`OrderedMatchMatcher` with all matches pre-computed,
         ready for sequential :meth:`~OrderedMatchMatcher.search_path` calls.
     """
-    # -- Pass 1: determine the read-length range for k-level boundaries ------
-    min_len = 10 ** 9
-    max_len = 0
-    with Progress(*_PROGRESS_COLUMNS) as progress:
-        task = progress.add_task(
-            "Scanning read lengths (ordered-match)", total=index.n_reads,
-        )
-        for read_name, read_mids in minimizer_iter_factory():
-            read_id = index.name_to_id.get(read_name)
-            if read_id is None:
-                continue
-            n = len(read_mids)
-            if n > 0 and (eligible is None or read_id in eligible):
-                if n < min_len:
-                    min_len = n
-                if n > max_len:
-                    max_len = n
-            progress.advance(task)
-
-    if max_len == 0:
-        logger.warning("No eligible reads with minimizers found; returning empty matcher.")
+    if not k_levels:
+        logger.warning("No k levels; returning empty ordered matcher.")
         return OrderedMatchMatcher([[] for _ in path_seqs], 0, [], 0)
 
-    k_levels = _compute_k_levels(min_len, max_len, n_levels)
-    logger.info("Ordered-match k levels: %s", k_levels)
-
-    # -- Build the path positional k-mer index for each level ----------------
-    path_index = _build_ordered_path_index(path_seqs, k_levels)
+    kinv_db = lmdb_env.open_db(_DB_KINV)
+    kcnt_db = lmdb_env.open_db(_DB_KCNT)
     path_lens = [len(seq) for seq in path_seqs]
-
-    # -- Pass 2: stream reads and match against the path index ---------------
     per_path: list[list[PathMatch]] = [[] for _ in path_seqs]
     seen_matches: set[tuple[int, int]] = set()
     n_total = 0
-    n_indexed = 0
-    with Progress(*_PROGRESS_COLUMNS) as progress:
+
+    with lmdb_env.begin() as txn, Progress(*_PROGRESS_COLUMNS) as progress:
         task = progress.add_task(
-            "Building ordered-match index", total=index.n_reads,
+            "Ordered-match (LMDB)", total=len(path_seqs),
         )
-        for read_name, read_mids in minimizer_iter_factory():
-            read_id = index.name_to_id.get(read_name)
-            if read_id is None:
-                continue
-            progress.advance(task)
-            if eligible is not None and read_id not in eligible:
-                continue
-            if not read_mids:
-                continue
-            n_indexed += 1
-            rev_mids: tuple[int, ...] = read_mids[::-1]
-            orientations = (read_mids, rev_mids) if rev_mids != read_mids else (read_mids,)
-            for mids in orientations:
-                for path_idx, match in _ordered_match_read(
-                    mids, path_index, k_levels, read_id, path_lens,
-                ):
-                    key = (read_id, path_idx)
+        for path_idx, seq in enumerate(path_seqs):
+            for k in k_levels:
+                n_seq = len(seq)
+                if n_seq < k:
+                    continue
+
+                # Per-path positional index: kmer → sorted positions in path
+                path_kmer_pos: dict[tuple[int, ...], list[int]] = {}
+                for pos in range(n_seq - k + 1):
+                    km = tuple(int(m) for m in seq[pos:pos + k])
+                    path_kmer_pos.setdefault(km, []).append(pos)
+                path_kmer_set = set(path_kmer_pos.keys())
+
+                # Collect candidate reads and their (kmer, read_pos) hits
+                # candidate_hits: read_id → [(km, read_pos)]
+                candidate_hits: dict[int, list[tuple[tuple[int, ...], int]]] = {}
+                candidate_counts: dict[int, int] = {}
+                for km in path_kmer_set:
+                    inv_data = txn.get(_kinv_key(k, km), db=kinv_db)
+                    if inv_data is None:
+                        continue
+                    arr = np.frombuffer(inv_data, dtype=np.uint32).reshape(-1, 2)
+                    for row in arr:
+                        rid = int(row[0])
+                        rpos = int(row[1])
+                        if eligible is not None and rid not in eligible:
+                            continue
+                        candidate_counts[rid] = candidate_counts.get(rid, 0) + 1
+                        candidate_hits.setdefault(rid, []).append((km, rpos))
+
+                for rid, match_count in candidate_counts.items():
+                    cnt_data = txn.get(_kcnt_key(rid, k), db=kcnt_db)
+                    if cnt_data is None:
+                        continue
+                    n_total_kmers = struct.unpack("<H", cnt_data)[0]
+                    if match_count != n_total_kmers:
+                        continue
+                    # All read k-mers in path (pseudo-match passed).
+                    # Now verify order: read k-mers by read_pos must map
+                    # to strictly increasing path positions.
+                    hits_sorted = sorted(
+                        candidate_hits[rid], key=lambda x: x[1],
+                    )
+                    last_path_pos = -1
+                    valid = True
+                    for km, _ in hits_sorted:
+                        positions = path_kmer_pos[km]
+                        idx = bisect.bisect_right(positions, last_path_pos)
+                        if idx >= len(positions):
+                            valid = False
+                            break
+                        last_path_pos = positions[idx]
+                    if not valid:
+                        continue
+                    key = (rid, path_idx)
                     if key not in seen_matches:
                         seen_matches.add(key)
-                        per_path[path_idx].append(match)
+                        per_path[path_idx].append(
+                            PathMatch(
+                                read_id=rid,
+                                path_start=0,
+                                path_end=path_lens[path_idx],
+                            )
+                        )
                         n_total += 1
+            progress.advance(task)
 
     logger.info(
-        "Ordered-match: %d total match events across %d paths, %d reads indexed",
-        n_total, len(path_seqs), n_indexed,
+        "Ordered-match (LMDB): %d total match events across %d paths",
+        n_total, len(path_seqs),
     )
-    return OrderedMatchMatcher(per_path, n_total, k_levels, n_indexed)
+    return OrderedMatchMatcher(per_path, n_total, k_levels, index.n_reads)
 
 
 # ------------------------------------------------------------------
 # Pseudo-match matcher (unordered k-mer set membership)
 # ------------------------------------------------------------------
-
-
-def _build_pseudo_path_index(
-    path_seqs: list[np.ndarray],
-    k_levels: list[int],
-) -> dict[int, dict[tuple[int, ...], set[int]]]:
-    """Build an inverted k-mer index over sampled paths for each k level.
-
-    Args:
-        path_seqs: Minimizer ID arrays for each sampled path.
-        k_levels: Distinct k values to index.
-
-    Returns:
-        Mapping ``k → kmer_tuple → {path_idx, …}`` covering every k-mer
-        present in any sampled path at each level.
-    """
-    index: dict[int, dict[tuple[int, ...], set[int]]] = {}
-    for k in k_levels:
-        kmer_map: dict[tuple[int, ...], set[int]] = {}
-        for path_idx, seq in enumerate(path_seqs):
-            for i in range(len(seq) - k + 1):
-                kmer: tuple[int, ...] = tuple(int(seq[i + j]) for j in range(k))
-                kmer_map.setdefault(kmer, set()).add(path_idx)
-        index[k] = kmer_map
-    return index
-
-
-def _pseudo_match_read(
-    read_mids: tuple[int, ...],
-    path_index: dict[int, dict[tuple[int, ...], set[int]]],
-    k_levels: list[int],
-    read_id: int,
-    path_lens: list[int],
-) -> list[tuple[int, PathMatch]]:
-    """Find paths that contain every k-mer of *read_mids* (unordered).
-
-    Selects the largest k ≤ len(read_mids) from k_levels, generates all
-    consecutive k-mers from the read, then intersects the candidate path
-    sets from the inverted index.  A path matches when it contains all
-    k-mers; positional order within the path is not required.
-
-    Args:
-        read_mids: Tuple of minimizer IDs for the read.
-        path_index: Inverted index from :func:`_build_pseudo_path_index`.
-        k_levels: Sorted list of k values matching those in path_index.
-        read_id: Integer read ID to embed in match records.
-        path_lens: Minimizer-sequence length of each path, used as the
-            placeholder ``path_end`` in returned :class:`PathMatch` records.
-
-    Returns:
-        List of ``(path_idx, PathMatch)`` for every matching path.
-    """
-    k = _floor_k_level(len(read_mids), k_levels)
-    if k is None:
-        return []
-    kmer_map = path_index[k]
-    candidate_paths: set[int] | None = None
-    for i in range(len(read_mids) - k + 1):
-        kmer: tuple[int, ...] = read_mids[i:i + k]
-        paths_for_kmer = kmer_map.get(kmer)
-        if not paths_for_kmer:
-            return []
-        if candidate_paths is None:
-            candidate_paths = set(paths_for_kmer)
-        else:
-            candidate_paths &= paths_for_kmer
-            if not candidate_paths:
-                return []
-    if candidate_paths is None:
-        return []
-    return [
-        (path_idx, PathMatch(read_id=read_id, path_start=0, path_end=path_lens[path_idx]))
-        for path_idx in candidate_paths
-    ]
 
 
 class PseudoMatchMatcher:
@@ -1361,102 +1401,99 @@ class PseudoMatchMatcher:
 
 def build_pseudo_matcher(
     path_seqs: list[np.ndarray],
-    minimizer_iter_factory: Callable[[], Iterable[tuple[str, tuple[int, ...]]]],
+    lmdb_env: lmdb.Environment,
+    k_levels: list[int],
     index: ReadIndex,
     eligible: set[int] | None = None,
-    n_levels: int = 5,
 ) -> PseudoMatchMatcher:
-    """Build a :class:`PseudoMatchMatcher` with a two-pass streaming approach.
+    """Build a :class:`PseudoMatchMatcher` by querying the on-disk LMDB index.
 
-    Pass 1 scans read lengths to determine the k-level boundaries, which
-    span from the minimum to the maximum observed eligible read length.
-    The path k-mer index is then built for those levels.  Pass 2 streams
-    reads again and checks each against the path index via unordered
-    k-mer set membership.
+    For each sampled path at each k level, builds an in-memory k-mer set,
+    then queries the LMDB inverted index for candidate reads.  A candidate
+    matches when the number of its distinct k-mers found in the path equals
+    its total distinct k-mer count (stored in the ``kcnt`` sub-database).
 
-    Both forward and reversed orientations are tested; each
-    ``(read_id, path_idx)`` pair is recorded at most once.
+    No streaming over read minimizer files is performed after the LMDB
+    index has been built.
 
     Args:
         path_seqs: Minimizer sequences for the sampled paths.
-        minimizer_iter_factory: Callable that returns a fresh
-            ``(read_name, minimizer_ids)`` iterator on each invocation;
-            called twice for the two streaming passes.
-        index: :class:`ReadIndex` providing the name-to-ID mapping.
+        lmdb_env: Open LMDB environment from :func:`build_lmdb_index`.
+        k_levels: K values loaded from LMDB metadata.
+        index: :class:`ReadIndex` for read-count reporting.
         eligible: Optional set of read IDs to include; others skipped.
-        n_levels: Number of distinct k values to index, evenly spaced
-            from the minimum to the maximum observed read length.
 
     Returns:
         A :class:`PseudoMatchMatcher` with all matches pre-computed,
         ready for sequential :meth:`~PseudoMatchMatcher.search_path` calls.
     """
-    # -- Pass 1: determine the read-length range for k-level boundaries ------
-    min_len = 10 ** 9
-    max_len = 0
-    with Progress(*_PROGRESS_COLUMNS) as progress:
-        task = progress.add_task(
-            "Scanning read lengths (pseudo-match)", total=index.n_reads,
-        )
-        for read_name, read_mids in minimizer_iter_factory():
-            read_id = index.name_to_id.get(read_name)
-            if read_id is None:
-                continue
-            n = len(read_mids)
-            if n > 0 and (eligible is None or read_id in eligible):
-                if n < min_len:
-                    min_len = n
-                if n > max_len:
-                    max_len = n
-            progress.advance(task)
-
-    if max_len == 0:
-        logger.warning("No eligible reads with minimizers found; returning empty matcher.")
+    if not k_levels:
+        logger.warning("No k levels; returning empty pseudo-match matcher.")
         return PseudoMatchMatcher([[] for _ in path_seqs], 0, [], 0)
 
-    k_levels = _compute_k_levels(min_len, max_len, n_levels)
-    logger.info("Pseudo-match k levels: %s", k_levels)
-
-    # -- Build the path k-mer index for each level ---------------------------
-    path_index = _build_pseudo_path_index(path_seqs, k_levels)
+    kinv_db = lmdb_env.open_db(_DB_KINV)
+    kcnt_db = lmdb_env.open_db(_DB_KCNT)
     path_lens = [len(seq) for seq in path_seqs]
-
-    # -- Pass 2: stream reads and match against the path index ---------------
     per_path: list[list[PathMatch]] = [[] for _ in path_seqs]
     seen_matches: set[tuple[int, int]] = set()
     n_total = 0
-    n_indexed = 0
-    with Progress(*_PROGRESS_COLUMNS) as progress:
+
+    with lmdb_env.begin() as txn, Progress(*_PROGRESS_COLUMNS) as progress:
         task = progress.add_task(
-            "Building pseudo-match index", total=index.n_reads,
+            "Pseudo-match (LMDB)", total=len(path_seqs),
         )
-        for read_name, read_mids in minimizer_iter_factory():
-            read_id = index.name_to_id.get(read_name)
-            if read_id is None:
-                continue
-            progress.advance(task)
-            if eligible is not None and read_id not in eligible:
-                continue
-            if not read_mids:
-                continue
-            n_indexed += 1
-            rev_mids: tuple[int, ...] = read_mids[::-1]
-            orientations = (read_mids, rev_mids) if rev_mids != read_mids else (read_mids,)
-            for mids in orientations:
-                for path_idx, match in _pseudo_match_read(
-                    mids, path_index, k_levels, read_id, path_lens,
-                ):
-                    key = (read_id, path_idx)
+        for path_idx, seq in enumerate(path_seqs):
+            for k in k_levels:
+                n_seq = len(seq)
+                if n_seq < k:
+                    continue
+
+                # Build path k-mer set at this level
+                path_kmer_set: set[tuple[int, ...]] = set()
+                for pos in range(n_seq - k + 1):
+                    path_kmer_set.add(
+                        tuple(int(m) for m in seq[pos:pos + k])
+                    )
+
+                # Collect candidate reads: count matching k-mers per read_id
+                candidate_counts: dict[int, int] = {}
+                for km in path_kmer_set:
+                    inv_data = txn.get(_kinv_key(k, km), db=kinv_db)
+                    if inv_data is None:
+                        continue
+                    arr = np.frombuffer(inv_data, dtype=np.uint32).reshape(-1, 2)
+                    for row in arr:
+                        rid = int(row[0])
+                        if eligible is None or rid in eligible:
+                            candidate_counts[rid] = (
+                                candidate_counts.get(rid, 0) + 1
+                            )
+
+                # Verify: read matches iff all its k-mers are in path_kmer_set
+                for rid, match_count in candidate_counts.items():
+                    cnt_data = txn.get(_kcnt_key(rid, k), db=kcnt_db)
+                    if cnt_data is None:
+                        continue
+                    if match_count != struct.unpack("<H", cnt_data)[0]:
+                        continue
+                    key = (rid, path_idx)
                     if key not in seen_matches:
                         seen_matches.add(key)
-                        per_path[path_idx].append(match)
+                        per_path[path_idx].append(
+                            PathMatch(
+                                read_id=rid,
+                                path_start=0,
+                                path_end=path_lens[path_idx],
+                            )
+                        )
                         n_total += 1
+            progress.advance(task)
 
     logger.info(
-        "Pseudo-match: %d total match events across %d paths, %d reads indexed",
-        n_total, len(path_seqs), n_indexed,
+        "Pseudo-match (LMDB): %d total match events across %d paths",
+        n_total, len(path_seqs),
     )
-    return PseudoMatchMatcher(per_path, n_total, k_levels, n_indexed)
+    return PseudoMatchMatcher(per_path, n_total, k_levels, index.n_reads)
 
 
 # ------------------------------------------------------------------
@@ -1509,7 +1546,7 @@ def _minimizer_to_bp_scale(
     Args:
         graph: Parsed GFA graph.
         seg_min_index: Node-index-keyed list of ``(fwd, rev)`` arrays
-            from :func:`build_seg_min_index`.
+            from :func:`build_seg_min_index_from_lmdb`.
 
     Returns:
         Scale factor (bp per minimizer), or ``None`` if no segments
@@ -2404,10 +2441,12 @@ def _report_chosen_components(
             f"= {len(comp) / n_total:.1%} of total"
         )
         if seg_min_index is not None:
+            def _smi_len(entry: tuple[np.ndarray, np.ndarray] | None) -> int:
+                return len(entry[0]) if entry is not None else 0
             comp_min = sum(
-                len(seg_min_index[idx][0])
+                _smi_len(seg_min_index[idx])
                 for idx in comp
-                if idx < len(seg_min_index) and seg_min_index[idx] is not None
+                if idx < len(seg_min_index)
             )
             line += f", {comp_min:,} minimizers"
         typer.echo(line, err=True)
@@ -2472,6 +2511,14 @@ def main(
              "provided alongside --read-minimizers",
         exists=True,
         dir_okay=False,
+    )] = None,
+    lmdb_index: Annotated[Path | None, typer.Option(
+        "--lmdb-index",
+        help="Path to the unified on-disk LMDB index directory. Built "
+             "automatically on first run from the .read_minimizers and "
+             ".sequences files; reused on subsequent runs when the read "
+             "count and k-level count match. Default: "
+             "{read-minimizers-prefix}.index.lmdb",
     )] = None,
     minimizer_table: Annotated[Path | None, typer.Option(
         "--minimizer-table",
@@ -2658,21 +2705,31 @@ def main(
             err=True,
         )
 
+        # Build (or reuse) the unified on-disk LMDB index.
+        _lmdb_path = (
+            lmdb_index
+            if lmdb_index is not None
+            else Path(str(read_minimizers_prefix) + ".index.lmdb")
+        )
+        k_levels, lmdb_seg_k = build_lmdb_index(
+            _lmdb_path, read_minimizers_prefix, read_index,
+            n_levels=pseudo_match_levels,
+        )
+        lmdb_env = lmdb.open(
+            str(_lmdb_path), readonly=True, lock=False,
+            max_dbs=_LMDB_MAX_DBS, map_size=_LMDB_MAP_SIZE,
+        )
+
         # Precompute path sequences for the matcher.
         path_seqs: list[np.ndarray] = []
         if sampled:
-            seg_min, k_from_file = load_segment_minimizers(
-                read_minimizers_prefix,
-            )
-            effective_k = k_from_file if k_from_file is not None else k
+            seg_min_index = build_seg_min_index_from_lmdb(graph, lmdb_env)
+            effective_k = lmdb_seg_k if lmdb_seg_k is not None else k
+            bp_scale = _minimizer_to_bp_scale(graph, seg_min_index)
             typer.echo(
-                f"Segment minimizers: {len(seg_min):,} segments "
-                f"(k={effective_k})",
+                f"Segment minimizers: (k={effective_k})",
                 err=True,
             )
-
-            seg_min_index = build_seg_min_index(graph, seg_min)
-            bp_scale = _minimizer_to_bp_scale(graph, seg_min_index)
             typer.echo(
                 f"bp/minimizer scale: "
                 + (f"{bp_scale:.3f}" if bp_scale else "unavailable"),
@@ -2689,23 +2746,18 @@ def main(
             for path, _ in sampled:
                 seq = path_minimizer_sequence(path, seg_min_index, effective_k)
                 path_seqs.append(seq)
-            del seg_min_index  # not accessed again after path sequences are built
+            del seg_min_index
 
         read_matcher: ReadMatcher
         if matcher == MatcherMode.exact:
             read_matcher = build_ordered_matcher(
-                path_seqs,
-                lambda: iter_read_minimizers(read_minimizers_prefix),
-                read_index,
-                n_levels=pseudo_match_levels,
+                path_seqs, lmdb_env, k_levels, read_index,
             )
         else:
             read_matcher = build_pseudo_matcher(
-                path_seqs,
-                lambda: iter_read_minimizers(read_minimizers_prefix),
-                read_index,
-                n_levels=pseudo_match_levels,
+                path_seqs, lmdb_env, k_levels, read_index,
             )
+        lmdb_env.close()
         typer.echo(read_matcher.describe(), err=True)
         read_index.name_to_id.clear()
         logger.info("name_to_id cleared; string keys released from memory")
