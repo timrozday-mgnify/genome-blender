@@ -59,7 +59,11 @@
       "Bash(cd /Users/timrozday/Documents/genome-blender/genome_blender_core && maturin develop --release 2>&1)",
       "Bash(find /Users/timrozday/Documents/rust-mdbg -maxdepth 2 -type f -name \"*minimizer*\" -o -name \"README*\" 2>/dev/null | head -20)",
       "Bash(find /Users/timrozday -name \"main.rs\" -path \"*/rust-mdbg/*\" 2>/dev/null | head -5)",
-      "Bash(cd /Users/timrozday/Documents/rust-mdbg && cargo check 2>&1 | grep -E \"^error|^warning.*unused|^warning.*dead_code|Finished\")"
+      "Bash(cd /Users/timrozday/Documents/rust-mdbg && cargo check 2>&1 | grep -E \"^error|^warning.*unused|^warning.*dead_code|Finished\")",
+      "Bash(LMDB_PATH=\"/Users/timrozday/Documents/genome-blender_run/single_short_shallow/output/rust-mdbg/rust_mdbg_out.index.lmdb\")",
+      "Bash(du -sh \"$LMDB_PATH\")",
+      "Read(//Users/timrozday/Documents/genome-blender/$LMDB_PATH/**)",
+      "Read(//Users/timrozday/Documents/genome-blender/**)"
     ]
   }
 }

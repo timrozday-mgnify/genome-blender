@@ -319,10 +319,12 @@ class ReadIndex:
     Attributes:
         n_reads: Total number of reads.
         pairs: Read ID → mate read ID for paired-end reads.
+        l: Minimizer length from LMDB meta; 0 if not written by rust-mdbg.
     """
 
     n_reads: int
     pairs: dict[int, int]
+    l: int = 0
 
 
 def build_read_index(
@@ -359,12 +361,14 @@ def build_read_index(
         meta_db = env.open_db(_DB_META)
         with env.begin() as txn:
             nr = txn.get(_META_N_READS, db=meta_db)
+            l_bytes = txn.get(_META_L, db=meta_db)
         if nr is None:
             raise RuntimeError(
                 f"n_reads not found in LMDB meta at {lmdb_path}; "
                 "re-run rust-mdbg with --dump-read-minimizers"
             )
         n_reads = struct.unpack("<Q", nr)[0]
+        l_val = struct.unpack("<I", l_bytes)[0] if l_bytes else 0
     finally:
         env.close()
 
@@ -378,7 +382,7 @@ def build_read_index(
             len(pairs) // 2, n_reads,
         )
     logger.info("Read index: %d reads, %d paired templates", n_reads, len(pairs) // 2)
-    return ReadIndex(n_reads=n_reads, pairs=pairs)
+    return ReadIndex(n_reads=n_reads, pairs=pairs, l=l_val)
 
 
 def path_minimizer_sequence(
@@ -428,7 +432,7 @@ def path_minimizer_sequence(
 # Unified on-disk LMDB index
 # ------------------------------------------------------------------
 
-_LMDB_MAP_SIZE: int = 128 * 1024**3   # 128 GiB virtual address space
+_LMDB_MAP_SIZE: int = 32 * 1024**3    # 32 GiB — fallback for read-only opens (virtual only)
 _LMDB_MAX_DBS: int = 6
 
 _DB_META  = b"meta"   # metadata
@@ -441,6 +445,7 @@ _META_K_LEVELS = b"k_levels"
 _META_N_READS  = b"n_reads"
 _META_SEG_K    = b"seg_k"
 _META_N_LEVELS = b"n_levels"
+_META_L        = b"l"           # minimizer length written by rust-mdbg
 
 
 def _kinv_key(k: int, kmer: tuple[int, ...]) -> bytes:
@@ -496,6 +501,23 @@ def _check_lmdb_valid(
         return False, [], None
 
 
+def _compute_lmdb_map_size(n_reads: int, l: int, n_levels: int = 1) -> int:
+    """Return a map_size (bytes) sufficient for the LMDB given n_reads, l, n_levels.
+
+    Cost model (4× B-tree overhead):
+      reads_db: n_reads × avg_min × 8 B
+      kinv:     n_reads × avg_min × n_levels × 25 B
+      kcnt:     n_reads × n_levels × 7 B
+    where avg_min = l / 1.25.
+    Result is rounded up to the next GiB with a minimum of 4 GiB.
+    """
+    gib = 1024 ** 3
+    avg_min = l / 1.25
+    raw = int(n_reads * (avg_min * 8 + avg_min * n_levels * 25 + n_levels * 7) * 4)
+    rounded = math.ceil(raw / gib) * gib
+    return max(4 * gib, rounded)
+
+
 def build_lmdb_index(
     db_path: Path,
     read_prefix: Path,
@@ -532,13 +554,17 @@ def build_lmdb_index(
         return k_levels, seg_k
 
     logger.info("Building LMDB index at %s", db_path)
+    map_size = (
+        _compute_lmdb_map_size(index.n_reads, index.l, n_levels)
+        if index.l > 0
+        else _LMDB_MAP_SIZE
+    )
     # Rust already created the LMDB directory and populated the reads sub-db.
     env = lmdb.open(
         str(db_path),
-        map_size=_LMDB_MAP_SIZE,
+        map_size=map_size,
         max_dbs=_LMDB_MAX_DBS,
         sync=False,
-        writemap=True,
     )
     reads_db = env.open_db(_DB_READS)
     segs_db  = env.open_db(_DB_SEGS)
