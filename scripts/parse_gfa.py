@@ -24,7 +24,7 @@ import random
 import re
 import struct
 from collections import deque
-from collections.abc import Iterable, Iterator
+from collections.abc import Callable, Iterable, Iterator
 from dataclasses import dataclass, field
 from enum import Enum
 from pathlib import Path
@@ -273,10 +273,33 @@ def _add_link(
 # rust-mdbg read minimizers
 # ------------------------------------------------------------------
 
-# Binary format: LZ4-compressed; header = b"RMBG\x01"; then per-record:
-#   u32 LE name_len | name bytes | u32 LE n | n×u64 LE ids | n×u64 LE pos
+# Binary format: LZ4-compressed
+# v1 header = b"RMBG\x01"; per-record: u32 LE name_len | name bytes | u32 LE n | n×u64 LE ids | n×u64 LE pos
+# v2 header = b"RMBG\x02"; per-record: u32 LE read_index | u32 LE n | n×u32 LE compact_ids | n×u32 LE pos
 _RM_MAGIC = b"RMBG"
 _RM_HDR_LEN = 5  # 4 magic + 1 version
+
+# Compact minimizer map format: b"RMCM\x01" | u32 LE n | n×u64 LE hashes (indexed by compact_id)
+_RMCM_MAGIC = b"RMCM\x01"
+
+
+def _load_compact_map(path: Path) -> np.ndarray:
+    """Load a compact minimizer map file; return array of u64 hashes indexed by compact u32 ID."""
+    raw = path.read_bytes()
+    if raw[:5] != _RMCM_MAGIC:
+        raise ValueError(f"Not a compact minimizer map file: {path}")
+    (n,) = struct.unpack_from("<I", raw, 5)
+    return np.frombuffer(raw, dtype="<u8", count=n, offset=9)
+
+
+def _maybe_load_compact_map(prefix: Path) -> np.ndarray | None:
+    """Load compact map for *prefix* if the file exists, else return None."""
+    path = Path(str(prefix) + ".compact_map")
+    if path.exists():
+        cm = _load_compact_map(path)
+        logger.info("Loaded compact minimizer map: %d entries from %s", len(cm), path)
+        return cm
+    return None
 
 
 def _iter_tsv_rm(raw: bytes) -> Iterator[tuple[str, tuple[int, ...]]]:
@@ -291,36 +314,66 @@ def _iter_tsv_rm(raw: bytes) -> Iterator[tuple[str, tuple[int, ...]]]:
         yield parts[0], tuple(int(x) for x in parts[1].split(",") if x)
 
 
-def _iter_binary_rm(raw: bytes) -> Iterator[tuple[str, tuple[int, ...]]]:
-    """Yield ``(name, minimizer_ids)`` from binary-format bytes."""
+def _iter_binary_rm(
+    raw: bytes,
+    compact_map: np.ndarray | None = None,
+) -> Iterator[tuple[str, tuple[int, ...]]]:
+    """Yield ``(name, minimizer_ids)`` from binary-format bytes.
+
+    Supports v1 (name-string records) and v2 (compact-id records).  For v2,
+    *compact_map* must be provided to expand compact u32 IDs back to u64 hashes.
+    """
     mv = memoryview(raw)
+    version = raw[4]
     offset = _RM_HDR_LEN
     total = len(raw)
     while offset < total:
-        (name_len,) = struct.unpack_from("<I", mv, offset)
-        offset += 4
-        name = bytes(mv[offset: offset + name_len]).decode()
-        offset += name_len
-        (n,) = struct.unpack_from("<I", mv, offset)
-        offset += 4
-        ids: tuple[int, ...] = struct.unpack_from(f"<{n}Q", mv, offset)
-        offset += n * 8 + n * 8  # skip positions (not needed here)
-        yield name, ids
+        if version == 1:
+            (name_len,) = struct.unpack_from("<I", mv, offset)
+            offset += 4
+            name = bytes(mv[offset: offset + name_len]).decode()
+            offset += name_len
+            (n,) = struct.unpack_from("<I", mv, offset)
+            offset += 4
+            ids: tuple[int, ...] = struct.unpack_from(f"<{n}Q", mv, offset)
+            offset += n * 8 + n * 8  # skip positions (not needed here)
+            yield name, ids
+        else:  # version == 2
+            (read_index,) = struct.unpack_from("<I", mv, offset)
+            offset += 4
+            (n,) = struct.unpack_from("<I", mv, offset)
+            offset += 4
+            compact_ids: tuple[int, ...] = struct.unpack_from(f"<{n}I", mv, offset)
+            offset += n * 4
+            offset += n * 4  # skip positions
+            if compact_map is not None:
+                ids = tuple(int(compact_map[cid]) for cid in compact_ids)
+            else:
+                ids = compact_ids  # fallback: emit compact ids as-is
+            yield str(read_index), ids
 
 
 def _iter_binary_rm_names(raw: bytes) -> Iterator[str]:
     """Yield read names only from binary-format bytes, skipping minimizer data."""
     mv = memoryview(raw)
+    version = raw[4]
     offset = _RM_HDR_LEN
     total = len(raw)
     while offset < total:
-        (name_len,) = struct.unpack_from("<I", mv, offset)
-        offset += 4
-        name = bytes(mv[offset: offset + name_len]).decode()
-        offset += name_len
-        (n,) = struct.unpack_from("<I", mv, offset)
-        offset += 4 + n * 16  # skip ids (n×8) + positions (n×8)
-        yield name
+        if version == 1:
+            (name_len,) = struct.unpack_from("<I", mv, offset)
+            offset += 4
+            name = bytes(mv[offset: offset + name_len]).decode()
+            offset += name_len
+            (n,) = struct.unpack_from("<I", mv, offset)
+            offset += 4 + n * 16  # skip ids (n×8) + positions (n×8)
+            yield name
+        else:  # version == 2
+            (read_index,) = struct.unpack_from("<I", mv, offset)
+            offset += 4
+            (n,) = struct.unpack_from("<I", mv, offset)
+            offset += 4 + n * 8  # skip compact_ids (n×4) + positions (n×4)
+            yield str(read_index)
 
 
 def _iter_tsv_rm_names(raw: bytes) -> Iterator[str]:
@@ -340,8 +393,10 @@ def iter_read_minimizers(
     """Stream ``(name, minimizer_ids)`` pairs from all ``.read_minimizers`` files.
 
     Decompresses one file at a time so only one file's data resides in
-    memory simultaneously.  Supports both binary (``RMBG`` magic) and
-    legacy LZ4-TSV formats, auto-detected per file.
+    memory simultaneously.  Supports binary v1/v2 (``RMBG`` magic) and
+    legacy LZ4-TSV formats, auto-detected per file.  For v2 files, the
+    compact minimizer map (``{prefix}.compact_map``) is loaded once and
+    used to expand compact u32 IDs back to u64 hashes.
 
     Args:
         prefix: rust-mdbg output prefix (e.g. ``Path("rust_mdbg_out")``).
@@ -351,10 +406,13 @@ def iter_read_minimizers(
     """
     pattern = str(prefix) + ".*.read_minimizers"
     files = sorted(glob.glob(pattern))
+    compact_map = _maybe_load_compact_map(prefix)
     for fpath in files:
         raw = lz4.frame.decompress(Path(fpath).read_bytes())
-        iter_fn = _iter_binary_rm if raw[:4] == _RM_MAGIC else _iter_tsv_rm
-        yield from iter_fn(raw)
+        if raw[:4] == _RM_MAGIC:
+            yield from _iter_binary_rm(raw, compact_map)
+        else:
+            yield from _iter_tsv_rm(raw)
 
 
 def load_minimizer_table(table_path: Path) -> dict[int, str]:
@@ -488,7 +546,11 @@ def load_name_index(path: Path) -> list[str]:
     return content.decode().splitlines()
 
 
-def build_read_index(prefix: Path, name_index_path: Path) -> ReadIndex:
+def build_read_index(
+    prefix: Path,
+    name_index_path: Path,
+    paired_interleaved: bool = False,
+) -> ReadIndex:
     """Build an integer-indexed read registry from ``.read_minimizers`` files.
 
     Performs a names-only streaming pass — minimizer data is not loaded
@@ -497,9 +559,15 @@ def build_read_index(prefix: Path, name_index_path: Path) -> ReadIndex:
     one name per line) and then freed; only ``name_to_id`` and ``pairs``
     are retained in the returned :class:`ReadIndex`.
 
+    For v2 binary files (``RMBG\\x02``), names are integer read indices.
+    When *paired_interleaved* is ``True``, pairs are assigned arithmetically:
+    odd-indexed reads (1, 3, 5, …) are paired with the next even-indexed read
+    (2, 4, 6, …) — this matches interleaved paired-end input ordering.
+
     Args:
         prefix: rust-mdbg output prefix (e.g. ``Path("rust_mdbg_out")``).
         name_index_path: Destination for the name-index file.
+        paired_interleaved: Use arithmetic pairing for interleaved input.
 
     Returns:
         A :class:`ReadIndex` with ``n_reads``, ``name_to_id``, and
@@ -537,23 +605,47 @@ def build_read_index(prefix: Path, name_index_path: Path) -> ReadIndex:
         name: i for i, name in enumerate(sorted_names)
     }
 
-    template_to_ids: dict[str, list[int]] = {}
-    for read_id, name in enumerate(sorted_names):
-        tmpl = _template_name(name)
-        logger.debug("Read name: %s  template: %s", name, tmpl)
-        template_to_ids.setdefault(tmpl, []).append(read_id)
-    del sorted_names  # free the sorted list; dict keys are the canonical copy
-
     pairs: dict[int, int] = {}
-    for tmpl, ids in template_to_ids.items():
-        if len(ids) == 2:
-            pairs[ids[0]] = ids[1]
-            pairs[ids[1]] = ids[0]
-        elif len(ids) > 2:
+    if paired_interleaved:
+        # Arithmetic pairing for interleaved input: 1↔2, 3↔4, 5↔6, …
+        # Names are 1-based read indices (str); pair odd with the next even.
+        try:
+            int_ids = sorted(int(n) for n in sorted_names)
+        except ValueError:
             logger.warning(
-                "Template %r has %d reads; skipping pair detection",
-                tmpl, len(ids),
+                "paired_interleaved=True but names are not integers; "
+                "falling back to template-name pairing"
             )
+            int_ids = []
+        if int_ids:
+            id_set = set(int_ids)
+            for idx in int_ids:
+                if idx % 2 == 1 and (idx + 1) in id_set:
+                    r1 = name_to_id[str(idx)]
+                    r2 = name_to_id[str(idx + 1)]
+                    pairs[r1] = r2
+                    pairs[r2] = r1
+            logger.info(
+                "Interleaved pairing: %d pairs from %d reads",
+                len(pairs) // 2, len(sorted_names),
+            )
+    else:
+        template_to_ids: dict[str, list[int]] = {}
+        for read_id, name in enumerate(sorted_names):
+            tmpl = _template_name(name)
+            logger.debug("Read name: %s  template: %s", name, tmpl)
+            template_to_ids.setdefault(tmpl, []).append(read_id)
+
+        for tmpl, ids in template_to_ids.items():
+            if len(ids) == 2:
+                pairs[ids[0]] = ids[1]
+                pairs[ids[1]] = ids[0]
+            elif len(ids) > 2:
+                logger.warning(
+                    "Template %r has %d reads; skipping pair detection",
+                    tmpl, len(ids),
+                )
+    del sorted_names  # free the sorted list; dict keys are the canonical copy
 
     n_reads = len(name_to_id)
     logger.info(
@@ -745,6 +837,7 @@ class MatcherMode(str, Enum):
     ac = "ac"
     seed_extend = "seed-extend"
     exact = "exact"
+    pseudo_match = "pseudo-match"
 
 
 class ReadMatcher(Protocol):
@@ -1391,6 +1484,286 @@ def build_exact_path_matcher(
         n_total, len(path_seqs),
     )
     return ExactPathMatcher(per_path, n_total)
+
+
+# ------------------------------------------------------------------
+# Pseudo-match matcher (unordered k-mer set membership)
+# ------------------------------------------------------------------
+
+
+def _compute_k_levels(min_len: int, max_len: int, n_levels: int) -> list[int]:
+    """Compute distinct k values evenly distributed across [min_len, max_len].
+
+    Args:
+        min_len: Minimum read length in minimizers (lower bound for k).
+        max_len: Maximum read length in minimizers (upper bound for k).
+        n_levels: Desired total number of levels including the endpoints.
+
+    Returns:
+        Sorted list of distinct integer k values, length ≤ n_levels.
+    """
+    if n_levels <= 1 or min_len >= max_len:
+        return [max(1, min_len)]
+    raw = np.linspace(min_len, max_len, n_levels)
+    seen: set[int] = set()
+    result: list[int] = []
+    for val in np.round(raw).astype(int):
+        k_int = int(val)
+        if k_int >= 1 and k_int not in seen:
+            seen.add(k_int)
+            result.append(k_int)
+    return result
+
+
+def _build_pseudo_path_index(
+    path_seqs: list[np.ndarray],
+    k_levels: list[int],
+) -> dict[int, dict[tuple[int, ...], set[int]]]:
+    """Build an inverted k-mer index over sampled paths for each k level.
+
+    Args:
+        path_seqs: Minimizer ID arrays for each sampled path.
+        k_levels: Distinct k values to index.
+
+    Returns:
+        Mapping ``k → kmer_tuple → {path_idx, …}`` covering every k-mer
+        present in any sampled path at each level.
+    """
+    index: dict[int, dict[tuple[int, ...], set[int]]] = {}
+    for k in k_levels:
+        kmer_map: dict[tuple[int, ...], set[int]] = {}
+        for path_idx, seq in enumerate(path_seqs):
+            for i in range(len(seq) - k + 1):
+                kmer: tuple[int, ...] = tuple(int(seq[i + j]) for j in range(k))
+                kmer_map.setdefault(kmer, set()).add(path_idx)
+        index[k] = kmer_map
+    return index
+
+
+def _floor_k_level(read_len: int, k_levels: list[int]) -> int | None:
+    """Return the largest k in k_levels that does not exceed read_len.
+
+    Args:
+        read_len: Number of minimizers in the read.
+        k_levels: Sorted ascending list of candidate k values.
+
+    Returns:
+        Largest k ≤ read_len, or None if every level exceeds read_len.
+    """
+    best: int | None = None
+    for k in k_levels:
+        if k <= read_len:
+            best = k
+    return best
+
+
+def _pseudo_match_read(
+    read_mids: tuple[int, ...],
+    path_index: dict[int, dict[tuple[int, ...], set[int]]],
+    k_levels: list[int],
+    read_id: int,
+    path_lens: list[int],
+) -> list[tuple[int, PathMatch]]:
+    """Find paths that contain every k-mer of *read_mids* (unordered).
+
+    Selects the largest k ≤ len(read_mids) from k_levels, generates all
+    consecutive k-mers from the read, then intersects the candidate path
+    sets from the inverted index.  A path matches when it contains all
+    k-mers; positional order within the path is not required.
+
+    Args:
+        read_mids: Tuple of minimizer IDs for the read.
+        path_index: Inverted index from :func:`_build_pseudo_path_index`.
+        k_levels: Sorted list of k values matching those in path_index.
+        read_id: Integer read ID to embed in match records.
+        path_lens: Minimizer-sequence length of each path, used as the
+            placeholder ``path_end`` in returned :class:`PathMatch` records.
+
+    Returns:
+        List of ``(path_idx, PathMatch)`` for every matching path.
+    """
+    k = _floor_k_level(len(read_mids), k_levels)
+    if k is None:
+        return []
+    kmer_map = path_index[k]
+    candidate_paths: set[int] | None = None
+    for i in range(len(read_mids) - k + 1):
+        kmer: tuple[int, ...] = read_mids[i:i + k]
+        paths_for_kmer = kmer_map.get(kmer)
+        if not paths_for_kmer:
+            return []
+        if candidate_paths is None:
+            candidate_paths = set(paths_for_kmer)
+        else:
+            candidate_paths &= paths_for_kmer
+            if not candidate_paths:
+                return []
+    if candidate_paths is None:
+        return []
+    return [
+        (path_idx, PathMatch(read_id=read_id, path_start=0, path_end=path_lens[path_idx]))
+        for path_idx in candidate_paths
+    ]
+
+
+class PseudoMatchMatcher:
+    """Read-to-path matcher using unordered k-mer set membership.
+
+    Indexes sampled paths at multiple k-mer sizes spanning the range of
+    observed read lengths.  For each read the k value is floored to the
+    nearest indexed level; a read matches a path when every k-mer formed
+    from its minimizer sequence appears somewhere in that path, with no
+    constraint on order.
+
+    Both forward and reversed read orientations are tested; each
+    (read_id, path_idx) pair is emitted at most once.
+
+    Pre-computed results are served sequentially via :meth:`search_path`
+    in the same order as the *path_seqs* passed to :func:`build_pseudo_matcher`.
+
+    Attributes:
+        _per_path_matches: Per-path :class:`PathMatch` lists.
+        _n_total: Total read–path match events recorded.
+        _k_levels: K values used for the multi-level index.
+        _n_reads_indexed: Reads processed during the build pass.
+        _search_idx: Next sequential index for :meth:`search_path`.
+    """
+
+    def __init__(
+        self,
+        per_path_matches: list[list[PathMatch]],
+        n_total: int,
+        k_levels: list[int],
+        n_reads_indexed: int,
+    ) -> None:
+        self._per_path_matches = per_path_matches
+        self._n_total = n_total
+        self._k_levels = k_levels
+        self._n_reads_indexed = n_reads_indexed
+        self._search_idx = 0
+
+    def search_path(self, path_seq: np.ndarray) -> list[PathMatch]:
+        """Return pre-computed matches for the next path in sequence.
+
+        Args:
+            path_seq: Ignored; present for :class:`ReadMatcher` protocol
+                compatibility.
+
+        Returns:
+            List of :class:`PathMatch` records for this path.
+        """
+        result = self._per_path_matches[self._search_idx]
+        self._search_idx += 1
+        return result
+
+    def describe(self) -> str:
+        """Return a short human-readable description of the index."""
+        k_str = ", ".join(str(k) for k in self._k_levels)
+        return (
+            f"Pseudo-match: {len(self._k_levels)} k levels [{k_str}], "
+            f"{self._n_reads_indexed:,} reads indexed, "
+            f"{self._n_total:,} total match events"
+        )
+
+
+def build_pseudo_matcher(
+    path_seqs: list[np.ndarray],
+    minimizer_iter_factory: Callable[[], Iterable[tuple[str, tuple[int, ...]]]],
+    index: ReadIndex,
+    eligible: set[int] | None = None,
+    n_levels: int = 5,
+) -> PseudoMatchMatcher:
+    """Build a :class:`PseudoMatchMatcher` with a two-pass streaming approach.
+
+    Pass 1 scans read lengths to determine the k-level boundaries, which
+    span from the minimum to the maximum observed eligible read length.
+    The path k-mer index is then built for those levels.  Pass 2 streams
+    reads again and checks each against the path index via unordered
+    k-mer set membership.
+
+    Both forward and reversed orientations are tested; each
+    ``(read_id, path_idx)`` pair is recorded at most once.
+
+    Args:
+        path_seqs: Minimizer sequences for the sampled paths.
+        minimizer_iter_factory: Callable that returns a fresh
+            ``(read_name, minimizer_ids)`` iterator on each invocation;
+            called twice for the two streaming passes.
+        index: :class:`ReadIndex` providing the name-to-ID mapping.
+        eligible: Optional set of read IDs to include; others skipped.
+        n_levels: Number of distinct k values to index, evenly spaced
+            from the minimum to the maximum observed read length.
+
+    Returns:
+        A :class:`PseudoMatchMatcher` with all matches pre-computed,
+        ready for sequential :meth:`~PseudoMatchMatcher.search_path` calls.
+    """
+    # -- Pass 1: determine the read-length range for k-level boundaries ------
+    min_len = 10 ** 9
+    max_len = 0
+    with Progress(*_PROGRESS_COLUMNS) as progress:
+        task = progress.add_task(
+            "Scanning read lengths (pseudo-match)", total=index.n_reads,
+        )
+        for read_name, read_mids in minimizer_iter_factory():
+            read_id = index.name_to_id.get(read_name)
+            if read_id is None:
+                continue
+            n = len(read_mids)
+            if n > 0 and (eligible is None or read_id in eligible):
+                if n < min_len:
+                    min_len = n
+                if n > max_len:
+                    max_len = n
+            progress.advance(task)
+
+    if max_len == 0:
+        logger.warning("No eligible reads with minimizers found; returning empty matcher.")
+        return PseudoMatchMatcher([[] for _ in path_seqs], 0, [], 0)
+
+    k_levels = _compute_k_levels(min_len, max_len, n_levels)
+    logger.info("Pseudo-match k levels: %s", k_levels)
+
+    # -- Build the path k-mer index for each level ---------------------------
+    path_index = _build_pseudo_path_index(path_seqs, k_levels)
+    path_lens = [len(seq) for seq in path_seqs]
+
+    # -- Pass 2: stream reads and match against the path index ---------------
+    per_path: list[list[PathMatch]] = [[] for _ in path_seqs]
+    seen_matches: set[tuple[int, int]] = set()
+    n_total = 0
+    n_indexed = 0
+    with Progress(*_PROGRESS_COLUMNS) as progress:
+        task = progress.add_task(
+            "Building pseudo-match index", total=index.n_reads,
+        )
+        for read_name, read_mids in minimizer_iter_factory():
+            read_id = index.name_to_id.get(read_name)
+            if read_id is None:
+                continue
+            progress.advance(task)
+            if eligible is not None and read_id not in eligible:
+                continue
+            if not read_mids:
+                continue
+            n_indexed += 1
+            rev_mids: tuple[int, ...] = read_mids[::-1]
+            orientations = (read_mids, rev_mids) if rev_mids != read_mids else (read_mids,)
+            for mids in orientations:
+                for path_idx, match in _pseudo_match_read(
+                    mids, path_index, k_levels, read_id, path_lens,
+                ):
+                    key = (read_id, path_idx)
+                    if key not in seen_matches:
+                        seen_matches.add(key)
+                        per_path[path_idx].append(match)
+                        n_total += 1
+
+    logger.info(
+        "Pseudo-match: %d total match events across %d paths, %d reads indexed",
+        n_total, len(path_seqs), n_indexed,
+    )
+    return PseudoMatchMatcher(per_path, n_total, k_levels, n_indexed)
 
 
 # ------------------------------------------------------------------
@@ -2465,7 +2838,7 @@ def main(
     )] = 5,
     matcher: Annotated[MatcherMode, typer.Option(
         "--matcher",
-        help="Read-to-path exact matching strategy. "
+        help="Read-to-path matching strategy. "
              "'ac' uses an Aho-Corasick automaton (exact substring "
              "matching, indexes reads — high memory for large read sets). "
              "'seed-extend' uses a minimap2-style inverted minimizer "
@@ -2473,9 +2846,29 @@ def main(
              "'exact' indexes paths instead of reads and streams reads "
              "one at a time for numpy array verification — same results "
              "as 'ac' but O(path minimizers) memory instead of "
-             "O(read minimizers); recommended for large metagenomes.",
+             "O(read minimizers); recommended for large metagenomes. "
+             "'pseudo-match' builds a multi-level k-mer set index over "
+             "paths; a read matches when all its k-mers are present in "
+             "the path regardless of order (two streaming passes).",
         case_sensitive=False,
     )] = MatcherMode.ac,
+    pseudo_match_levels: Annotated[int, typer.Option(
+        "--pseudo-match-levels",
+        help="Number of k-mer size levels for the 'pseudo-match' matcher. "
+             "Levels are evenly spaced between the minimum and maximum "
+             "observed read length (in minimizers). Each read is assigned "
+             "to the largest level not exceeding its minimizer count.",
+        min=1,
+    )] = 5,
+    interleaved_pairs: Annotated[bool, typer.Option(
+        "--interleaved-pairs/--no-interleaved-pairs",
+        help="Pair reads arithmetically assuming interleaved paired-end "
+             "input: read 1 pairs with read 2, read 3 with read 4, etc. "
+             "Intended for v2 read_minimizers files (RMBG\\x02) where "
+             "names are sequential integer indices rather than FASTQ "
+             "read identifiers. Falls back to template-name pairing if "
+             "names are not integers.",
+    )] = False,
 ) -> None:
     """Parse a rust-mdbg GFA output into a graph and report properties."""
     if paired_end and pe_bam is None:
@@ -2569,7 +2962,7 @@ def main(
         _name_index_path = Path(
             str(read_minimizers_prefix) + ".read_name_index"
         )
-        read_index = build_read_index(read_minimizers_prefix, _name_index_path)
+        read_index = build_read_index(read_minimizers_prefix, _name_index_path, interleaved_pairs)
         typer.echo(
             f"Read index: {read_index.n_reads:,} reads, "
             f"{len(read_index.pairs) // 2:,} paired templates",
@@ -2615,6 +3008,7 @@ def main(
                 f"distinct minimizers across {len(sampled)} paths",
                 err=True,
             )
+            del seg_min_index  # not accessed again after path sequences are built
 
         if ac_prefilter and path_minimizer_set:
             individually_passing: set[int] = {
@@ -2640,6 +3034,14 @@ def main(
                 iter_read_minimizers(read_minimizers_prefix),
                 read_index,
                 eligible,
+            )
+        elif matcher == MatcherMode.pseudo_match:
+            read_matcher = build_pseudo_matcher(
+                path_seqs,
+                lambda: iter_read_minimizers(read_minimizers_prefix),
+                read_index,
+                eligible,
+                n_levels=pseudo_match_levels,
             )
         else:
             read_matcher = build_seed_extender(
@@ -2779,13 +3181,14 @@ def main(
             if mappings_out_fh is not None:
                 mappings_out_fh.write("read_name\tpair\tpath_index\n")
 
+            del sampled  # content fully consumed above; free path-node lists
             try:
                 with Progress(*_PROGRESS_COLUMNS) as progress:
                     task = progress.add_task(
-                        "Matching reads to paths", total=len(sampled),
+                        "Matching reads to paths", total=len(cached_matches),
                     )
-                    for path_idx, (seq, (_, _), path_matches) in enumerate(
-                        zip(path_seqs, sampled, cached_matches), start=1,
+                    for path_idx, (seq, path_matches) in enumerate(
+                        zip(path_seqs, cached_matches), start=1,
                     ):
                         for m in path_matches:
                             match_counts[m.read_id] = (
@@ -2880,6 +3283,7 @@ def main(
         stats = _compute_summary(
             graph, path_lengths, weight_str, pair_distances,
         )
+        del graph  # last use; release graph memory
         stats["gfa"] = str(gfa)
         if read_index is not None:
             stats["read_index_reads"] = read_index.n_reads
