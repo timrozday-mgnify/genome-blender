@@ -5,9 +5,42 @@ INPUT_DIR="$(cd ../genome-blender_run/multi_genome_full/output && pwd)"
 OUTPUT_DIR="${INPUT_DIR}/rust-mdbg"
 mkdir -p "${OUTPUT_DIR}"
 
-# rust-mdbg accepts a single reads file; concatenate all FASTQ inputs
+# Whether the input is paired-end (R1 + R2 files).  Set to 1 to interleave;
+# set to 0 to concatenate all FASTQ files as single-end.
+PAIRED_END=1
+
+# rust-mdbg accepts a single reads file.
+# For paired-end input the R1 and R2 files must be interleaved so that
+# sequential read indices (v2 format) follow the pattern 1=R1, 2=R2, 3=R1, …
+# which allows --interleaved-pairs arithmetic pairing in parse_gfa.py.
 COMBINED="${OUTPUT_DIR}/combined_reads.fastq"
-cat "${INPUT_DIR}"/*.fastq > "${COMBINED}"
+
+if [[ "${PAIRED_END}" -eq 1 ]]; then
+    # Detect gzipped output from genome-blender (default: .fastq.gz)
+    R1_FILES=( "${INPUT_DIR}"/*_R1.fastq.gz "${INPUT_DIR}"/*_R1.fastq )
+    R2_FILES=( "${INPUT_DIR}"/*_R2.fastq.gz "${INPUT_DIR}"/*_R2.fastq )
+    # Pick whichever glob expanded (prefer .gz)
+    R1=""; for f in "${R1_FILES[@]}"; do [[ -f "$f" ]] && R1="$f" && break; done
+    R2=""; for f in "${R2_FILES[@]}"; do [[ -f "$f" ]] && R2="$f" && break; done
+    if [[ -z "${R1}" || -z "${R2}" ]]; then
+        echo "ERROR: could not find R1/R2 FASTQ files in ${INPUT_DIR}" >&2
+        exit 1
+    fi
+    echo "Interleaving paired-end reads: ${R1}  +  ${R2}"
+    # Interleave: collapse each file to one tab-separated line per record,
+    # then alternate records from R1 and R2, then expand back to 4 lines each.
+    _open() { case "$1" in *.gz) zcat "$1";; *) cat "$1";; esac; }
+    paste <(paste - - - - < <(_open "${R1}")) \
+          <(paste - - - - < <(_open "${R2}")) \
+    | awk -F'\t' '{print $1; print $2; print $3; print $4;
+                   print $5; print $6; print $7; print $8}' \
+    > "${COMBINED}"
+else
+    # Single-end: accept .fastq.gz or .fastq
+    { for f in "${INPUT_DIR}"/*.fastq.gz; do [[ -f "$f" ]] && zcat "$f"; done
+      for f in "${INPUT_DIR}"/*.fastq;    do [[ -f "$f" ]] && cat  "$f"; done
+    } > "${COMBINED}"
+fi
 
 # rust-mdbg parameters
 K=4   # k-mer size (minimizer k-mer)
@@ -53,6 +86,16 @@ echo "Using density: ${DENSITY}  (l=${L} / (${MEAN_READ_LEN} * 1.25))"
 UNIQUE_MINIMIZERS=$(grep -vc '^#' "${MINIMIZER_TABLE}" 2>/dev/null || echo 0)
 echo "Unique minimizers in minimizer_table: ${UNIQUE_MINIMIZERS}"
 
+# Build parse_gfa.py paired-end flags.
+# --interleaved-pairs: use arithmetic pairing (1↔2, 3↔4, …) for v2 binary
+#   files where names are sequential integer indices; requires interleaved input.
+# --reads: source read names from the FASTQ so human-readable names appear in
+#   output alongside the integer v2 indices.
+_PAIRED_FLAGS=()
+if [[ "${PAIRED_END}" -eq 1 ]]; then
+    _PAIRED_FLAGS+=(--interleaved-pairs --reads "${COMBINED}")
+fi
+
 /Users/timrozday/miniforge3/envs/genome_blender_dev/bin/python "$(dirname "$0")/parse_gfa.py" \
     -n 100000 \
     --top-paths 5 \
@@ -62,6 +105,7 @@ echo "Unique minimizers in minimizer_table: ${UNIQUE_MINIMIZERS}"
     --minimizer-table "${MINIMIZER_TABLE}" \
     --insert-sizes-out "${PREFIX}.insert_sizes.tsv" \
     --json "${PREFIX}.graph_summary.json" \
+    "${_PAIRED_FLAGS[@]}" \
     "${GFA}"
 
 #    --read-mappings-out "${PREFIX}.read_mappings.tsv" \
