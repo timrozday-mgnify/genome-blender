@@ -17,13 +17,13 @@ from __future__ import annotations
 
 import bisect
 import glob
-import gzip
 import io
 import json
 import logging
 import math
 import random
 import re
+import shutil
 import struct
 from collections import deque
 from collections.abc import Callable, Iterable, Iterator
@@ -277,153 +277,37 @@ def _add_link(
 # ------------------------------------------------------------------
 
 # Binary format: LZ4-compressed
-# v1 header = b"RMBG\x01"; per-record: u32 LE name_len | name bytes | u32 LE n | n×u64 LE ids | n×u64 LE pos
-# v2 header = b"RMBG\x02"; per-record: u32 LE read_index | u32 LE n | n×u32 LE compact_ids | n×u32 LE pos
-_RM_MAGIC = b"RMBG"
+# v2: header b"RMBG\x02" (5 bytes); per-record: u32 LE read_index | u32 LE n | n×u64 LE ids | n×u32 LE pos
 _RM_HDR_LEN = 5  # 4 magic + 1 version
 
-# Compact minimizer map format: b"RMCM\x01" | u32 LE n | n×u64 LE hashes (indexed by compact_id)
-_RMCM_MAGIC = b"RMCM\x01"
 
-
-def _load_compact_map(path: Path) -> np.ndarray:
-    """Load a compact minimizer map file; return array of u64 hashes indexed by compact u32 ID."""
-    raw = path.read_bytes()
-    if raw[:5] != _RMCM_MAGIC:
-        raise ValueError(f"Not a compact minimizer map file: {path}")
-    (n,) = struct.unpack_from("<I", raw, 5)
-    return np.frombuffer(raw, dtype="<u8", count=n, offset=9)
-
-
-def _maybe_load_compact_map(prefix: Path) -> np.ndarray | None:
-    """Load compact map for *prefix* if the file exists, else return None."""
-    path = Path(str(prefix) + ".compact_map")
-    if path.exists():
-        cm = _load_compact_map(path)
-        logger.info("Loaded compact minimizer map: %d entries from %s", len(cm), path)
-        return cm
-    return None
-
-
-def _iter_tsv_rm(raw: bytes) -> Iterator[tuple[str, tuple[int, ...]]]:
-    """Yield ``(name, minimizer_ids)`` from legacy LZ4-TSV bytes."""
-    for line in io.TextIOWrapper(io.BytesIO(raw), encoding="utf-8"):
-        line = line.rstrip("\n")
-        if not line or line.startswith("#"):
-            continue
-        parts = line.split("\t")
-        if len(parts) != 3:
-            continue
-        yield parts[0], tuple(int(x) for x in parts[1].split(",") if x)
-
-
-def _iter_binary_rm(
-    raw: bytes,
-    compact_map: np.ndarray | None = None,
-) -> Iterator[tuple[str, tuple[int, ...]]]:
-    """Yield ``(name, minimizer_ids)`` from binary-format bytes.
-
-    Supports v1 (name-string records) and v2 (compact-id records).  For v2,
-    *compact_map* must be provided to expand compact u32 IDs back to u64 hashes.
-    """
+def _iter_binary_rm(raw: bytes) -> Iterator[tuple[str, tuple[int, ...]]]:
+    """Yield ``(name, minimizer_ids)`` from v2 binary-format bytes."""
     mv = memoryview(raw)
-    version = raw[4]
     offset = _RM_HDR_LEN
     total = len(raw)
     while offset < total:
-        if version == 1:
-            (name_len,) = struct.unpack_from("<I", mv, offset)
-            offset += 4
-            name = bytes(mv[offset: offset + name_len]).decode()
-            offset += name_len
-            (n,) = struct.unpack_from("<I", mv, offset)
-            offset += 4
-            ids: tuple[int, ...] = struct.unpack_from(f"<{n}Q", mv, offset)
-            offset += n * 8 + n * 8  # skip positions (not needed here)
-            yield name, ids
-        else:  # version == 2
-            (read_index,) = struct.unpack_from("<I", mv, offset)
-            offset += 4
-            (n,) = struct.unpack_from("<I", mv, offset)
-            offset += 4
-            compact_ids: tuple[int, ...] = struct.unpack_from(f"<{n}I", mv, offset)
-            offset += n * 4
-            offset += n * 4  # skip positions
-            if compact_map is not None:
-                ids = tuple(int(compact_map[cid]) for cid in compact_ids)
-            else:
-                ids = compact_ids  # fallback: emit compact ids as-is
-            yield str(read_index), ids
+        (read_index,) = struct.unpack_from("<I", mv, offset)
+        offset += 4
+        (n,) = struct.unpack_from("<I", mv, offset)
+        offset += 4
+        ids: tuple[int, ...] = struct.unpack_from(f"<{n}Q", mv, offset)
+        offset += n * 8 + n * 4  # ids (n×8) + positions (n×4)
+        yield str(read_index), ids
 
 
 def _iter_binary_rm_names(raw: bytes) -> Iterator[str]:
-    """Yield read names only from binary-format bytes, skipping minimizer data."""
+    """Yield read indices only from v2 binary-format bytes, skipping minimizer data."""
     mv = memoryview(raw)
-    version = raw[4]
     offset = _RM_HDR_LEN
     total = len(raw)
     while offset < total:
-        if version == 1:
-            (name_len,) = struct.unpack_from("<I", mv, offset)
-            offset += 4
-            name = bytes(mv[offset: offset + name_len]).decode()
-            offset += name_len
-            (n,) = struct.unpack_from("<I", mv, offset)
-            offset += 4 + n * 16  # skip ids (n×8) + positions (n×8)
-            yield name
-        else:  # version == 2
-            (read_index,) = struct.unpack_from("<I", mv, offset)
-            offset += 4
-            (n,) = struct.unpack_from("<I", mv, offset)
-            offset += 4 + n * 8  # skip compact_ids (n×4) + positions (n×4)
-            yield str(read_index)
+        (read_index,) = struct.unpack_from("<I", mv, offset)
+        offset += 4
+        (n,) = struct.unpack_from("<I", mv, offset)
+        offset += 4 + n * 12  # ids (n×8) + positions (n×4)
+        yield str(read_index)
 
-
-def _iter_tsv_rm_names(raw: bytes) -> Iterator[str]:
-    """Yield read names only from legacy LZ4-TSV bytes."""
-    for line in io.TextIOWrapper(io.BytesIO(raw), encoding="utf-8"):
-        line = line.rstrip("\n")
-        if not line or line.startswith("#"):
-            continue
-        parts = line.split("\t", 1)
-        if parts:
-            yield parts[0]
-
-
-def _iter_fastx_names(path: Path) -> Iterator[str]:
-    """Yield the first whitespace-delimited token from each sequence header.
-
-    Handles both FASTQ (records starting with ``@``) and FASTA (records
-    starting with ``>``).  Gzip-compressed files are detected automatically
-    from a ``.gz`` suffix.  Format is auto-detected from the first non-empty
-    line.
-
-    Args:
-        path: Path to a FASTQ or FASTA file, optionally gzip-compressed.
-
-    Yields:
-        Read/sequence names (header token before the first space).
-    """
-    opener = gzip.open if path.suffix == ".gz" else open
-    with opener(path, "rt") as fh:
-        is_fastq: bool | None = None
-        skip_remaining = 0
-        for raw_line in fh:
-            line = raw_line.rstrip("\n")
-            if skip_remaining > 0:
-                skip_remaining -= 1
-                continue
-            if is_fastq is None:
-                if not line:
-                    continue
-                is_fastq = line.startswith("@")
-            if is_fastq:
-                if line.startswith("@"):
-                    yield line[1:].split()[0]
-                    skip_remaining = 3  # seq, +, qual
-            else:
-                if line.startswith(">"):
-                    yield line[1:].split()[0]
 
 
 def iter_read_minimizers(
@@ -431,27 +315,19 @@ def iter_read_minimizers(
 ) -> Iterator[tuple[str, tuple[int, ...]]]:
     """Stream ``(name, minimizer_ids)`` pairs from all ``.read_minimizers`` files.
 
-    Decompresses one file at a time so only one file's data resides in
-    memory simultaneously.  Supports binary v1/v2 (``RMBG`` magic) and
-    legacy LZ4-TSV formats, auto-detected per file.  For v2 files, the
-    compact minimizer map (``{prefix}.compact_map``) is loaded once and
-    used to expand compact u32 IDs back to u64 hashes.
+    Decompresses one file at a time.
 
     Args:
         prefix: rust-mdbg output prefix (e.g. ``Path("rust_mdbg_out")``).
 
     Yields:
-        ``(read_name, minimizer_id_tuple)`` for each read record.
+        ``(read_index_str, minimizer_id_tuple)`` for each read record.
     """
     pattern = str(prefix) + ".*.read_minimizers"
     files = sorted(glob.glob(pattern))
-    compact_map = _maybe_load_compact_map(prefix)
     for fpath in files:
         raw = lz4.frame.decompress(Path(fpath).read_bytes())
-        if raw[:4] == _RM_MAGIC:
-            yield from _iter_binary_rm(raw, compact_map)
-        else:
-            yield from _iter_tsv_rm(raw)
+        yield from _iter_binary_rm(raw)
 
 
 def load_minimizer_table(table_path: Path) -> dict[int, str]:
@@ -486,223 +362,72 @@ def load_minimizer_table(table_path: Path) -> dict[int, str]:
 # Strips common paired-end read-name suffixes to obtain the template name.
 # Handles: /1 /2, /R1 /R2, _R1 _R2, .1 .2, .R1 .R2,
 #          and Illumina CASAVA space suffixes (e.g. " 1:N:0:BARCODE").
-# Bare _1/_2 (underscore without R) are intentionally excluded: they are
-# indistinguishable from accession suffixes (e.g. MGYG000290000_1).
-_PAIR_SUFFIX_RE = re.compile(
-    r"/R?[12]$"             # /1  /2  /R1  /R2
-    r"|_R[12]$"             # _R1  _R2
-    r"|\.R?[12]$"           # .1  .2  .R1  .R2
-    r"|[ \t][12]:[^ \t]+$"  # CASAVA: " 1:N:0:BARCODE"
-)
-
-_PAIR_NUMBER_RE = re.compile(
-    r"/R?([12])$"           # /1  /2  /R1  /R2
-    r"|_R([12])$"           # _R1  _R2
-    r"|\.R?([12])$"         # .1  .2  .R1  .R2
-    r"|[ \t]([12]):[^ \t]+$"  # CASAVA: " 1:N:0:BARCODE"
-)
-
-
-def _template_name(name: str) -> str:
-    """Strip paired-end suffix from *name* to get the template name.
-
-    Args:
-        name: Raw read name from a FASTQ/FASTA file.
-
-    Returns:
-        Template name shared by both mates of a pair.
-    """
-    return _PAIR_SUFFIX_RE.sub("", name.split()[0])
-
-
-def _pair_number(name: str) -> str:
-    """Return the mate number (``"1"`` or ``"2"``) encoded in *name*.
-
-    Returns ``"."`` when no recognised paired-end suffix is found.
-
-    Args:
-        name: Raw read name from a FASTQ/FASTA file.
-
-    Returns:
-        ``"1"``, ``"2"``, or ``"."`` for unpaired reads.
-    """
-    m = _PAIR_NUMBER_RE.search(name)
-    if m is None:
-        return "."
-    return next(g for g in m.groups() if g is not None)
-
 
 @dataclass
 class ReadIndex:
-    """Integer-keyed read registry for memory-efficient downstream use.
+    """Integer-keyed read registry.
 
-    Each read is assigned a compact integer ID so that index structures
-    (Aho-Corasick output lists, pair maps, position tables) store small
-    ints rather than variable-length strings.
-
-    Read names are written to a name-index file by
-    :func:`build_read_index` and can be loaded back with
-    :func:`load_name_index` when output requires them.  After the
-    matcher is built, ``name_to_id`` should be cleared (``name_to_id.clear()``)
-    to release the string keys from memory.
+    Read IDs are 0-based; v2 binary indices are 1-based, so
+    ``read_id = read_index - 1``.
 
     Attributes:
-        n_reads: Total number of reads indexed.
-        name_to_id: Read name to compact integer ID.  Clear after the
-            matcher is built to free string memory.
-        pairs: Read ID to mate read ID for paired-end reads.  Unpaired
-            reads have no entry.
+        n_reads: Total number of reads.
+        pairs: Read ID → mate read ID for paired-end reads.
     """
 
     n_reads: int
-    name_to_id: dict[str, int]
     pairs: dict[int, int]
-
-
-def _write_name_index(sorted_names: list[str], path: Path) -> None:
-    """Write read names to an LZ4-compressed line-per-name file.
-
-    Line number *i* (0-based) is the name for read ID *i*.
-
-    Args:
-        sorted_names: Read names in ascending sort order.
-        path: Destination path for the compressed index file.
-    """
-    content = "\n".join(sorted_names).encode()
-    path.write_bytes(lz4.frame.compress(content))
-
-
-def load_name_index(path: Path) -> list[str]:
-    """Load a name index written by :func:`_write_name_index`.
-
-    Args:
-        path: Path to the LZ4-compressed name-index file.
-
-    Returns:
-        List of read names where index *i* is the name for read ID *i*.
-    """
-    content = lz4.frame.decompress(path.read_bytes())
-    return content.decode().splitlines()
 
 
 def build_read_index(
     prefix: Path,
-    name_index_path: Path,
     paired_interleaved: bool = False,
-    reads_path: Path | None = None,
 ) -> ReadIndex:
-    """Build an integer-indexed read registry from ``.read_minimizers`` files.
+    """Build a read registry by scanning ``.read_minimizers`` files.
 
-    Performs a names-only streaming pass — minimizer data is not loaded
-    into memory.  Reads are assigned IDs in sorted name order.  The
-    sorted name list is written to *name_index_path* (LZ4-compressed,
-    one name per line) and then freed; only ``name_to_id`` and ``pairs``
-    are retained in the returned :class:`ReadIndex`.
-
-    For v2 binary files (``RMBG\\x02``), names are integer read indices.
-    When *paired_interleaved* is ``True``, pairs are assigned arithmetically:
-    odd-indexed reads (1, 3, 5, …) are paired with the next even-indexed read
-    (2, 4, 6, …) — this matches interleaved paired-end input ordering.
-
-    When *reads_path* is provided, read names are sourced from the FASTQ/FASTA
-    file instead of from ``.read_minimizers`` files.
+    Read IDs are 0-based and derived from the 1-based sequential index
+    written by rust-mdbg v2 (``read_id = read_index - 1``).  When
+    *paired_interleaved* is ``True``, pairs are 0↔1, 2↔3, 4↔5, …
+    (interleaved R1/R2 ordering).
 
     Args:
         prefix: rust-mdbg output prefix (e.g. ``Path("rust_mdbg_out")``).
-        name_index_path: Destination for the name-index file.
-        paired_interleaved: Use arithmetic pairing for interleaved input.
-        reads_path: Optional FASTQ or FASTA file (plain or ``.gz``) whose
-            read names override the ``.read_minimizers`` name scan.
+        paired_interleaved: Build arithmetic pairs for interleaved input.
 
     Returns:
-        A :class:`ReadIndex` with ``n_reads``, ``name_to_id``, and
-        ``pairs``.  Call ``name_to_id.clear()`` once the matcher is
-        built to release string memory.
+        A :class:`ReadIndex` with ``n_reads`` and ``pairs``.
     """
-    all_names: list[str] = []
+    pattern = str(prefix) + ".*.read_minimizers"
+    files = sorted(glob.glob(pattern))
+    if not files:
+        logger.warning("No .read_minimizers files found for prefix: %s", prefix)
+        return ReadIndex(n_reads=0, pairs={})
 
-    if reads_path is not None:
-        logger.info("Loading read names from %s", reads_path)
-        all_names.extend(_iter_fastx_names(reads_path))
-    else:
-        pattern = str(prefix) + ".*.read_minimizers"
-        files = sorted(glob.glob(pattern))
-        if not files:
-            logger.warning(
-                "No .read_minimizers files found for prefix: %s", prefix,
-            )
-            _write_name_index([], name_index_path)
-            return ReadIndex(n_reads=0, name_to_id={}, pairs={})
+    max_index = 0
+    with Progress(*_PROGRESS_COLUMNS) as progress:
+        task = progress.add_task("Scanning read indices", total=len(files))
+        for fpath in files:
+            raw = lz4.frame.decompress(Path(fpath).read_bytes())
+            for name in _iter_binary_rm_names(raw):
+                idx = int(name)
+                if idx > max_index:
+                    max_index = idx
+            progress.advance(task)
 
-        with Progress(*_PROGRESS_COLUMNS) as progress:
-            task = progress.add_task("Loading read names", total=len(files))
-            for fpath in files:
-                raw = lz4.frame.decompress(Path(fpath).read_bytes())
-                iter_fn = (
-                    _iter_binary_rm_names
-                    if raw[:4] == _RM_MAGIC
-                    else _iter_tsv_rm_names
-                )
-                all_names.extend(iter_fn(raw))
-                progress.advance(task)
-
-    sorted_names = sorted(all_names)
-    del all_names  # free unsorted list before building the dict
-    _write_name_index(sorted_names, name_index_path)
-    logger.info("Name index written to %s (%d reads)", name_index_path, len(sorted_names))
-
-    name_to_id: dict[str, int] = {
-        name: i for i, name in enumerate(sorted_names)
-    }
+    n_reads = max_index  # 1-based max = count of reads
 
     pairs: dict[int, int] = {}
     if paired_interleaved:
-        # Arithmetic pairing for interleaved input: 1↔2, 3↔4, 5↔6, …
-        # Names are 1-based read indices (str); pair odd with the next even.
-        try:
-            int_ids = sorted(int(n) for n in sorted_names)
-        except ValueError:
-            logger.warning(
-                "paired_interleaved=True but names are not integers; "
-                "falling back to template-name pairing"
-            )
-            int_ids = []
-        if int_ids:
-            id_set = set(int_ids)
-            for idx in int_ids:
-                if idx % 2 == 1 and (idx + 1) in id_set:
-                    r1 = name_to_id[str(idx)]
-                    r2 = name_to_id[str(idx + 1)]
-                    pairs[r1] = r2
-                    pairs[r2] = r1
-            logger.info(
-                "Interleaved pairing: %d pairs from %d reads",
-                len(pairs) // 2, len(sorted_names),
-            )
-    else:
-        template_to_ids: dict[str, list[int]] = {}
-        for read_id, name in enumerate(sorted_names):
-            tmpl = _template_name(name)
-            logger.debug("Read name: %s  template: %s", name, tmpl)
-            template_to_ids.setdefault(tmpl, []).append(read_id)
+        for i in range(0, n_reads - 1, 2):
+            pairs[i] = i + 1
+            pairs[i + 1] = i
+        logger.info(
+            "Interleaved pairing: %d pairs from %d reads",
+            len(pairs) // 2, n_reads,
+        )
 
-        for tmpl, ids in template_to_ids.items():
-            if len(ids) == 2:
-                pairs[ids[0]] = ids[1]
-                pairs[ids[1]] = ids[0]
-            elif len(ids) > 2:
-                logger.warning(
-                    "Template %r has %d reads; skipping pair detection",
-                    tmpl, len(ids),
-                )
-    del sorted_names  # free the sorted list; dict keys are the canonical copy
-
-    n_reads = len(name_to_id)
-    logger.info(
-        "Read index: %d reads, %d paired templates",
-        n_reads, len(pairs) // 2,
-    )
-    return ReadIndex(n_reads=n_reads, name_to_id=name_to_id, pairs=pairs)
+    logger.info("Read index: %d reads, %d paired templates", n_reads, len(pairs) // 2)
+    return ReadIndex(n_reads=n_reads, pairs=pairs)
 
 
 def path_minimizer_sequence(
@@ -860,7 +585,9 @@ def build_lmdb_index(
         return k_levels, seg_k
 
     logger.info("Building LMDB index at %s", db_path)
-    db_path.mkdir(parents=True, exist_ok=True)
+    if db_path.exists():
+        shutil.rmtree(db_path)
+    db_path.mkdir(parents=True)
     env = lmdb.open(
         str(db_path),
         map_size=_LMDB_MAP_SIZE,
@@ -880,7 +607,6 @@ def build_lmdb_index(
     min_len = 10 ** 9
     max_len = 0
     rm_files = sorted(glob.glob(str(read_prefix) + ".*.read_minimizers"))
-    compact_map = _maybe_load_compact_map(read_prefix)
 
     with Progress(*_PROGRESS_COLUMNS) as progress:
         task = progress.add_task(
@@ -889,9 +615,9 @@ def build_lmdb_index(
         for fpath in rm_files:
             raw = lz4.frame.decompress(Path(fpath).read_bytes())
             with env.begin(write=True) as txn:
-                for read_name, mids in _iter_binary_rm(raw, compact_map):
-                    read_id = index.name_to_id.get(read_name)
-                    if read_id is None:
+                for read_name, mids in _iter_binary_rm(raw):
+                    read_id = int(read_name) - 1
+                    if read_id >= index.n_reads:
                         continue
                     n = len(mids)
                     if n:
@@ -957,9 +683,8 @@ def build_lmdb_index(
             with env.begin() as rtxn:
                 cursor = rtxn.cursor(db=reads_db)
                 for name_bytes, val_bytes in cursor:
-                    read_name = name_bytes.decode()
-                    read_id = index.name_to_id.get(read_name)
-                    if read_id is None:
+                    read_id = int(name_bytes.decode()) - 1
+                    if read_id >= index.n_reads:
                         progress.advance(task)
                         continue
                     n = len(val_bytes) // 8
@@ -2504,14 +2229,6 @@ def main(
              "(e.g. rust_mdbg_out); reads all matching "
              "{prefix}.*.read_minimizers files",
     )] = None,
-    reads: Annotated[Path | None, typer.Option(
-        "--reads",
-        help="FASTQ or FASTA file (plain or .gz) whose read names populate "
-             "the read index; overrides the .read_minimizers name scan when "
-             "provided alongside --read-minimizers",
-        exists=True,
-        dir_okay=False,
-    )] = None,
     lmdb_index: Annotated[Path | None, typer.Option(
         "--lmdb-index",
         help="Path to the unified on-disk LMDB index directory. Built "
@@ -2568,13 +2285,6 @@ def main(
              "path_length_bp.",
         dir_okay=False,
     )] = None,
-    min_paired_matches: Annotated[int, typer.Option(
-        "--min-paired-matches",
-        help="Keep only paths where at least this many paired-end read "
-             "pairs (both mates mapped to the same path) are found. "
-             "Applied after matching, before reporting. 0 disables "
-             "the filter. Requires --read-minimizers.",
-    )] = 5,
     matcher: Annotated[MatcherMode, typer.Option(
         "--matcher",
         help="Read-to-path matching strategy. "
@@ -2692,12 +2402,14 @@ def main(
     ins_stats: dict[str, object] = {}
     bp_scale: float | None = None
 
+    # --- Select top N paths by length before read mapping ---------------------
+    if sampled and top_paths:
+        sampled.sort(key=lambda t: t[1], reverse=True)
+        sampled = sampled[:top_paths]
+
     if read_minimizers_prefix is not None:
-        _name_index_path = Path(
-            str(read_minimizers_prefix) + ".read_name_index"
-        )
         read_index = build_read_index(
-            read_minimizers_prefix, _name_index_path, interleaved_pairs, reads,
+            read_minimizers_prefix, interleaved_pairs,
         )
         typer.echo(
             f"Read index: {read_index.n_reads:,} reads, "
@@ -2720,16 +2432,13 @@ def main(
             max_dbs=_LMDB_MAX_DBS, map_size=_LMDB_MAP_SIZE,
         )
 
-        # Precompute path sequences for the matcher.
+        # Precompute path sequences for the top paths only.
         path_seqs: list[np.ndarray] = []
         if sampled:
             seg_min_index = build_seg_min_index_from_lmdb(graph, lmdb_env)
             effective_k = lmdb_seg_k if lmdb_seg_k is not None else k
             bp_scale = _minimizer_to_bp_scale(graph, seg_min_index)
-            typer.echo(
-                f"Segment minimizers: (k={effective_k})",
-                err=True,
-            )
+            typer.echo(f"Segment minimizers: (k={effective_k})", err=True)
             typer.echo(
                 f"bp/minimizer scale: "
                 + (f"{bp_scale:.3f}" if bp_scale else "unavailable"),
@@ -2738,8 +2447,7 @@ def main(
 
             if chosen_comps:
                 typer.echo(
-                    f"Chosen components ({len(chosen_comps)} total):",
-                    err=True,
+                    f"Chosen components ({len(chosen_comps)} total):", err=True,
                 )
                 _report_chosen_components(graph, chosen_comps, seg_min_index)
 
@@ -2759,50 +2467,8 @@ def main(
             )
         lmdb_env.close()
         typer.echo(read_matcher.describe(), err=True)
-        read_index.name_to_id.clear()
-        logger.info("name_to_id cleared; string keys released from memory")
 
-        # --- Score all paths, filter by paired matches, rank, select top N ----
-        # Matches are cached here so the reporting loop below reuses them.
-        cached_matches: list[list[PathMatch]] = []
-        path_pair_counts: list[int] = []
-        if sampled:
-            _scored: list[
-                tuple[int, int, np.ndarray, tuple[_OrientedPath, int], list[PathMatch]]
-            ] = []
-            with Progress(*_PROGRESS_COLUMNS) as progress:
-                task = progress.add_task(
-                    "Scoring paths by paired matches", total=len(sampled),
-                )
-                for seq, entry in zip(path_seqs, sampled):
-                    pm = match_reads_to_path(seq, read_matcher)
-                    n_pairs = len(_path_pair_insert_sizes(pm, read_index))
-                    _scored.append((n_pairs, entry[1], seq, entry, pm))
-                    progress.advance(task)
-
-            if min_paired_matches > 0:
-                n_before = len(_scored)
-                _scored = [t for t in _scored if t[0] >= min_paired_matches]
-                n_removed = n_before - len(_scored)
-                typer.echo(
-                    f"Path filter (≥{min_paired_matches} paired matches): "
-                    f"{len(_scored)} of {n_before} paths kept "
-                    f"({n_removed} removed)",
-                    err=True,
-                )
-
-            # Sort by paired match count descending; length descending as tiebreaker.
-            _scored.sort(key=lambda t: (t[0], t[1]), reverse=True)
-            if top_paths:
-                _scored = _scored[:top_paths]
-
-            path_seqs = [t[2] for t in _scored]
-            sampled = [t[3] for t in _scored]
-            cached_matches = [t[4] for t in _scored]
-            path_pair_counts = [t[0] for t in _scored]
-            del _scored
-
-        # --- Report and write paths after filtering ----------------------------
+        # --- Report and write paths --------------------------------------------
         if sampled:
             n_paths = len(sampled)
             unique_path_nodes = {
@@ -2818,18 +2484,13 @@ def main(
                 f"= {n_unique / n_total:.1%} of {n_total:,}):",
                 err=True,
             )
-            for i, (seq, (path, bp), n_pairs) in enumerate(
-                zip(path_seqs, sampled, path_pair_counts)
-            ):
+            for i, (seq, (path, bp)) in enumerate(zip(path_seqs, sampled)):
                 if i == 10:
-                    typer.echo(
-                        f"  ... and {n_paths - 10} more", err=True,
-                    )
+                    typer.echo(f"  ... and {n_paths - 10} more", err=True)
                     break
                 typer.echo(
                     f"  [{i + 1}] {len(seq):,} minimizers, "
-                    f"{bp:,} bp, {len(path)} nodes, "
-                    f"{n_pairs} paired matches",
+                    f"{bp:,} bp, {len(path)} nodes",
                     err=True,
                 )
 
@@ -2841,9 +2502,7 @@ def main(
                     for path_idx, (seq, (path, bp)) in enumerate(
                         zip(path_seqs, sampled), start=1,
                     ):
-                        minimizers_col = ",".join(
-                            str(int(m)) for m in seq
-                        )
+                        minimizers_col = ",".join(str(int(m)) for m in seq)
                         nodes_col = ",".join(
                             graph[node_idx].name + ("+" if fwd else "-")
                             for node_idx, fwd in path
@@ -2852,20 +2511,11 @@ def main(
                             f"{path_idx}\t{minimizers_col}\t"
                             f"{nodes_col}\t{bp}\n"
                         )
-                typer.echo(
-                    f"Paths written to {paths_out}", err=True,
-                )
+                typer.echo(f"Paths written to {paths_out}", err=True)
 
+        # --- Match reads to the top paths -------------------------------------
         if sampled:
-            # Load name strings from disk only if output files need them;
-            # held only for the duration of the matching loop then released.
-            _need_names = (
-                read_mappings_out is not None or insert_sizes_out is not None
-            )
-            _output_names: list[str] = (
-                load_name_index(_name_index_path) if _need_names else []
-            )
-            match_counts: dict[int, int] = {}  # read_id → hit count
+            match_counts: dict[int, int] = {}
             all_insert_sizes_min: list[int] = []
             insert_out_fh = (
                 open(insert_sizes_out, "w")  # noqa: WPS515
@@ -2874,7 +2524,7 @@ def main(
             )
             if insert_out_fh is not None:
                 header_cols = (
-                    "read1_name\tread2_name\t"
+                    "read1_index\tread2_index\t"
                     "insert_size_minimizers"
                     + ("\tinsert_size_bp" if bp_scale else "")
                 )
@@ -2886,27 +2536,28 @@ def main(
                 else None
             )
             if mappings_out_fh is not None:
-                mappings_out_fh.write("read_name\tpair\tpath_index\n")
+                mappings_out_fh.write("read_index\tpair\tpath_index\n")
 
-            del sampled  # content fully consumed above; free path-node lists
+            del sampled
             try:
                 with Progress(*_PROGRESS_COLUMNS) as progress:
                     task = progress.add_task(
-                        "Matching reads to paths", total=len(cached_matches),
+                        "Matching reads to paths", total=len(path_seqs),
                     )
-                    for path_idx, (seq, path_matches) in enumerate(
-                        zip(path_seqs, cached_matches), start=1,
-                    ):
+                    for path_idx, seq in enumerate(path_seqs, start=1):
+                        path_matches = read_matcher.search_path(seq)
                         for m in path_matches:
                             match_counts[m.read_id] = (
                                 match_counts.get(m.read_id, 0) + 1
                             )
                             n_total_matches += 1
                             if mappings_out_fh is not None:
-                                rname = _output_names[m.read_id]
+                                pair_num = (
+                                    "1" if m.read_id % 2 == 0 else "2"
+                                ) if m.read_id in read_index.pairs else "."
                                 mappings_out_fh.write(
-                                    f"{rname}\t"
-                                    f"{_pair_number(rname)}\t"
+                                    f"{m.read_id + 1}\t"
+                                    f"{pair_num}\t"
                                     f"{path_idx}\n"
                                 )
                         for r1_id, r2_id, span in _path_pair_insert_sizes(
@@ -2914,10 +2565,8 @@ def main(
                         ):
                             all_insert_sizes_min.append(span)
                             if insert_out_fh is not None:
-                                r1_name = _output_names[r1_id]
-                                r2_name = _output_names[r2_id]
                                 row = (
-                                    f"{r1_name}\t{r2_name}\t{span}"
+                                    f"{r1_id + 1}\t{r2_id + 1}\t{span}"
                                 )
                                 if bp_scale is not None:
                                     row += f"\t{span * bp_scale:.1f}"
@@ -2928,7 +2577,6 @@ def main(
                     insert_out_fh.close()
                 if mappings_out_fh is not None:
                     mappings_out_fh.close()
-                del _output_names  # release name strings from memory
 
             n_matched_reads = len(match_counts)
             typer.echo(

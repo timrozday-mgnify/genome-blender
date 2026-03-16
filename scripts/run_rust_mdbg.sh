@@ -1,25 +1,19 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-INPUT_DIR="$(cd ../genome-blender_run/multi_genome_full/output && pwd)"
+INPUT_DIR="$(cd ../genome-blender_run/single_short_shallow/output && pwd)"
 OUTPUT_DIR="${INPUT_DIR}/rust-mdbg"
 mkdir -p "${OUTPUT_DIR}"
 
-# Whether the input is paired-end (R1 + R2 files).  Set to 1 to interleave;
-# set to 0 to concatenate all FASTQ files as single-end.
+# Whether the input is paired-end (R1 + R2 files).
+# Set to 1 to pass R1 and R2 separately via --reads2 (rust-mdbg assigns
+# interleaved indices: 1=R1, 2=R2, 3=R1, … enabling arithmetic pairing
+# in parse_gfa.py --interleaved-pairs).
+# Set to 0 to use a single FASTQ file as single-end input.
 PAIRED_END=1
 
-# rust-mdbg accepts a single reads file.
-# For paired-end input the R1 and R2 files must be interleaved so that
-# sequential read indices (v2 format) follow the pattern 1=R1, 2=R2, 3=R1, …
-# which allows --interleaved-pairs arithmetic pairing in parse_gfa.py.
-COMBINED="${OUTPUT_DIR}/combined_reads.fastq"
-
-_open() { case "$1" in *.gz) gunzip -c "$1";; *) cat "$1";; esac; }
-_write() { case "${COMBINED}" in *.gz) gzip -c;; *) cat;; esac > "${COMBINED}"; }
-
+# Detect R1 and R2 files (for paired-end) or collect all FASTQ files (single-end).
 if [[ "${PAIRED_END}" -eq 1 ]]; then
-    # Detect gzipped output from genome-blender (default: .fastq.gz)
     R1=""; for f in "${INPUT_DIR}"/*_R1.fastq.gz "${INPUT_DIR}"/*_R1.fastq; do
         [[ -f "$f" ]] && R1="$f" && break; done
     R2=""; for f in "${INPUT_DIR}"/*_R2.fastq.gz "${INPUT_DIR}"/*_R2.fastq; do
@@ -28,28 +22,19 @@ if [[ "${PAIRED_END}" -eq 1 ]]; then
         echo "ERROR: could not find R1/R2 FASTQ files in ${INPUT_DIR}" >&2
         exit 1
     fi
-    # Name the combined file to match the input extension
-    case "${R1}" in *.gz) COMBINED="${OUTPUT_DIR}/combined_reads.fastq.gz";;
-                    *)    COMBINED="${OUTPUT_DIR}/combined_reads.fastq";; esac
-    echo "Interleaving paired-end reads: ${R1}  +  ${R2}"
-    # Interleave: collapse each file to one tab-separated line per record,
-    # then alternate records from R1 and R2, then expand back to 4 lines each.
-    paste <(paste - - - - < <(_open "${R1}")) \
-          <(paste - - - - < <(_open "${R2}")) \
-    | awk -F'\t' '{print $1; print $2; print $3; print $4;
-                   print $5; print $6; print $7; print $8}' \
-    | _write
+    echo "Paired-end reads: R1=${R1}  R2=${R2}"
+    READS_FILE="${R1}"
+    READS2_FLAG=(--reads2 "${R2}")
 else
     # Single-end: prefer .fastq.gz, fall back to .fastq
     SE_GZ=( "${INPUT_DIR}"/*.fastq.gz )
     SE_PLAIN=( "${INPUT_DIR}"/*.fastq )
-    if [[ -f "${SE_GZ[0]}" ]]; then
-        COMBINED="${OUTPUT_DIR}/combined_reads.fastq.gz"
-        cat "${SE_GZ[@]}" | _write
+    if [[ -f "${SE_GZ[0]:-}" ]]; then
+        READS_FILE="${SE_GZ[0]}"
     else
-        COMBINED="${OUTPUT_DIR}/combined_reads.fastq"
-        cat "${SE_PLAIN[@]}" | _write
+        READS_FILE="${SE_PLAIN[0]}"
     fi
+    READS2_FLAG=()
 fi
 
 # rust-mdbg parameters
@@ -67,7 +52,7 @@ MINIMIZER_TABLE="${PREFIX}.minimizer_table"
 #   read_length * density * 1.25 = l  =>  density = l / (read_length * 1.25)
 READS_STATS_JSON="${OUTPUT_DIR}/reads_stats.json"
 /Users/timrozday/miniforge3/envs/genome_blender_dev/bin/python \
-    "$(dirname "$0")/reads_summary.py" "${COMBINED}" -n 1000 \
+    "$(dirname "$0")/reads_summary.py" "${READS_FILE}" -n 1000 \
     --json "${READS_STATS_JSON}"
 MEAN_READ_LEN=$(
     /Users/timrozday/miniforge3/envs/genome_blender_dev/bin/python3 -c \
@@ -81,10 +66,12 @@ echo "Estimated mean read length: ${MEAN_READ_LEN} bp"
 echo "Using density: ${DENSITY}  (l=${L} / (${MEAN_READ_LEN} * 1.25))"
 
 # Run rust-mdbg directly (local build from timrozday-mgnify/rust-mdbg, mg-summary branch)
-# --dump-read-minimizers writes {PREFIX}.{thread}.read_minimizers (LZ4-compressed TSV)
+# --dump-read-minimizers writes {PREFIX}.{thread}.read_minimizers (LZ4-compressed binary v2)
 # and {PREFIX}.minimizer_table (plain-text TSV: hash <-> l-mer lookup)
+# When --reads2 is given, R1 gets odd indices (1, 3, 5, …) and R2 gets even (2, 4, 6, …).
 "$(dirname "$0")/../bin/rust-mdbg" \
-    "${COMBINED}" \
+    "${READS_FILE}" \
+    "${READS2_FLAG[@]}" \
     -k "${K}" \
     --density "${DENSITY}" \
     -l "${L}" \
@@ -97,13 +84,11 @@ UNIQUE_MINIMIZERS=$(grep -vc '^#' "${MINIMIZER_TABLE}" 2>/dev/null || echo 0)
 echo "Unique minimizers in minimizer_table: ${UNIQUE_MINIMIZERS}"
 
 # Build parse_gfa.py paired-end flags.
-# --interleaved-pairs: use arithmetic pairing (1↔2, 3↔4, …) for v2 binary
-#   files where names are sequential integer indices; requires interleaved input.
-# --reads: source read names from the FASTQ so human-readable names appear in
-#   output alongside the integer v2 indices.
+# --interleaved-pairs: arithmetic pairing (0↔1, 2↔3, …) derived from the
+#   interleaved 1-based read indices written by rust-mdbg v2 --reads2 mode.
 _PAIRED_FLAGS=()
 if [[ "${PAIRED_END}" -eq 1 ]]; then
-    _PAIRED_FLAGS+=(--interleaved-pairs --reads "${COMBINED}")
+    _PAIRED_FLAGS+=(--interleaved-pairs)
 fi
 
 /Users/timrozday/miniforge3/envs/genome_blender_dev/bin/python "$(dirname "$0")/parse_gfa.py" \
@@ -125,14 +110,3 @@ fi
     --summary \
     --json "${PREFIX}.minimizer_summary.json" \
     "${PREFIX}"
-
-# echo "rust_mdbg_out.gfa head: $( cat ${OUTPUT_DIR}/rust_mdbg_out.gfa | sed -nE 's/^.*LN:i:([0-9]+).*$/\1/p' | sort -nr | head -n 5 )"
-
-# docker run --rm \
-#     -v "${OUTPUT_DIR}:/output" \
-#     --entrypoint to_basespace \
-#     rust-mdbg \
-#     --gfa /output/rust_mdbg_out.unitigs.gfa \
-#     --sequences /output/rust_mdbg_out
-# 
-# echo "rust_mdbg_out.unitigs.gfa.complete.gfa wc stats: $(wc ${OUTPUT_DIR}/rust_mdbg_out.unitigs.gfa.complete.gfa)"
