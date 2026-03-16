@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import gzip
 import logging
 from pathlib import Path
 
@@ -21,18 +22,27 @@ def write_fastq(
 ) -> None:
     """Write reads to a FASTQ file with Phred+33 encoding.
 
+    Gzip compression is applied automatically when *output_path* ends
+    with ``.gz``; each call opens (or appends to) an independent gzip
+    frame, producing a valid concatenated gzip stream.
+
     Args:
         reads: Reads to write.
-        output_path: Output FASTQ file path.
-        append: If True, append to existing file.
+        output_path: Output FASTQ file path.  Use a ``.gz`` suffix for
+            gzip-compressed output.
+        append: If True, append to the existing file.
     """
-    mode = "a" if append else "w"
+    compressed = output_path.suffix == ".gz"
+    text_mode = "at" if append else "wt"
+    plain_mode = "a" if append else "w"
     logger.debug(
         "%s %d reads to %s",
         "Appending" if append else "Writing",
         len(reads), output_path,
     )
-    with open(output_path, mode) as fh:
+    opener = gzip.open if compressed else open
+    open_mode = text_mode if compressed else plain_mode
+    with opener(output_path, open_mode) as fh:
         with progress_task(
             len(reads), f"Writing {output_path.name}",
         ) as step:

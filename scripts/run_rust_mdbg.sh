@@ -10,7 +10,7 @@ COMBINED="${OUTPUT_DIR}/combined_reads.fastq"
 cat "${INPUT_DIR}"/*.fastq > "${COMBINED}"
 
 # rust-mdbg parameters
-K=5   # k-mer size (minimizer k-mer)
+K=4   # k-mer size (minimizer k-mer)
 L=12  # l-mer length (minimizer length)
 MINABUND=2
 
@@ -21,7 +21,7 @@ MINIMIZER_TABLE="${PREFIX}.minimizer_table"
 
 # Estimate mean read length from the first 1000 reads, then derive density.
 # The minimizer length l and density are related by:
-#   read_length * density * 0.75 = l  =>  density = l / (read_length * 0.75)
+#   read_length * density * 1.25 = l  =>  density = l / (read_length * 1.25)
 READS_STATS_JSON="${OUTPUT_DIR}/reads_stats.json"
 /Users/timrozday/miniforge3/envs/genome_blender_dev/bin/python \
     "$(dirname "$0")/reads_summary.py" "${COMBINED}" -n 1000 \
@@ -32,10 +32,10 @@ MEAN_READ_LEN=$(
 )
 DENSITY=$(
     /Users/timrozday/miniforge3/envs/genome_blender_dev/bin/python3 -c \
-        "print(f'{${L} / (${MEAN_READ_LEN} * 0.75):.4f}')"
+        "print(f'{${L} / (${MEAN_READ_LEN} * 1.25):.4f}')"
 )
 echo "Estimated mean read length: ${MEAN_READ_LEN} bp"
-echo "Using density: ${DENSITY}  (l=${L} / (${MEAN_READ_LEN} * 0.75))"
+echo "Using density: ${DENSITY}  (l=${L} / (${MEAN_READ_LEN} * 1.25))"
 
 # Run rust-mdbg directly (local build from timrozday-mgnify/rust-mdbg, mg-summary branch)
 # --dump-read-minimizers writes {PREFIX}.{thread}.read_minimizers (LZ4-compressed TSV)
@@ -57,7 +57,7 @@ echo "Unique minimizers in minimizer_table: ${UNIQUE_MINIMIZERS}"
     -n 100000 \
     --top-paths 5 \
     --sample-component-proportion 0.5 \
-    --matcher psuedo-match \
+    --matcher pseudo-match \
     --read-minimizers "${PREFIX}" \
     --minimizer-table "${MINIMIZER_TABLE}" \
     --insert-sizes-out "${PREFIX}.insert_sizes.tsv" \

@@ -218,6 +218,12 @@ def main(
         help="Number of fragments to process per chunk "
         "to limit memory usage",
     )] = 100_000,
+    compress: Annotated[bool, typer.Option(
+        "--compress/--no-compress",
+        help="Write gzip-compressed FASTQ output "
+        "(.fastq.gz).  Enabled by default; use "
+        "--no-compress for plain-text FASTQ.",
+    )] = True,
 ) -> None:
     """Generate simulated WGS reads from reference genomes."""
     # Apply YAML config: values from the file fill in anything
@@ -364,6 +370,7 @@ def main(
         profile=profile,
         calibration=calibration,
         error_rate_scale=error_rate_scale,
+        compress=compress,
     )
 
     if disable_progress:
@@ -488,6 +495,7 @@ def _run_pipeline(
     profile: ErrorModelProfile | None,
     calibration: QualityCalibration | None,
     error_rate_scale: float,
+    compress: bool,
     outer_progress: Progress | None,
     inner_progress: Progress | None,
 ) -> None:
@@ -527,11 +535,12 @@ def _run_pipeline(
     output_dir = Path(output_prefix).parent
     output_dir.mkdir(parents=True, exist_ok=True)
     bam_path = Path(f"{output_prefix}.bam")
+    fq_ext = ".fastq.gz" if compress else ".fastq"
     if paired_end:
-        r1_path = Path(f"{output_prefix}_R1.fastq")
-        r2_path = Path(f"{output_prefix}_R2.fastq")
+        r1_path = Path(f"{output_prefix}_R1{fq_ext}")
+        r2_path = Path(f"{output_prefix}_R2{fq_ext}")
     else:
-        out_path = Path(f"{output_prefix}.fastq")
+        out_path = Path(f"{output_prefix}{fq_ext}")
 
     header, ref_name_to_idx = build_bam_header(genomes)
 

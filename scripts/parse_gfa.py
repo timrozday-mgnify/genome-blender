@@ -16,6 +16,7 @@ Usage::
 from __future__ import annotations
 
 import glob
+import gzip
 import io
 import json
 import logging
@@ -387,6 +388,42 @@ def _iter_tsv_rm_names(raw: bytes) -> Iterator[str]:
             yield parts[0]
 
 
+def _iter_fastx_names(path: Path) -> Iterator[str]:
+    """Yield the first whitespace-delimited token from each sequence header.
+
+    Handles both FASTQ (records starting with ``@``) and FASTA (records
+    starting with ``>``).  Gzip-compressed files are detected automatically
+    from a ``.gz`` suffix.  Format is auto-detected from the first non-empty
+    line.
+
+    Args:
+        path: Path to a FASTQ or FASTA file, optionally gzip-compressed.
+
+    Yields:
+        Read/sequence names (header token before the first space).
+    """
+    opener = gzip.open if path.suffix == ".gz" else open
+    with opener(path, "rt") as fh:
+        is_fastq: bool | None = None
+        skip_remaining = 0
+        for raw_line in fh:
+            line = raw_line.rstrip("\n")
+            if skip_remaining > 0:
+                skip_remaining -= 1
+                continue
+            if is_fastq is None:
+                if not line:
+                    continue
+                is_fastq = line.startswith("@")
+            if is_fastq:
+                if line.startswith("@"):
+                    yield line[1:].split()[0]
+                    skip_remaining = 3  # seq, +, qual
+            else:
+                if line.startswith(">"):
+                    yield line[1:].split()[0]
+
+
 def iter_read_minimizers(
     prefix: Path,
 ) -> Iterator[tuple[str, tuple[int, ...]]]:
@@ -550,6 +587,7 @@ def build_read_index(
     prefix: Path,
     name_index_path: Path,
     paired_interleaved: bool = False,
+    reads_path: Path | None = None,
 ) -> ReadIndex:
     """Build an integer-indexed read registry from ``.read_minimizers`` files.
 
@@ -564,37 +602,47 @@ def build_read_index(
     odd-indexed reads (1, 3, 5, …) are paired with the next even-indexed read
     (2, 4, 6, …) — this matches interleaved paired-end input ordering.
 
+    When *reads_path* is provided, read names are sourced from the FASTQ/FASTA
+    file instead of from ``.read_minimizers`` files.
+
     Args:
         prefix: rust-mdbg output prefix (e.g. ``Path("rust_mdbg_out")``).
         name_index_path: Destination for the name-index file.
         paired_interleaved: Use arithmetic pairing for interleaved input.
+        reads_path: Optional FASTQ or FASTA file (plain or ``.gz``) whose
+            read names override the ``.read_minimizers`` name scan.
 
     Returns:
         A :class:`ReadIndex` with ``n_reads``, ``name_to_id``, and
         ``pairs``.  Call ``name_to_id.clear()`` once the matcher is
         built to release string memory.
     """
-    pattern = str(prefix) + ".*.read_minimizers"
-    files = sorted(glob.glob(pattern))
-    if not files:
-        logger.warning(
-            "No .read_minimizers files found for prefix: %s", prefix,
-        )
-        _write_name_index([], name_index_path)
-        return ReadIndex(n_reads=0, name_to_id={}, pairs={})
-
     all_names: list[str] = []
-    with Progress(*_PROGRESS_COLUMNS) as progress:
-        task = progress.add_task("Loading read names", total=len(files))
-        for fpath in files:
-            raw = lz4.frame.decompress(Path(fpath).read_bytes())
-            iter_fn = (
-                _iter_binary_rm_names
-                if raw[:4] == _RM_MAGIC
-                else _iter_tsv_rm_names
+
+    if reads_path is not None:
+        logger.info("Loading read names from %s", reads_path)
+        all_names.extend(_iter_fastx_names(reads_path))
+    else:
+        pattern = str(prefix) + ".*.read_minimizers"
+        files = sorted(glob.glob(pattern))
+        if not files:
+            logger.warning(
+                "No .read_minimizers files found for prefix: %s", prefix,
             )
-            all_names.extend(iter_fn(raw))
-            progress.advance(task)
+            _write_name_index([], name_index_path)
+            return ReadIndex(n_reads=0, name_to_id={}, pairs={})
+
+        with Progress(*_PROGRESS_COLUMNS) as progress:
+            task = progress.add_task("Loading read names", total=len(files))
+            for fpath in files:
+                raw = lz4.frame.decompress(Path(fpath).read_bytes())
+                iter_fn = (
+                    _iter_binary_rm_names
+                    if raw[:4] == _RM_MAGIC
+                    else _iter_tsv_rm_names
+                )
+                all_names.extend(iter_fn(raw))
+                progress.advance(task)
 
     sorted_names = sorted(all_names)
     del all_names  # free unsorted list before building the dict
@@ -2773,6 +2821,14 @@ def main(
              "(e.g. rust_mdbg_out); reads all matching "
              "{prefix}.*.read_minimizers files",
     )] = None,
+    reads: Annotated[Path | None, typer.Option(
+        "--reads",
+        help="FASTQ or FASTA file (plain or .gz) whose read names populate "
+             "the read index; overrides the .read_minimizers name scan when "
+             "provided alongside --read-minimizers",
+        exists=True,
+        dir_okay=False,
+    )] = None,
     minimizer_table: Annotated[Path | None, typer.Option(
         "--minimizer-table",
         help="Path to the rust-mdbg {prefix}.minimizer_table file "
@@ -2962,7 +3018,9 @@ def main(
         _name_index_path = Path(
             str(read_minimizers_prefix) + ".read_name_index"
         )
-        read_index = build_read_index(read_minimizers_prefix, _name_index_path, interleaved_pairs)
+        read_index = build_read_index(
+            read_minimizers_prefix, _name_index_path, interleaved_pairs, reads,
+        )
         typer.echo(
             f"Read index: {read_index.n_reads:,} reads, "
             f"{len(read_index.pairs) // 2:,} paired templates",
