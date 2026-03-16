@@ -23,7 +23,6 @@ import logging
 import math
 import random
 import re
-import shutil
 import struct
 from collections import deque
 from collections.abc import Callable, Iterable, Iterator
@@ -276,59 +275,6 @@ def _add_link(
 # rust-mdbg read minimizers
 # ------------------------------------------------------------------
 
-# Binary format: LZ4-compressed
-# v2: header b"RMBG\x02" (5 bytes); per-record: u32 LE read_index | u32 LE n | n×u64 LE ids | n×u32 LE pos
-_RM_HDR_LEN = 5  # 4 magic + 1 version
-
-
-def _iter_binary_rm(raw: bytes) -> Iterator[tuple[str, tuple[int, ...]]]:
-    """Yield ``(name, minimizer_ids)`` from v2 binary-format bytes."""
-    mv = memoryview(raw)
-    offset = _RM_HDR_LEN
-    total = len(raw)
-    while offset < total:
-        (read_index,) = struct.unpack_from("<I", mv, offset)
-        offset += 4
-        (n,) = struct.unpack_from("<I", mv, offset)
-        offset += 4
-        ids: tuple[int, ...] = struct.unpack_from(f"<{n}Q", mv, offset)
-        offset += n * 8 + n * 4  # ids (n×8) + positions (n×4)
-        yield str(read_index), ids
-
-
-def _iter_binary_rm_names(raw: bytes) -> Iterator[str]:
-    """Yield read indices only from v2 binary-format bytes, skipping minimizer data."""
-    mv = memoryview(raw)
-    offset = _RM_HDR_LEN
-    total = len(raw)
-    while offset < total:
-        (read_index,) = struct.unpack_from("<I", mv, offset)
-        offset += 4
-        (n,) = struct.unpack_from("<I", mv, offset)
-        offset += 4 + n * 12  # ids (n×8) + positions (n×4)
-        yield str(read_index)
-
-
-
-def iter_read_minimizers(
-    prefix: Path,
-) -> Iterator[tuple[str, tuple[int, ...]]]:
-    """Stream ``(name, minimizer_ids)`` pairs from all ``.read_minimizers`` files.
-
-    Decompresses one file at a time.
-
-    Args:
-        prefix: rust-mdbg output prefix (e.g. ``Path("rust_mdbg_out")``).
-
-    Yields:
-        ``(read_index_str, minimizer_id_tuple)`` for each read record.
-    """
-    pattern = str(prefix) + ".*.read_minimizers"
-    files = sorted(glob.glob(pattern))
-    for fpath in files:
-        raw = lz4.frame.decompress(Path(fpath).read_bytes())
-        yield from _iter_binary_rm(raw)
-
 
 def load_minimizer_table(table_path: Path) -> dict[int, str]:
     """Load a rust-mdbg minimizer_table file into a hash-to-lmer dict.
@@ -380,41 +326,47 @@ class ReadIndex:
 
 
 def build_read_index(
-    prefix: Path,
+    lmdb_path: Path,
     paired_interleaved: bool = False,
 ) -> ReadIndex:
-    """Build a read registry by scanning ``.read_minimizers`` files.
+    """Build a read registry from the LMDB index written by rust-mdbg.
 
-    Read IDs are 0-based and derived from the 1-based sequential index
-    written by rust-mdbg v2 (``read_id = read_index - 1``).  When
-    *paired_interleaved* is ``True``, pairs are 0↔1, 2↔3, 4↔5, …
-    (interleaved R1/R2 ordering).
+    Reads n_reads from the ``meta`` sub-database (key ``b"n_reads"``,
+    value u64 LE), then builds arithmetic pairs when *paired_interleaved*
+    is True.
 
     Args:
-        prefix: rust-mdbg output prefix (e.g. ``Path("rust_mdbg_out")``).
-        paired_interleaved: Build arithmetic pairs for interleaved input.
+        lmdb_path: Path to the LMDB environment directory (``{prefix}.index.lmdb``).
+        paired_interleaved: Build arithmetic pairs (0↔1, 2↔3, …).
 
     Returns:
         A :class:`ReadIndex` with ``n_reads`` and ``pairs``.
+
+    Raises:
+        FileNotFoundError: If the LMDB directory does not exist.
+        RuntimeError: If ``n_reads`` is missing from the LMDB meta sub-db.
     """
-    pattern = str(prefix) + ".*.read_minimizers"
-    files = sorted(glob.glob(pattern))
-    if not files:
-        logger.warning("No .read_minimizers files found for prefix: %s", prefix)
-        return ReadIndex(n_reads=0, pairs={})
-
-    max_index = 0
-    with Progress(*_PROGRESS_COLUMNS) as progress:
-        task = progress.add_task("Scanning read indices", total=len(files))
-        for fpath in files:
-            raw = lz4.frame.decompress(Path(fpath).read_bytes())
-            for name in _iter_binary_rm_names(raw):
-                idx = int(name)
-                if idx > max_index:
-                    max_index = idx
-            progress.advance(task)
-
-    n_reads = max_index  # 1-based max = count of reads
+    if not lmdb_path.exists():
+        raise FileNotFoundError(
+            f"LMDB index not found at {lmdb_path}; run rust-mdbg with "
+            f"--dump-read-minimizers first"
+        )
+    env = lmdb.open(
+        str(lmdb_path), readonly=True, lock=False,
+        max_dbs=_LMDB_MAX_DBS, map_size=_LMDB_MAP_SIZE,
+    )
+    try:
+        meta_db = env.open_db(_DB_META)
+        with env.begin() as txn:
+            nr = txn.get(_META_N_READS, db=meta_db)
+        if nr is None:
+            raise RuntimeError(
+                f"n_reads not found in LMDB meta at {lmdb_path}; "
+                "re-run rust-mdbg with --dump-read-minimizers"
+            )
+        n_reads = struct.unpack("<Q", nr)[0]
+    finally:
+        env.close()
 
     pairs: dict[int, int] = {}
     if paired_interleaved:
@@ -425,7 +377,6 @@ def build_read_index(
             "Interleaved pairing: %d pairs from %d reads",
             len(pairs) // 2, n_reads,
         )
-
     logger.info("Read index: %d reads, %d paired templates", n_reads, len(pairs) // 2)
     return ReadIndex(n_reads=n_reads, pairs=pairs)
 
@@ -503,16 +454,17 @@ def _kcnt_key(read_id: int, k: int) -> bytes:
 
 
 def _check_lmdb_valid(
-    db_path: Path, n_reads: int, n_levels: int,
+    db_path: Path, n_levels: int,
 ) -> tuple[bool, list[int], int | None]:
-    """Return (is_valid, k_levels, seg_k) from an existing LMDB index.
+    """Return (is_valid, k_levels, seg_k).
 
-    Returns (False, [], None) if the index is absent, corrupt, or
-    was built with different *n_reads* / *n_levels* parameters.
+    Returns (False, [], None) if the index is absent, corrupt, or kinv/kcnt
+    were not built (n_levels missing or mismatched).  The reads sub-db is
+    populated by rust-mdbg; this check only validates the kinv/kcnt layer
+    built on top by :func:`build_lmdb_index`.
 
     Args:
         db_path: LMDB environment directory.
-        n_reads: Expected number of reads (from :class:`ReadIndex`).
         n_levels: Expected number of k levels.
 
     Returns:
@@ -527,14 +479,11 @@ def _check_lmdb_valid(
         )
         meta_db = env.open_db(_DB_META)
         with env.begin() as txn:
-            nr  = txn.get(_META_N_READS,  db=meta_db)
             kl  = txn.get(_META_K_LEVELS, db=meta_db)
             nl  = txn.get(_META_N_LEVELS, db=meta_db)
             sk  = txn.get(_META_SEG_K,    db=meta_db)
         env.close()
-        if not (nr and kl and nl):
-            return False, [], None
-        if struct.unpack("<Q", nr)[0] != n_reads:
+        if not (kl and nl):
             return False, [], None
         if struct.unpack("<H", nl)[0] != n_levels:
             return False, [], None
@@ -574,9 +523,7 @@ def build_lmdb_index(
     Returns:
         Tuple of ``(k_levels, seg_k)``.
     """
-    valid, k_levels, seg_k = _check_lmdb_valid(
-        db_path, index.n_reads, n_levels,
-    )
+    valid, k_levels, seg_k = _check_lmdb_valid(db_path, n_levels)
     if valid:
         logger.info(
             "Reusing LMDB index at %s (k_levels=%s, seg_k=%s)",
@@ -585,9 +532,7 @@ def build_lmdb_index(
         return k_levels, seg_k
 
     logger.info("Building LMDB index at %s", db_path)
-    if db_path.exists():
-        shutil.rmtree(db_path)
-    db_path.mkdir(parents=True)
+    # Rust already created the LMDB directory and populated the reads sub-db.
     env = lmdb.open(
         str(db_path),
         map_size=_LMDB_MAP_SIZE,
@@ -603,29 +548,7 @@ def build_lmdb_index(
 
     _BATCH = 20_000
 
-    # -- Stage 1: .read_minimizers → reads sub-db; track length range --------
-    min_len = 10 ** 9
-    max_len = 0
-    rm_files = sorted(glob.glob(str(read_prefix) + ".*.read_minimizers"))
-
-    with Progress(*_PROGRESS_COLUMNS) as progress:
-        task = progress.add_task(
-            "LMDB: read minimizers", total=len(rm_files),
-        )
-        for fpath in rm_files:
-            raw = lz4.frame.decompress(Path(fpath).read_bytes())
-            with env.begin(write=True) as txn:
-                for read_name, mids in _iter_binary_rm(raw):
-                    read_id = int(read_name) - 1
-                    if read_id >= index.n_reads:
-                        continue
-                    n = len(mids)
-                    if n:
-                        min_len = min(min_len, n)
-                        max_len = max(max_len, n)
-                    val = struct.pack(f"<{n}Q", *mids) if n else b""
-                    txn.put(read_name.encode(), val, db=reads_db)
-            progress.advance(task)
+    # -- Stage 1 REMOVED: reads sub-db already populated by rust-mdbg --------
 
     # -- Stage 2: .sequences → segs sub-db; extract k -----------------------
     seg_k_found: int | None = None
@@ -662,6 +585,17 @@ def build_lmdb_index(
                     val = struct.pack(f"<{len(seg_mids)}Q", *seg_mids) if seg_mids else b""
                     txn.put(parts[0].encode(), val, db=segs_db)
             progress.advance(task)
+
+    # -- Compute min/max minimizer count from reads_db (populated by Rust) ----
+    min_len = 10 ** 9
+    max_len = 0
+    with env.begin() as txn:
+        cursor = txn.cursor(db=reads_db)
+        for _key, val_bytes in cursor:
+            n = len(val_bytes) // 8
+            if n:
+                min_len = min(min_len, n)
+                max_len = max(max_len, n)
 
     # -- Stage 3: reads sub-db → kinv + kcnt sub-dbs ------------------------
     if max_len == 0:
@@ -2408,21 +2342,20 @@ def main(
         sampled = sampled[:top_paths]
 
     if read_minimizers_prefix is not None:
-        read_index = build_read_index(
-            read_minimizers_prefix, interleaved_pairs,
+        # Compute lmdb_path first — build_read_index reads n_reads from it.
+        _lmdb_path = (
+            lmdb_index
+            if lmdb_index is not None
+            else Path(str(read_minimizers_prefix) + ".index.lmdb")
         )
+        read_index = build_read_index(_lmdb_path, interleaved_pairs)
         typer.echo(
             f"Read index: {read_index.n_reads:,} reads, "
             f"{len(read_index.pairs) // 2:,} paired templates",
             err=True,
         )
 
-        # Build (or reuse) the unified on-disk LMDB index.
-        _lmdb_path = (
-            lmdb_index
-            if lmdb_index is not None
-            else Path(str(read_minimizers_prefix) + ".index.lmdb")
-        )
+        # Build (or reuse) the unified on-disk LMDB index (kinv/kcnt/segs layers).
         k_levels, lmdb_seg_k = build_lmdb_index(
             _lmdb_path, read_minimizers_prefix, read_index,
             n_levels=pseudo_match_levels,

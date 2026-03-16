@@ -66,8 +66,8 @@ echo "Estimated mean read length: ${MEAN_READ_LEN} bp"
 echo "Using density: ${DENSITY}  (l=${L} / (${MEAN_READ_LEN} * 1.25))"
 
 # Run rust-mdbg directly (local build from timrozday-mgnify/rust-mdbg, mg-summary branch)
-# --dump-read-minimizers writes {PREFIX}.{thread}.read_minimizers (LZ4-compressed binary v2)
-# and {PREFIX}.minimizer_table (plain-text TSV: hash <-> l-mer lookup)
+# --dump-read-minimizers writes the reads LMDB index ({PREFIX}.index.lmdb)
+# and {PREFIX}.minimizer_table (plain-text TSV: hash <-> l-mer lookup).
 # When --reads2 is given, R1 gets odd indices (1, 3, 5, …) and R2 gets even (2, 4, 6, …).
 "$(dirname "$0")/../bin/rust-mdbg" \
     "${READS_FILE}" \
@@ -106,7 +106,3 @@ fi
 #    --read-mappings-out "${PREFIX}.read_mappings.tsv" \
 #    --paths-out "${PREFIX}.paths.tsv" \
 
-/Users/timrozday/miniforge3/envs/genome_blender_dev/bin/python "$(dirname "$0")/read_minimizers.py" \
-    --summary \
-    --json "${PREFIX}.minimizer_summary.json" \
-    "${PREFIX}"
