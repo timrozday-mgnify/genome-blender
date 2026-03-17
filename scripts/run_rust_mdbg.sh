@@ -38,8 +38,24 @@ else
 fi
 
 # rust-mdbg parameters
-K=4   # k-mer size (minimizer k-mer)
-L=12  # l-mer length (minimizer length)
+# K: minimizer k-mer order (number of consecutive minimizers per graph node).
+#   Higher K → more unique nodes, fewer false edges, longer assembly contigs,
+#   and less repeat-induced noise in the path combo sketches used for insert
+#   size estimation.  K=7 is a good default for typical Illumina data;
+#   K=4 is faster but produces more repetitive paths.
+K=7
+
+# L: l-mer length (minimizer alphabet).  Together with density (derived below)
+#   this controls how many minimizers are sampled per read.
+#   Rule of thumb: L ≈ read_length × density × 1.25, so
+#     density = L / (read_length × 1.25).
+#   L=12 gives ~9–10 minimizers per 150 bp read at the derived density.
+#   Increasing L reduces the minimizer density but creates more unique minimizers.
+L=12
+
+# MINABUND: minimum number of times a minimizer must appear to be kept in the
+#   graph.  Filters low-frequency (likely error-derived) minimizers.
+#   MINABUND=2 is standard; increase for very high-coverage data (≥100×).
 MINABUND=2
 
 # rust-mdbg output paths
@@ -93,16 +109,15 @@ fi
 
 /Users/timrozday/miniforge3/envs/genome_blender_dev/bin/python "$(dirname "$0")/parse_gfa.py" \
     -n 100000 \
-    --top-paths 5 \
     --sample-component-proportion 0.5 \
-    --matcher pseudo-match \
     --read-minimizers "${PREFIX}" \
     --minimizer-table "${MINIMIZER_TABLE}" \
-    --insert-sizes-out "${PREFIX}.insert_sizes.tsv" \
     --json "${PREFIX}.graph_summary.json" \
     "${_PAIRED_FLAGS[@]}" \
+    --estimate-insert-size \
+    --insert-size-paths 100 \
+    --insert-size-bins "150,200,250,300,400,500,600,800,1000" \
+    --insert-size-inference nuts \
+    --insert-size-min-bin-hashes 100 \
     "${GFA}"
-
-#    --read-mappings-out "${PREFIX}.read_mappings.tsv" \
-#    --paths-out "${PREFIX}.paths.tsv" \
 

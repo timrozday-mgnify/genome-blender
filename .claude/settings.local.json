@@ -63,7 +63,15 @@
       "Bash(LMDB_PATH=\"/Users/timrozday/Documents/genome-blender_run/single_short_shallow/output/rust-mdbg/rust_mdbg_out.index.lmdb\")",
       "Bash(du -sh \"$LMDB_PATH\")",
       "Read(//Users/timrozday/Documents/genome-blender/$LMDB_PATH/**)",
-      "Read(//Users/timrozday/Documents/genome-blender/**)"
+      "Read(//Users/timrozday/Documents/genome-blender/**)",
+      "Bash(find /Users/timrozday/Documents/genome-blender_run -name \"*.gfa\" 2>/dev/null | head -5)",
+      "Bash(which python3:*)",
+      "Bash(find /Users/timrozday/Documents/genome-blender_run -name \"*.lmdb\" -o -name \"rust_mdbg_out*\" 2>/dev/null | head -20)",
+      "Bash(find /Users/timrozday/Documents/genome-blender_run/tiny -name \"*.lmdb\" -type d 2>/dev/null; find /Users/timrozday/Documents/genome-blender_run -name \"*.index.lmdb\" 2>/dev/null | head -5)",
+      "Bash(wc -l /Users/timrozday/Documents/genome-blender_run/single_short_shallow/output/sim_reads_R1.fastq 2>/dev/null || echo \"not plain fastq\"\nls -lh /Users/timrozday/Documents/genome-blender_run/single_short_shallow/output/sim_reads_R*.fastq 2>/dev/null | head -5)",
+      "Bash(PREFIX=\"/Users/timrozday/Documents/genome-blender_run/single_short_shallow/output/rust-mdbg/rust_mdbg_out\"\n/Users/timrozday/miniforge3/envs/genome_blender_dev/bin/python parse_gfa.py \\\\\n    -n 100000 \\\\\n    --sample-component-proportion 0.5 \\\\\n    --read-minimizers \"${PREFIX}\" \\\\\n    --minimizer-table \"${PREFIX}.minimizer_table\" \\\\\n    --json \"${PREFIX}.graph_summary.json\" \\\\\n    --interleaved-pairs \\\\\n    --estimate-insert-size \\\\\n    --insert-size-paths 50 \\\\\n    --insert-size-bins \"300,500,700,1000,2000,3000,5000,7000,8000,9000,11000\" \\\\\n    --insert-size-inference nuts \\\\\n    \"${PREFIX}.gfa\" 2>&1 | grep -v \"^INFO Path combo thinning\")",
+      "Bash(PREFIX=\"/Users/timrozday/Documents/genome-blender_run/single_short_shallow/output/rust-mdbg/rust_mdbg_out\"\n/Users/timrozday/miniforge3/envs/genome_blender_dev/bin/python parse_gfa.py \\\\\n    -n 100000 \\\\\n    --sample-component-proportion 0.5 \\\\\n    --read-minimizers \"${PREFIX}\" \\\\\n    --minimizer-table \"${PREFIX}.minimizer_table\" \\\\\n    --json \"${PREFIX}.graph_summary.json\" \\\\\n    --interleaved-pairs \\\\\n    --estimate-insert-size \\\\\n    --insert-size-paths 50 \\\\\n    --insert-size-bins \"300,500,700,1000,2000,3000,5000,7000,8000,9000,11000\" \\\\\n    --insert-size-inference nuts \\\\\n    \"${PREFIX}.gfa\" 2>&1 | grep -v \"^INFO Path combo thinning\" | tail -30)",
+      "Bash(PREFIX=\"/Users/timrozday/Documents/genome-blender_run/single_short_shallow/output/rust-mdbg/rust_mdbg_out\"\n/Users/timrozday/miniforge3/envs/genome_blender_dev/bin/python parse_gfa.py \\\\\n    -n 100000 \\\\\n    --sample-component-proportion 0.5 \\\\\n    --read-minimizers \"${PREFIX}\" \\\\\n    --minimizer-table \"${PREFIX}.minimizer_table\" \\\\\n    --json \"${PREFIX}.graph_summary.json\" \\\\\n    --interleaved-pairs \\\\\n    --estimate-insert-size \\\\\n    --insert-size-paths 50 \\\\\n    --insert-size-bins \"150,200,250,300,400,500,600,800,1000\" \\\\\n    --insert-size-inference nuts \\\\\n    \"${PREFIX}.gfa\" 2>&1 | grep -v \"^INFO Path combo thinning\" | tail -20)"
     ]
   }
 }

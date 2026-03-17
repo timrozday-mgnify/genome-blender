@@ -44,6 +44,26 @@ try:
 except ImportError:
     _pysam = None  # type: ignore[assignment]
 
+try:
+    import lz4.frame as _lz4  # type: ignore[import-untyped]
+except ImportError:
+    _lz4 = None  # type: ignore[assignment]
+
+try:
+    import torch as _torch
+    import pyro as _pyro
+    import pyro.distributions as _pyro_dist
+    from pyro.infer import MCMC, NUTS, Predictive, SVI, Trace_ELBO
+    from pyro.infer.autoguide import AutoNormal
+    from pyro.optim import Adam as _PyroAdam
+except ImportError:
+    _torch = None  # type: ignore[assignment]
+    _pyro = None  # type: ignore[assignment]
+    _pyro_dist = None  # type: ignore[assignment]
+    MCMC = NUTS = Predictive = SVI = Trace_ELBO = None  # type: ignore[assignment,misc]
+    AutoNormal = None  # type: ignore[assignment]
+    _PyroAdam = None  # type: ignore[assignment]
+
 logger = logging.getLogger(__name__)
 
 # GFA1 record types (spec: gfa-spec.github.io/GFA-spec/GFA1.html)
@@ -383,8 +403,14 @@ def _iter_reads_lmdb(
 ) -> Iterator[tuple[int, np.ndarray]]:
     """Yield ``(read_id_0based, minimizer_ids)`` from a rust-mdbg reads LMDB.
 
-    Iterates the ``reads`` sub-database in ascending key order.  Keys are
-    1-based u64 read indices; values are packed little-endian u64 minimizer IDs.
+    Iterates the ``reads`` sub-database in ascending *numeric* key order.
+    Keys are 1-based ASCII-decimal read indices (e.g. ``b'1'``, ``b'42'``);
+    values are packed little-endian u64 minimizer IDs.
+
+    The LMDB default cursor iterates keys in lexicographic order, which does
+    not preserve numeric order for ASCII-encoded integers.  This function
+    collects all keys, sorts them numerically, and yields entries in that
+    order so that read pairs (odd/even 1-based IDs) are adjacent.
 
     Args:
         lmdb_path: LMDB environment directory.
@@ -404,13 +430,26 @@ def _iter_reads_lmdb(
     reads_db = env.open_db(b"reads")
     try:
         with env.begin() as txn:
-            count = 0
-            for key, val in txn.cursor(db=reads_db):
-                if len(key) != 8:
+            # Collect all keys and sort numerically.
+            # ASCII-decimal keys are typically short (~1–7 bytes for ≤10M reads).
+            all_keys: list[bytes] = []
+            cur = txn.cursor(db=reads_db)
+            for key in cur.iternext(keys=True, values=False):
+                try:
+                    int(key)  # validate parseable
+                    all_keys.append(key)
+                except (ValueError, UnicodeDecodeError):
                     continue
+            all_keys.sort(key=lambda k: int(k))
+
+            count = 0
+            for key in all_keys:
                 if limit is not None and count >= limit:
                     break
-                read_id = struct.unpack("<Q", key)[0] - 1  # 1-based → 0-based
+                val = txn.get(key, db=reads_db)
+                if val is None:
+                    continue
+                read_id = int(key) - 1  # 1-based → 0-based
                 n = len(val) // 8
                 mids = (
                     np.frombuffer(val, dtype="<u8").copy()
@@ -820,6 +859,8 @@ def build_path_combo_sketch(
 
     if exact_positions is not None:
         # Exact method: use reconstructed bp positions.
+        # Same single-occurrence deduplication as the approximate method.
+        hash_to_bin_ex: dict[int, int] = {}
         for i in range(n):
             pos_i = exact_positions[i]
             lo_bp = pos_i + bin_distances[0]
@@ -843,9 +884,23 @@ def build_path_combo_sketch(
             bin_indices = np.searchsorted(bin_arr, kept_dists, side="right") - 1
             for h_val, b_idx in zip(kept_hashes.tolist(), bin_indices.tolist()):
                 if 0 <= b_idx < n_bins:
-                    sketches[b_idx].increment(int(h_val))
+                    if h_val in hash_to_bin_ex:
+                        if hash_to_bin_ex[h_val] != b_idx:
+                            hash_to_bin_ex[h_val] = -1
+                    else:
+                        hash_to_bin_ex[h_val] = b_idx
+
+        for h_val, b_idx in hash_to_bin_ex.items():
+            if b_idx >= 0:
+                sketches[b_idx].increment(h_val)
     else:
         # Approximate method: scale minimizer-index gaps by bp_scale.
+        # Use single-occurrence deduplication: each combo hash is assigned to
+        # exactly one bin (the shortest distance at which it first appears).
+        # Hashes that appear in more than one bin (due to repeated minimizer IDs
+        # in tandem-repeat or cyclic path sequences) are discarded entirely.
+        # -1 in hash_to_bin signals a multi-bin conflict.
+        hash_to_bin: dict[int, int] = {}
         for i in range(n):
             j_lo = i + min_gap
             j_hi = min(i + max_gap, n - 1)
@@ -865,7 +920,15 @@ def build_path_combo_sketch(
             bin_indices = np.searchsorted(bin_arr, kept_dists, side="right") - 1
             for h_val, b_idx in zip(kept_hashes.tolist(), bin_indices.tolist()):
                 if 0 <= b_idx < n_bins:
-                    sketches[b_idx].increment(int(h_val))
+                    if h_val in hash_to_bin:
+                        if hash_to_bin[h_val] != b_idx:
+                            hash_to_bin[h_val] = -1  # mark multi-bin conflict
+                    else:
+                        hash_to_bin[h_val] = b_idx
+
+        for h_val, b_idx in hash_to_bin.items():
+            if b_idx >= 0:
+                sketches[b_idx].increment(h_val)
 
     return sketches
 
@@ -1648,6 +1711,676 @@ def _report_chosen_components(
 
 
 # ------------------------------------------------------------------
+# Fragment length / insert size estimation via combination minimizers
+# ------------------------------------------------------------------
+
+@dataclass
+class FragmentLengthEstimate:
+    """Posterior estimate of the log-normal fragment length distribution.
+
+    Attributes:
+        mu_log: Posterior mean of the log-scale mean parameter.
+        sigma_log: Posterior mean of the log-scale std-dev parameter.
+        mu_log_ci: 95 % credible interval for ``mu_log``.
+        sigma_log_ci: 95 % credible interval for ``sigma_log``.
+        median: Estimated median fragment length = ``exp(mu_log)`` bp.
+        mean: Estimated mean fragment length = ``exp(mu_log + sigma_log**2 / 2)`` bp.
+        n_bins_used: Number of distance bins that passed the minimum-hash filter.
+        inference: Inference algorithm used (``"nuts"`` or ``"advi"``).
+    """
+
+    mu_log: float
+    sigma_log: float
+    mu_log_ci: tuple[float, float]
+    sigma_log_ci: tuple[float, float]
+    median: float
+    mean: float
+    n_bins_used: int
+    inference: str
+    signal_reliable: bool = True  # False when containment rates are nearly flat
+
+
+def _load_node_minimizer_seqs(
+    seqs_prefix: Path,
+) -> tuple[dict[int, np.ndarray], int]:
+    """Load per-node minimizer ID arrays from rust-mdbg LZ4 sequences files.
+
+    The sequences files written by rust-mdbg (``{prefix}.{thread}.sequences``)
+    are LZ4-frame-compressed tab-separated text.  Each data row has the form::
+
+        node_name\\t[h1, h2, ..., hk]\\tsequence\\t...
+
+    Args:
+        seqs_prefix: rust-mdbg output prefix; files are matched as
+            ``{prefix.parent}/{prefix.name}.*.sequences``.
+
+    Returns:
+        ``(node_name_int → minimizer_id_array, k_value)`` where ``k_value``
+        is read from the file header.  Returns ``({}, 1)`` if no files are
+        found or the ``lz4`` package is unavailable.
+    """
+    if _lz4 is None:
+        logger.warning(
+            "lz4 package not available; cannot load sequences files. "
+            "Install with: pip install lz4"
+        )
+        return {}, 1
+
+    seqs_files = sorted(
+        seqs_prefix.parent.glob(f"{seqs_prefix.name}.*.sequences")
+    )
+    if not seqs_files:
+        logger.warning(
+            "No sequences files found matching %s.*.sequences", seqs_prefix
+        )
+        return {}, 1
+
+    node_seqs: dict[int, np.ndarray] = {}
+    k_val = 1
+
+    for seqs_file in seqs_files:
+        try:
+            with _lz4.open(str(seqs_file), mode="rt") as fh:
+                for line in fh:
+                    line = line.rstrip("\n")
+                    if not line:
+                        continue
+                    if line.startswith("# k ="):
+                        try:
+                            k_val = int(line.split("=", 1)[1].strip())
+                        except ValueError:
+                            pass
+                        continue
+                    if line.startswith("#"):
+                        continue
+                    fields = line.split("\t")
+                    if len(fields) < 2:
+                        continue
+                    try:
+                        node_name = int(fields[0])
+                    except ValueError:
+                        continue
+                    min_str = fields[1].strip()
+                    if min_str.startswith("[") and min_str.endswith("]"):
+                        min_str = min_str[1:-1]
+                        try:
+                            mids = np.array(
+                                [
+                                    int(x.strip())
+                                    for x in min_str.split(",")
+                                    if x.strip()
+                                ],
+                                dtype=np.uint64,
+                            )
+                        except ValueError:
+                            continue
+                        node_seqs[node_name] = mids
+        except Exception as exc:
+            logger.warning(
+                "Failed to read sequences file %s: %s", seqs_file, exc
+            )
+
+    logger.info(
+        "Loaded minimizer sequences for %d nodes (k=%d) from %d file(s)",
+        len(node_seqs), k_val, len(seqs_files),
+    )
+    return node_seqs, k_val
+
+
+def _load_minimizer_table(table_path: Path) -> dict[int, str]:
+    """Load the rust-mdbg minimizer table TSV into a ``hash_id → l-mer`` dict.
+
+    Lines starting with ``#`` are treated as comments.  Each data row must
+    have at least two tab-separated fields: ``minimizer_id`` (integer) and
+    ``lmer`` (DNA string).
+
+    Args:
+        table_path: Path to the ``{prefix}.minimizer_table`` TSV file.
+
+    Returns:
+        Dict mapping integer minimizer hash ID to l-mer string.
+    """
+    table: dict[int, str] = {}
+    with table_path.open() as fh:
+        for line in fh:
+            line = line.rstrip("\n")
+            if not line or line.startswith("#"):
+                continue
+            fields = line.split("\t")
+            if len(fields) < 2:
+                continue
+            try:
+                table[int(fields[0])] = fields[1]
+            except ValueError:
+                continue
+    logger.info("Loaded %d entries from minimizer table %s", len(table), table_path)
+    return table
+
+
+def aggregate_path_bin_sketches(
+    path_sketches: list[list[CombSketchIndex]],
+    max_pool_hashes: int = 500_000,
+) -> list[set[int]]:
+    """Union per-path per-bin sketches into one set per bin.
+
+    For each distance bin, the hash sets from all paths are unioned.  If the
+    resulting set exceeds *max_pool_hashes*, it is uniformly subsampled.
+
+    Args:
+        path_sketches: ``list[list[CombSketchIndex]]`` — one inner list per
+            path, one ``CombSketchIndex`` per distance bin.
+        max_pool_hashes: Saturation cap per bin after pooling.
+
+    Returns:
+        ``list[set[int]]`` — one set of hash values per bin.
+    """
+    if not path_sketches:
+        return []
+    n_bins = len(path_sketches[0])
+    pooled: list[set[int]] = [set() for _ in range(n_bins)]
+
+    for sketch_list in path_sketches:
+        for b, sketch in enumerate(sketch_list):
+            if b >= n_bins:
+                break
+            # Path sketches are always in-memory (no LMDB).
+            pooled[b].update(sketch._buf.keys())
+
+    for b in range(n_bins):
+        if len(pooled[b]) > max_pool_hashes:
+            pooled[b] = set(random.sample(list(pooled[b]), max_pool_hashes))
+
+    return pooled
+
+
+def compute_containment_rates(
+    pe_sketch: CombSketchIndex,
+    path_bin_sets: list[set[int]],
+    intra_sketch: CombSketchIndex | None = None,
+) -> tuple[np.ndarray, np.ndarray, int]:
+    """Compute per-bin containment of path hashes in the PE sketch.
+
+    For each distance bin *b*::
+
+        c_obs[b]   = |pe_sketch ∩ path_bin_sets[b]| / |path_bin_sets[b]|
+        c_noise[b] = |intra_sketch ∩ path_bin_sets[b]| / |path_bin_sets[b]|
+
+    Bins with an empty path set are assigned ``nan``.
+
+    Args:
+        pe_sketch: Cross-pair (R1×R2) combination minimizer sketch.
+        path_bin_sets: Pooled path hash sets, one per distance bin.
+        intra_sketch: Within-read combination minimizer sketch used as a
+            noise baseline.  Pass ``None`` to skip noise estimation.
+
+    Returns:
+        ``(c_obs, c_noise, n_pe_hashes)`` where the arrays have length
+        equal to ``len(path_bin_sets)``.
+    """
+    def _sketch_keys(sketch: CombSketchIndex) -> set[int]:
+        if sketch._env is None:
+            return set(sketch._buf.keys())
+        sketch._flush()
+        keys: set[int] = set()
+        with sketch._env.begin() as txn:
+            for key, _ in txn.cursor(db=sketch._lmdb_db):
+                keys.add(struct.unpack("<Q", key)[0])
+        return keys
+
+    pe_keys = _sketch_keys(pe_sketch)
+    n_pe = len(pe_keys)
+    intra_keys: set[int] | None = (
+        _sketch_keys(intra_sketch) if intra_sketch is not None else None
+    )
+
+    n_bins = len(path_bin_sets)
+    c_obs = np.full(n_bins, np.nan)
+    c_noise = np.zeros(n_bins)
+
+    for b, path_set in enumerate(path_bin_sets):
+        if not path_set:
+            continue
+        n_path = len(path_set)
+        c_obs[b] = len(pe_keys & path_set) / n_path
+        if intra_keys is not None:
+            c_noise[b] = len(intra_keys & path_set) / n_path
+
+    return c_obs, c_noise, n_pe
+
+
+def _fragment_length_pyro_model(
+    c_adjusted: "_torch.Tensor",
+    bin_lo: "_torch.Tensor",
+    bin_hi: "_torch.Tensor",
+    n_path_hashes: "_torch.Tensor",
+    observed_mask: "_torch.Tensor",
+) -> None:
+    """Pyro generative model for fragment length from containment rates.
+
+    Priors::
+
+        mu_log    ~ Normal(log(8000), 1.0)
+        sigma_log ~ HalfNormal(0.5)
+        rho       ~ Beta(2, 20)          # residual noise floor
+
+    Likelihood per active bin *b*::
+
+        p[b]        = LogNormal(mu_log, sigma_log).CDF(bin_hi[b])
+                    - LogNormal(mu_log, sigma_log).CDF(bin_lo[b])
+        expected[b] = p[b] * (1 - rho) + rho
+        sigma_obs[b]= sqrt(expected[b] * (1 - expected[b]) / n_path_hashes[b])
+        obs[b]      ~ Normal(expected[b], sigma_obs[b])    [masked by observed_mask]
+
+    Args:
+        c_adjusted: Noise-subtracted containment rates, shape ``[B]``.
+        bin_lo: Lower bp edge of each bin, shape ``[B]``.
+        bin_hi: Upper bp edge of each bin, shape ``[B]``.
+        n_path_hashes: Number of path hashes per bin, shape ``[B]``.
+        observed_mask: Boolean mask — ``True`` means the bin is active, shape ``[B]``.
+    """
+    mu_log = _pyro.sample(
+        "mu_log",
+        _pyro_dist.Normal(
+            _torch.tensor(math.log(8000.0)), _torch.tensor(1.0)
+        ),
+    )
+    sigma_log = _pyro.sample(
+        "sigma_log", _pyro_dist.HalfNormal(_torch.tensor(0.5))
+    )
+    rho = _pyro.sample(
+        "rho", _pyro_dist.Beta(_torch.tensor(2.0), _torch.tensor(20.0))
+    )
+
+    # Log-normal CDF: P(X <= x) = Phi((log(x) - mu) / sigma).
+    normal = _torch.distributions.Normal(mu_log, sigma_log)
+    log_lo = _torch.log(bin_lo.clamp(min=1.0))
+    log_hi = _torch.log(bin_hi.clamp(min=1.0))
+    p = (normal.cdf(log_hi) - normal.cdf(log_lo)).clamp(0.0, 1.0)
+
+    expected = p * (1.0 - rho) + rho
+    # Clamp n_path_hashes to ≥ 1 to avoid division by zero for masked bins
+    # (the mask prevents those bins from contributing to the gradient).
+    sigma_obs = (
+        expected * (1.0 - expected) / n_path_hashes.clamp(min=1.0)
+    ).sqrt().clamp(min=1e-6)
+
+    B = c_adjusted.shape[0]
+    with _pyro.plate("bins", B, dim=-1):
+        with _pyro.poutine.mask(mask=observed_mask):
+            _pyro.sample(
+                "obs", _pyro_dist.Normal(expected, sigma_obs), obs=c_adjusted
+            )
+
+
+def estimate_fragment_length(
+    pe_sketch: CombSketchIndex,
+    path_bin_sketches: list[list[CombSketchIndex]],
+    bin_distances: list[float],
+    intra_sketch: CombSketchIndex | None = None,
+    read_length: int = 150,
+    min_path_hashes_per_bin: int = 50,
+    inference: str = "nuts",
+    num_samples: int = 500,
+    num_warmup: int = 200,
+    max_pool_hashes: int = 500_000,
+) -> FragmentLengthEstimate:
+    """Estimate the fragment length distribution from combination minimizer containment.
+
+    Pools path distance-bin sketches across paths, computes containment rates
+    relative to the PE sketch, subtracts intra-read noise, and fits a log-normal
+    distribution via Bayesian inference (NUTS or ADVI).
+
+    Args:
+        pe_sketch: Cross-pair (R1×R2) combination minimizer sketch.
+        path_bin_sketches: One inner list per path; each inner list has one
+            :class:`CombSketchIndex` per distance bin.
+        bin_distances: Sorted bp breakpoints defining bins
+            (``len(bin_distances) - 1`` bins total).
+        intra_sketch: Within-read sketch for noise baseline.  ``None`` → skip.
+        read_length: Sequenced read length in bp (informational only).
+        min_path_hashes_per_bin: Bins with fewer path hashes are excluded.
+        inference: ``"nuts"`` (default) or ``"advi"``.
+        num_samples: Posterior samples to draw (NUTS) or predictive samples
+            (ADVI).
+        num_warmup: NUTS warm-up steps.
+        max_pool_hashes: Saturation cap for pooled path bin sets.
+
+    Returns:
+        :class:`FragmentLengthEstimate` with posterior statistics.
+
+    Raises:
+        RuntimeError: If ``pyro-ppl`` or ``torch`` are not installed.
+        ValueError: If *inference* is not ``"nuts"`` or ``"advi"``.
+    """
+    if _pyro is None or _torch is None:
+        raise RuntimeError(
+            "pyro-ppl and torch are required for insert size estimation; "
+            "install with: pip install pyro-ppl torch"
+        )
+
+    # 1. Pool path bin sketches.
+    path_bin_sets = aggregate_path_bin_sketches(path_bin_sketches, max_pool_hashes)
+
+    # 2. Compute containment rates.
+    c_obs, c_noise, n_pe = compute_containment_rates(
+        pe_sketch, path_bin_sets, intra_sketch
+    )
+    logger.info(
+        "PE sketch: %d unique hashes; containment rates per bin: %s",
+        n_pe,
+        np.round(c_obs, 4),
+    )
+
+    # 3. Build bin-edge arrays.
+    n_bins = len(bin_distances) - 1
+    bin_lo = np.array(bin_distances[:-1], dtype=np.float32)
+    bin_hi = np.array(bin_distances[1:], dtype=np.float32)
+    n_path_hashes = np.array([len(s) for s in path_bin_sets], dtype=np.float32)
+
+    # 4. Adjust for noise; replace NaN (empty bins) with 0.
+    c_adjusted = np.clip(np.where(np.isnan(c_obs), 0.0, c_obs) - c_noise, 0.0, 1.0)
+
+    # 5. Build mask.
+    observed_mask = n_path_hashes >= min_path_hashes_per_bin
+    n_bins_used = int(observed_mask.sum())
+
+    # 5b. Flat-containment check: if the containment rates across active bins
+    # have very low variance, the signal is dominated by repeat-induced noise.
+    # This can occur with low-k graphs, tandem-repeat-rich genomes, or when the
+    # true insert size is outside the bin range.
+    active_c = c_adjusted[observed_mask] if n_bins_used > 1 else np.array([])
+    signal_reliable = True
+    if len(active_c) > 1:
+        c_range = float(active_c.max() - active_c.min())
+        if c_range < 0.10:
+            signal_reliable = False
+            logger.warning(
+                "Containment rates are nearly flat across active bins "
+                "(range=%.3f, threshold=0.10). The insert-size signal is weak — "
+                "the estimate will be dominated by the prior. "
+                "Possible causes: repeat-rich genome, low k value in the mdBG, "
+                "or insert size outside the specified bin range. "
+                "Consider increasing k or widening --insert-size-bins.",
+                c_range,
+            )
+
+    if n_bins_used == 0:
+        logger.warning(
+            "No bins have >= %d path hashes; returning uninformative estimate",
+            min_path_hashes_per_bin,
+        )
+        mu0 = math.log(8000.0)
+        return FragmentLengthEstimate(
+            mu_log=mu0,
+            sigma_log=0.5,
+            mu_log_ci=(mu0 - 1.0, mu0 + 1.0),
+            sigma_log_ci=(0.0, 1.0),
+            median=math.exp(mu0),
+            mean=math.exp(mu0 + 0.5**2 / 2.0),
+            n_bins_used=0,
+            inference=inference,
+            signal_reliable=False,
+        )
+
+    # 6. Convert to tensors.
+    c_adj_t = _torch.tensor(c_adjusted, dtype=_torch.float32)
+    bin_lo_t = _torch.tensor(bin_lo, dtype=_torch.float32)
+    bin_hi_t = _torch.tensor(bin_hi, dtype=_torch.float32)
+    n_path_t = _torch.tensor(n_path_hashes, dtype=_torch.float32)
+    mask_t = _torch.tensor(observed_mask, dtype=_torch.bool)
+    model_args = (c_adj_t, bin_lo_t, bin_hi_t, n_path_t, mask_t)
+
+    # 7. Run inference.
+    if inference == "nuts":
+        kernel = NUTS(_fragment_length_pyro_model)
+        mcmc = MCMC(
+            kernel,
+            num_samples=num_samples,
+            warmup_steps=num_warmup,
+            disable_progbar=True,
+        )
+        mcmc.run(*model_args)
+        samples = mcmc.get_samples()
+        mu_log_samps = samples["mu_log"].numpy()
+        sigma_log_samps = samples["sigma_log"].numpy()
+
+    elif inference == "advi":
+        _pyro.clear_param_store()
+        guide = AutoNormal(_fragment_length_pyro_model)
+        optimizer = _PyroAdam({"lr": 0.01})
+        svi_obj = SVI(
+            _fragment_length_pyro_model, guide, optimizer, loss=Trace_ELBO()
+        )
+        for step in range(2000):
+            loss = svi_obj.step(*model_args)
+            if step % 500 == 0:
+                logger.debug("ADVI step %d, ELBO=%.4f", step, -loss)
+        predictive = Predictive(
+            _fragment_length_pyro_model,
+            guide=guide,
+            num_samples=num_samples,
+            return_sites=["mu_log", "sigma_log"],
+        )
+        post = predictive(*model_args)
+        mu_log_samps = post["mu_log"].squeeze().numpy()
+        sigma_log_samps = post["sigma_log"].squeeze().numpy()
+
+    else:
+        raise ValueError(
+            f"Unknown inference method {inference!r}; use 'nuts' or 'advi'"
+        )
+
+    # 8. Summarise posterior.
+    mu_log_mean = float(np.mean(mu_log_samps))
+    sigma_log_mean = float(np.mean(sigma_log_samps))
+    mu_log_ci = (
+        float(np.percentile(mu_log_samps, 2.5)),
+        float(np.percentile(mu_log_samps, 97.5)),
+    )
+    sigma_log_ci = (
+        float(np.percentile(sigma_log_samps, 2.5)),
+        float(np.percentile(sigma_log_samps, 97.5)),
+    )
+
+    return FragmentLengthEstimate(
+        mu_log=mu_log_mean,
+        sigma_log=sigma_log_mean,
+        mu_log_ci=mu_log_ci,
+        sigma_log_ci=sigma_log_ci,
+        median=math.exp(mu_log_mean),
+        mean=math.exp(mu_log_mean + sigma_log_mean**2 / 2.0),
+        n_bins_used=n_bins_used,
+        inference=inference,
+        signal_reliable=signal_reliable,
+    )
+
+
+def build_top_path_combo_sketches(
+    graph: rx.PyGraph,
+    lmdb_path: Path | None,
+    bin_distances: list[float],
+    density: float,
+    n_paths: int = 50,
+    top_paths: list[tuple[_OrientedPath, int]] | None = None,
+    max_hash: int | None = None,
+    use_exact_distances: bool = False,
+    min_table: dict[int, str] | None = None,
+    l: int = 12,
+    bp_scale: float | None = None,
+    seqs_prefix: Path | None = None,
+) -> tuple[list[list[CombSketchIndex]], float]:
+    """Build distance-binned combination minimizer sketches for the top paths.
+
+    For each path in *top_paths* (up to *n_paths*), the minimizer sequence is
+    reconstructed from the rust-mdbg LZ4 sequences files (if *seqs_prefix* is
+    given) and passed to :func:`build_path_combo_sketch`.  The resulting per-bin
+    sketches are collected and returned alongside the ``bp_scale`` used.
+
+    **Minimizer sequence construction** (when *seqs_prefix* is provided):
+
+    Each GFA segment corresponds to a minimizer-space k-mer of length ``k``.
+    For a forward-traversed segment the last minimizer is the new element;
+    for a backward-traversed segment the first element of the reversed array is
+    new.  The first segment in the path contributes all ``k`` minimizers; each
+    subsequent segment contributes one new minimizer.
+
+    If no sequences files are available, node graph indices are used as proxy
+    minimizer IDs (combinations will not intersect with the PE sketch — use
+    only for testing purposes).
+
+    Args:
+        graph: Parsed GFA graph (``Segment`` node data required).
+        lmdb_path: rust-mdbg reads LMDB directory — used to train
+            *max_hash* when not supplied.  May be ``None`` if
+            *max_hash* is provided directly.
+        bin_distances: Sorted bp breakpoints (``≥ 2`` values).
+        density: Combination hash thinning density.
+        n_paths: Maximum number of paths to process.
+        top_paths: Pre-selected ``(path, bp_length)`` pairs, sorted
+            longest-first.  Pass ``None`` to return empty results.
+        max_hash: Thinning threshold; trained from *lmdb_path* when ``None``.
+        use_exact_distances: Forward to :func:`build_path_combo_sketch`.
+        min_table: Minimizer hash → l-mer string mapping for exact distances.
+        l: l-mer length; forwarded to :func:`build_path_combo_sketch`.
+        bp_scale: Average bp per minimizer position.  Estimated from path
+            data when ``None``.
+        seqs_prefix: rust-mdbg output prefix for loading LZ4 sequences files.
+
+    Returns:
+        ``(list_of_per_path_sketch_lists, bp_scale_used)`` where each inner
+        list has one :class:`CombSketchIndex` per distance bin.
+    """
+    if not top_paths:
+        logger.warning("No top paths provided; skipping path combo sketch building")
+        return [], 1.0
+
+    # --- Load node minimizer sequences ------------------------------------------
+    node_min_seqs: dict[int, np.ndarray] = {}
+    k_val = 1
+    if seqs_prefix is not None:
+        node_min_seqs, k_val = _load_node_minimizer_seqs(seqs_prefix)
+        if not node_min_seqs:
+            logger.warning(
+                "Sequences files empty or unreadable; "
+                "falling back to node-index proxy minimizer IDs"
+            )
+    else:
+        logger.warning(
+            "No sequences prefix provided; "
+            "using node graph indices as proxy minimizer IDs. "
+            "Containment rates will not be meaningful."
+        )
+
+    selected = top_paths[:n_paths]
+
+    # --- Estimate bp_scale if not provided --------------------------------------
+    if bp_scale is None:
+        total_bp = 0
+        total_min = 0
+        for path, bp_len in selected:
+            total_bp += bp_len
+            if node_min_seqs:
+                for seg_i, (node_idx, _is_fwd) in enumerate(path):
+                    mids = node_min_seqs.get(int(graph[node_idx].name))
+                    if mids is not None:
+                        if seg_i == 0:
+                            total_min += len(mids)
+                        else:
+                            total_min += max(1, len(mids) - (k_val - 1))
+                    else:
+                        total_min += 1
+            else:
+                total_min += len(path)
+        bp_scale = total_bp / max(total_min, 1)
+        logger.info(
+            "Estimated bp_scale=%.2f from %d top path(s)", bp_scale, len(selected)
+        )
+
+    # --- Train max_hash if not provided -----------------------------------------
+    if max_hash is None and node_min_seqs:
+        # Sample from the first path to train the thinning threshold.
+        first_path, _ = selected[0]
+        sample_mids: list[int] = []
+        for node_idx, is_fwd in first_path[:200]:
+            mids = node_min_seqs.get(int(graph[node_idx].name))
+            if mids is not None:
+                sample_mids.extend(mids.tolist())
+        if sample_mids:
+            probe = np.array(sample_mids[:5000], dtype=np.uint64)
+            n_probe = len(probe)
+            max_h = 0
+            for i in range(min(n_probe, 1000)):
+                j_hi = min(i + 50, n_probe - 1)
+                if i >= j_hi:
+                    continue
+                a_arr = np.full(j_hi - i, probe[i], dtype=np.uint64)
+                h_max = int(_combo_hash_v(a_arr, probe[i + 1: j_hi + 1]).max())
+                if h_max > max_h:
+                    max_h = h_max
+            max_hash = max_h
+            logger.info("Path combo max hash trained from first path: %d", max_hash)
+
+    # --- Build sketches per path ------------------------------------------------
+    path_sketch_lists: list[list[CombSketchIndex]] = []
+    with Progress(*_PROGRESS_COLUMNS) as progress:
+        task = progress.add_task(
+            "Building path combo sketches", total=len(selected)
+        )
+        for path, _bp_len in selected:
+            # Build path_min_seq.
+            if node_min_seqs:
+                min_ids: list[int] = []
+                valid = True
+                for seg_i, (node_idx, is_fwd) in enumerate(path):
+                    mids = node_min_seqs.get(int(graph[node_idx].name))
+                    if mids is None or len(mids) == 0:
+                        valid = False
+                        break
+                    # Reversed segment: flip the minimizer order.
+                    node_mids: np.ndarray = mids if is_fwd else mids[::-1]
+                    if seg_i == 0:
+                        min_ids.extend(node_mids.tolist())
+                    else:
+                        # Each subsequent node adds one new minimizer beyond
+                        # the k-1 shared overlap with the previous node.
+                        overlap = k_val - 1
+                        new_mids = node_mids[overlap:] if len(node_mids) > overlap else node_mids[-1:]
+                        min_ids.extend(new_mids.tolist())
+                if not valid or len(min_ids) < 2:
+                    progress.advance(task)
+                    continue
+                path_min_seq = np.array(min_ids, dtype=np.uint64)
+            else:
+                path_min_seq = np.array(
+                    [node_idx for node_idx, _ in path], dtype=np.uint64
+                )
+                if len(path_min_seq) < 2:
+                    progress.advance(task)
+                    continue
+
+            sketches = build_path_combo_sketch(
+                path_min_seq=path_min_seq,
+                bin_distances=bin_distances,
+                density=density,
+                bp_scale=bp_scale,
+                max_hash=max_hash,
+                use_exact_distances=use_exact_distances,
+                path=path if use_exact_distances else None,
+                graph=graph if use_exact_distances else None,
+                min_table=min_table if use_exact_distances else None,
+                l=l,
+            )
+            path_sketch_lists.append(sketches)
+            progress.advance(task)
+
+    logger.info(
+        "Built path combo sketches for %d/%d paths",
+        len(path_sketch_lists), len(selected),
+    )
+    return path_sketch_lists, bp_scale
+
+
+# ------------------------------------------------------------------
 # CLI
 # ------------------------------------------------------------------
 
@@ -1737,6 +2470,42 @@ def main(
         help="Persist the intra-read combination sketch to this LMDB directory",
         file_okay=False,
     )] = None,
+    minimizer_table: Annotated[Path | None, typer.Option(
+        "--minimizer-table",
+        help="rust-mdbg minimizer table TSV ({prefix}.minimizer_table); "
+             "enables exact bp-distance mode for path combo sketches",
+        exists=True,
+        dir_okay=False,
+    )] = None,
+    estimate_insert_size: Annotated[bool, typer.Option(
+        "--estimate-insert-size/--no-estimate-insert-size",
+        help="Estimate the fragment length distribution via combination "
+             "minimizer containment (requires --read-minimizers and "
+             "--interleaved-pairs)",
+    )] = False,
+    insert_size_bins: Annotated[str, typer.Option(
+        "--insert-size-bins",
+        help="Comma-separated bp bin edges for insert size estimation",
+    )] = "150,200,250,300,400,500,600,800,1000",
+    insert_size_paths: Annotated[int, typer.Option(
+        "--insert-size-paths",
+        help="Number of top (longest) paths to use for path combo sketches",
+        min=1,
+    )] = 50,
+    read_length: Annotated[int, typer.Option(
+        "--read-length",
+        help="Sequenced read length in bp (used in insert size prior)",
+        min=1,
+    )] = 150,
+    insert_size_inference: Annotated[str, typer.Option(
+        "--insert-size-inference",
+        help="Inference algorithm for insert size estimation: 'nuts' or 'advi'",
+    )] = "nuts",
+    insert_size_min_bin_hashes: Annotated[int, typer.Option(
+        "--insert-size-min-bin-hashes",
+        help="Minimum number of path hashes per bin to include in fitting",
+        min=1,
+    )] = 50,
 ) -> None:
     """Parse a rust-mdbg GFA output into a graph and report properties."""
     if paired_end and pe_bam is None:
@@ -1755,6 +2524,7 @@ def main(
     weight_str = weight.value
 
     path_lengths: list[int] | None = None
+    sampled_paths: list[tuple[_OrientedPath, int]] | None = None
     chosen_comps: list[set[int]] = []
 
     if no_sample:
@@ -1784,7 +2554,13 @@ def main(
             err=True,
         )
         _report_chosen_components(graph, chosen_comps)
-        path_lengths = sample_path_lengths(graph, samples, weight_str, eligible_nodes)
+        if estimate_insert_size:
+            # Preserve full paths (needed for path combo sketches).
+            sampled_paths = sample_paths(graph, samples, weight_str, eligible_nodes)
+            path_lengths = [bp for _, bp in sampled_paths]
+        else:
+            sampled_paths = None
+            path_lengths = sample_path_lengths(graph, samples, weight_str, eligible_nodes)
 
     pair_distances: list[int] | None = None
     if paired_end and pe_bam is not None:
@@ -1819,40 +2595,139 @@ def main(
     # --- Combination minimizer sketches ------------------------------------
     pe_combo_unique: int | None = None
     intra_combo_unique: int | None = None
+    pe_sketch_obj: CombSketchIndex | None = None
+    intra_sketch_obj: CombSketchIndex | None = None
+    _lmdb_path: Path | None = None
 
     if read_minimizers_prefix is not None:
         _lmdb_path = Path(str(read_minimizers_prefix) + ".index.lmdb")
 
         if interleaved_pairs:
-            pe_sketch = build_pe_combo_sketch(
+            pe_sketch_obj = build_pe_combo_sketch(
                 _lmdb_path,
                 density=combo_density,
                 max_hash=combo_max_hash,
                 n_train=combo_train_reads,
                 out_lmdb=pe_combo_lmdb_out,
             )
-            pe_combo_unique = len(pe_sketch)
-            pe_sketch.close()
+            pe_combo_unique = len(pe_sketch_obj)
             typer.echo(
                 f"PE combo sketch: {pe_combo_unique:,} unique hashes "
                 f"(density={combo_density})",
                 err=True,
             )
 
-        intra_sketch = build_intra_combo_sketch(
+        intra_sketch_obj = build_intra_combo_sketch(
             _lmdb_path,
             density=combo_density,
             max_hash=combo_max_hash,
             n_train=combo_train_reads,
             out_lmdb=intra_combo_lmdb_out,
         )
-        intra_combo_unique = len(intra_sketch)
-        intra_sketch.close()
+        intra_combo_unique = len(intra_sketch_obj)
         typer.echo(
             f"Intra combo sketch: {intra_combo_unique:,} unique hashes "
             f"(density={combo_density})",
             err=True,
         )
+
+    # --- Insert size estimation via combination minimizer containment -------
+    insert_size_result: FragmentLengthEstimate | None = None
+
+    if estimate_insert_size:
+        if pe_sketch_obj is None:
+            typer.echo(
+                "ERROR: --estimate-insert-size requires --read-minimizers and "
+                "--interleaved-pairs to build the PE combo sketch.",
+                err=True,
+            )
+        elif sampled_paths is None:
+            typer.echo(
+                "WARNING: No sampled paths available for insert size estimation "
+                "(path sampling was skipped).",
+                err=True,
+            )
+        else:
+            # Parse bin edges.
+            try:
+                _bin_edges = sorted(
+                    float(x.strip()) for x in insert_size_bins.split(",")
+                )
+            except ValueError as exc:
+                raise typer.BadParameter(
+                    f"--insert-size-bins must be comma-separated numbers: {exc}"
+                ) from exc
+
+            # Select top paths by bp length.
+            top_paths_sorted = sorted(sampled_paths, key=lambda t: t[1], reverse=True)
+
+            # Load optional minimizer table.
+            _min_table: dict[int, str] | None = None
+            if minimizer_table is not None:
+                _min_table = _load_minimizer_table(minimizer_table)
+
+            typer.echo(
+                f"Building path combo sketches for top "
+                f"{insert_size_paths} paths "
+                f"(bins: {_bin_edges})…",
+                err=True,
+            )
+            path_bin_sketches, _bp_scale = build_top_path_combo_sketches(
+                graph=graph,
+                lmdb_path=_lmdb_path,
+                bin_distances=_bin_edges,
+                density=combo_density,
+                n_paths=insert_size_paths,
+                top_paths=top_paths_sorted,
+                max_hash=combo_max_hash,
+                min_table=_min_table,
+                l=read_length,
+                seqs_prefix=read_minimizers_prefix,
+            )
+
+            if path_bin_sketches:
+                typer.echo(
+                    f"Estimating fragment length "
+                    f"(inference={insert_size_inference})…",
+                    err=True,
+                )
+                insert_size_result = estimate_fragment_length(
+                    pe_sketch=pe_sketch_obj,
+                    path_bin_sketches=path_bin_sketches,
+                    bin_distances=_bin_edges,
+                    intra_sketch=intra_sketch_obj,
+                    read_length=read_length,
+                    min_path_hashes_per_bin=insert_size_min_bin_hashes,
+                    inference=insert_size_inference,
+                )
+                _reliable_tag = (
+                    "" if insert_size_result.signal_reliable else " [UNRELIABLE]"
+                )
+                typer.echo(
+                    f"Fragment length estimate{_reliable_tag}: "
+                    f"median={insert_size_result.median:.0f} bp, "
+                    f"mean={insert_size_result.mean:.0f} bp, "
+                    f"mu_log={insert_size_result.mu_log:.3f} "
+                    f"[{insert_size_result.mu_log_ci[0]:.3f}, "
+                    f"{insert_size_result.mu_log_ci[1]:.3f}], "
+                    f"sigma_log={insert_size_result.sigma_log:.3f} "
+                    f"[{insert_size_result.sigma_log_ci[0]:.3f}, "
+                    f"{insert_size_result.sigma_log_ci[1]:.3f}], "
+                    f"bins_used={insert_size_result.n_bins_used}",
+                    err=True,
+                )
+            else:
+                typer.echo(
+                    "WARNING: No path combo sketches were built; "
+                    "skipping insert size estimation.",
+                    err=True,
+                )
+
+    # Close sketches now that estimation is done.
+    if pe_sketch_obj is not None:
+        pe_sketch_obj.close()
+    if intra_sketch_obj is not None:
+        intra_sketch_obj.close()
 
     if json_out is not None:
         stats = _compute_summary(
@@ -1866,6 +2741,18 @@ def main(
         if intra_combo_unique is not None:
             stats["intra_combo_sketch_unique_hashes"] = intra_combo_unique
             stats.setdefault("combo_density", combo_density)
+        if insert_size_result is not None:
+            stats["insert_size"] = {
+                "median": insert_size_result.median,
+                "mean": insert_size_result.mean,
+                "mu_log": insert_size_result.mu_log,
+                "sigma_log": insert_size_result.sigma_log,
+                "mu_log_ci": list(insert_size_result.mu_log_ci),
+                "sigma_log_ci": list(insert_size_result.sigma_log_ci),
+                "n_bins_used": insert_size_result.n_bins_used,
+                "inference": insert_size_result.inference,
+                "signal_reliable": insert_size_result.signal_reliable,
+            }
         json_out.write_text(json.dumps(stats, indent=2) + "\n")
         typer.echo(f"Stats written to {json_out}", err=True)
 
