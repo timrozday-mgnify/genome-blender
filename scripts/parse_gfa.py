@@ -1920,6 +1920,70 @@ def aggregate_path_bin_sketches(
     return pooled
 
 
+def write_path_bin_debug(
+    pooled: list[set[int]],
+    bin_distances: list[float],
+    out_path: Path,
+    combo_k: int,
+    combo_density: float,
+    n_paths: int,
+    max_hashes_per_bin: int = 50_000,
+) -> None:
+    """Write pooled path bin hash sets to a JSONL debug file.
+
+    The file contains one metadata line followed by one line per distance bin.
+    Hashes are hex-encoded packed little-endian uint64 bytes to preserve
+    precision without JSON integer limitations.
+
+    Format::
+
+        {"type":"meta","bin_distances":[...],"combo_k":7,...}
+        {"type":"bin","idx":0,"lo":150.0,"hi":300.0,"n_hashes_total":1234,
+         "n_hashes_sampled":1234,"hashes":"<hex>"}
+
+    Args:
+        pooled: Pooled path hash sets from :func:`aggregate_path_bin_sketches`.
+        bin_distances: Sorted bp breakpoints (length = n_bins + 1).
+        out_path: Output file path (.jsonl).
+        combo_k: Combination minimizer k used when building sketches.
+        combo_density: Thinning density used when building sketches.
+        n_paths: Number of paths used to build sketches.
+        max_hashes_per_bin: Cap on hashes written per bin (subsampled if larger).
+    """
+    n_bins = len(bin_distances) - 1
+    meta = {
+        "type": "meta",
+        "bin_distances": list(bin_distances),
+        "combo_k": combo_k,
+        "combo_density": combo_density,
+        "n_paths": n_paths,
+        "n_bins": n_bins,
+    }
+    with out_path.open("w") as fh:
+        fh.write(json.dumps(meta) + "\n")
+        for idx, h_set in enumerate(pooled):
+            lo = float(bin_distances[idx])
+            hi = float(bin_distances[idx + 1]) if idx + 1 < len(bin_distances) else float("inf")
+            n_total = len(h_set)
+            if n_total > max_hashes_per_bin:
+                sampled = random.sample(list(h_set), max_hashes_per_bin)
+            else:
+                sampled = list(h_set)
+            arr = np.array(sampled, dtype=np.uint64)
+            hex_str = arr.tobytes().hex()
+            entry = {
+                "type": "bin",
+                "idx": idx,
+                "lo": lo,
+                "hi": hi,
+                "n_hashes_total": n_total,
+                "n_hashes_sampled": len(sampled),
+                "hashes": hex_str,
+            }
+            fh.write(json.dumps(entry) + "\n")
+    logger.info("Path bin debug written to %s", out_path)
+
+
 def compute_containment_rates(
     pe_sketch: CombSketchIndex,
     path_bin_sets: list[set[int]],
@@ -2050,6 +2114,7 @@ def estimate_fragment_length(
     num_samples: int = 500,
     num_warmup: int = 200,
     max_pool_hashes: int = 500_000,
+    _pooled_bin_sets: list[set[int]] | None = None,
 ) -> FragmentLengthEstimate:
     """Estimate the fragment length distribution from combination minimizer containment.
 
@@ -2085,8 +2150,12 @@ def estimate_fragment_length(
             "install with: pip install pyro-ppl torch"
         )
 
-    # 1. Pool path bin sketches.
-    path_bin_sets = aggregate_path_bin_sketches(path_bin_sketches, max_pool_hashes)
+    # 1. Pool path bin sketches (accept pre-pooled sets to avoid double work).
+    path_bin_sets = (
+        _pooled_bin_sets
+        if _pooled_bin_sets is not None
+        else aggregate_path_bin_sketches(path_bin_sketches, max_pool_hashes)
+    )
 
     # 2. Compute containment rates.
     c_obs, c_noise, n_pe = compute_containment_rates(
@@ -2509,6 +2578,13 @@ def main(
         help="Minimum number of path hashes per bin to include in fitting",
         min=1,
     )] = 50,
+    debug_path_bins: Annotated[Path | None, typer.Option(
+        "--debug-path-bins",
+        help=(
+            "Write pooled path bin hash sets to a JSONL file for debugging. "
+            "Enabled only when --estimate-insert-size is active."
+        ),
+    )] = None,
 ) -> None:
     """Parse a rust-mdbg GFA output into a graph and report properties."""
     if paired_end and pe_bam is None:
@@ -2687,6 +2763,43 @@ def main(
             )
 
             if path_bin_sketches:
+                # Pool once here so we can log a summary and optionally write
+                # the debug file without repeating the aggregation step.
+                _pooled = aggregate_path_bin_sketches(path_bin_sketches)
+
+                # Per-bin summary: hash count + containment in PE sketch.
+                # intra_sketch_obj is reserved for future noise subtraction.
+                if pe_sketch_obj is not None:
+                    _c_obs, _, _n_pe = compute_containment_rates(
+                        pe_sketch_obj, _pooled, None
+                    )
+                    typer.echo(
+                        f"Path bin summary ({_n_pe:,} PE hashes):", err=True
+                    )
+                    for _bi, (_lo, _hi) in enumerate(
+                        zip(_bin_edges[:-1], _bin_edges[1:])
+                    ):
+                        _bset = _pooled[_bi] if _bi < len(_pooled) else set()
+                        _n = len(_bset)
+                        _prop = _c_obs[_bi] if _bi < len(_c_obs) else float("nan")
+                        _hits = round(_prop * _n) if not np.isnan(_prop) else 0
+                        typer.echo(
+                            f"  bin {_bi}: [{_lo:.0f}, {_hi:.0f}) bp  "
+                            f"n_hashes={_n:,}  pe_hits={_hits:,}  "
+                            f"containment={_prop:.4f}",
+                            err=True,
+                        )
+
+                if debug_path_bins is not None:
+                    write_path_bin_debug(
+                        pooled=_pooled,
+                        bin_distances=_bin_edges,
+                        out_path=debug_path_bins,
+                        combo_k=combo_k,
+                        combo_density=combo_density,
+                        n_paths=insert_size_paths,
+                    )
+
                 typer.echo(
                     f"Estimating fragment length "
                     f"(inference={insert_size_inference})…",
@@ -2696,10 +2809,11 @@ def main(
                     pe_sketch=pe_sketch_obj,
                     path_bin_sketches=path_bin_sketches,
                     bin_distances=_bin_edges,
-                    intra_sketch=intra_sketch_obj,
+                    intra_sketch=None,  # reserved for future noise subtraction
                     read_length=read_length,
                     min_path_hashes_per_bin=insert_size_min_bin_hashes,
                     inference=insert_size_inference,
+                    _pooled_bin_sets=_pooled,
                 )
                 _reliable_tag = (
                     "" if insert_size_result.signal_reliable else " [UNRELIABLE]"

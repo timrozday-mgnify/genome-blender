@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-INPUT_DIR="$(cd ../genome-blender_run/multi_genome_full/output && pwd)"
+INPUT_DIR="$(cd ../genome-blender_run/single_short_shallow/output && pwd)"
 OUTPUT_DIR="${INPUT_DIR}/rust-mdbg"
 mkdir -p "${OUTPUT_DIR}"
 
@@ -123,5 +123,11 @@ fi
     --insert-size-min-bin-hashes 100 \
     --pe-combo-lmdb-out "${PREFIX}.pe_index.lmdb" \
     --intra-combo-lmdb-out "${PREFIX}.intra_index.lmdb" \
+    --debug-path-bins "${PREFIX}.path_bins.jsonl" \
     "${GFA}"
+
+/Users/timrozday/miniforge3/envs/genome_blender_dev/bin/python "$(dirname "$0")/plot_path_bin_pe_counts.py" \
+    --debug-bins "${PREFIX}.path_bins.jsonl" \
+    --pe-lmdb "${PREFIX}.pe_index.lmdb" \
+    --output "${PREFIX}.path_bin_pe_counts.pdf"
 
