@@ -315,6 +315,79 @@ def _combo_hash_v(a: np.ndarray, b: np.ndarray) -> np.ndarray:
     return h ^ (h >> _CR31)
 
 
+def _chain_hash(rows: np.ndarray) -> np.ndarray:
+    """Vectorised sequential splitmix64 reduction along columns of a 2-D matrix.
+
+    Each row is an ordered sequence of uint64 values.  The first column
+    seeds the hash; each subsequent column is mixed in with the same
+    splitmix64-inspired round used by :func:`_combo_hash_v`.  For a
+    single-column matrix the raw seed value is returned unchanged.
+
+    Args:
+        rows: Shape ``[N, K]`` uint64 array; each row is a k-mer sequence.
+
+    Returns:
+        Shape ``[N]`` uint64 hash array.
+    """
+    h: np.ndarray = rows[:, 0].copy()
+    for col in range(1, rows.shape[1]):
+        h ^= rows[:, col] * _CM1
+        h = (h ^ (h >> _CR30)) * _CM2
+        h = (h ^ (h >> _CR27)) * _CM3
+        h ^= h >> _CR31
+    return h
+
+
+def _compute_kmer_hashes(mids: np.ndarray, k: int) -> np.ndarray:
+    """Compute canonical minimizer-space k-mer hashes for a sequence.
+
+    Slides a window of *k* consecutive minimizer IDs over *mids* and
+    hashes each window both forward (left-to-right) and in reverse
+    (right-to-left) via :func:`_chain_hash`.  The canonical hash is
+    ``min(forward, reverse)``, making it invariant to sequence orientation.
+
+    For ``k == 1`` the result is the raw minimizer ID array (forward ==
+    reverse for single elements, no mixing applied).
+
+    Args:
+        mids: 1-D uint64 array of minimizer IDs.
+        k: Window size — number of consecutive minimizers per k-mer.
+
+    Returns:
+        1-D uint64 array of length ``max(0, len(mids) - k + 1)``.
+    """
+    n = len(mids)
+    if n < k:
+        return np.empty(0, dtype=np.uint64)
+    if k == 1:
+        return mids.copy()
+    n_kmers = n - k + 1
+    offsets = np.arange(k, dtype=np.intp)
+    starts = np.arange(n_kmers, dtype=np.intp)
+    windows: np.ndarray = mids[starts[:, None] + offsets]  # [n_kmers, k]
+    h_fwd = _chain_hash(windows)
+    h_rev = _chain_hash(windows[:, ::-1])
+    return np.minimum(h_fwd, h_rev)
+
+
+def _canonical_combo_hash_v(a: np.ndarray, b: np.ndarray) -> np.ndarray:
+    """Commutative combination hash: ``hash(a, b) == hash(b, a)`` element-wise.
+
+    Achieved by sorting each pair so that the smaller value is always
+    passed as the first argument to :func:`_combo_hash_v`.
+
+    Args:
+        a: First uint64 array.
+        b: Second uint64 array (same shape as *a*).
+
+    Returns:
+        uint64 array of combination hashes, same shape as inputs.
+    """
+    lo = np.minimum(a, b)
+    hi = np.maximum(a, b)
+    return _combo_hash_v(lo, hi)
+
+
 class CombSketchIndex:
     """Combination minimizer sketch: maps combo_hash → occurrence count.
 
@@ -470,22 +543,27 @@ def _iter_reads_lmdb(
 def build_pe_combo_sketch(
     lmdb_path: Path,
     density: float,
+    k: int = 7,
     out_lmdb: Path | None = None,
 ) -> CombSketchIndex:
     """Build a cross-pair (R1 × R2) combination minimizer sketch.
 
-    For each interleaved read pair, computes the Cartesian product of R1 and
-    R2 minimizer ID arrays, hashes each ``(R1_min, R2_min)`` pair via
-    :func:`_combo_hash_v`, and retains those whose hash value is ≤
-    ``_UINT64_MAX × density`` (minimizer-style thinning).
+    For each interleaved read pair, first converts each read's minimizer ID
+    sequence into canonical k-mer hashes via :func:`_compute_kmer_hashes`
+    (``k`` consecutive minimizer IDs per k-mer, orientation-invariant).
+    Then computes the Cartesian product of R1 and R2 k-mer hash arrays and
+    hashes each ``(kmer_R1, kmer_R2)`` pair via
+    :func:`_canonical_combo_hash_v` (commutative — same value regardless of
+    pair order).  Retains hashes ≤ ``_UINT64_MAX × density``.
 
     The thinning threshold is fixed at ``int(density × _UINT64_MAX)`` — no
-    training is needed because :func:`_combo_hash_v` (splitmix64) produces
-    values that are uniform over the full uint64 range.
+    training is needed because splitmix64 outputs are uniform over uint64.
 
     Args:
         lmdb_path: rust-mdbg reads LMDB directory (``{prefix}.index.lmdb``).
         density: Fraction of combination hashes to retain (0 < density ≤ 1).
+        k: Number of consecutive minimizer IDs per k-mer (default 7, matching
+            the rust-mdbg ``-k`` parameter so each k-mer maps to one graph node).
         out_lmdb: If given, persist the sketch to this LMDB directory.
 
     Returns:
@@ -497,21 +575,22 @@ def build_pe_combo_sketch(
     )
 
     index = CombSketchIndex(lmdb_path=out_lmdb)
-    r1_mids: np.ndarray | None = None
+    r1_kmers: np.ndarray | None = None
     pairs_done = 0
     with Progress(*_PROGRESS_COLUMNS) as progress:
         task = progress.add_task("PE combo sketch", total=None)
         for read_id, mids in _iter_reads_lmdb(lmdb_path):
             if read_id % 2 == 0:
-                r1_mids = mids
-            elif r1_mids is not None:
-                if len(r1_mids) > 0 and len(mids) > 0:
-                    hashes = _combo_hash_v(
-                        np.repeat(r1_mids, len(mids)),
-                        np.tile(mids, len(r1_mids)),
+                r1_kmers = _compute_kmer_hashes(mids, k)
+            elif r1_kmers is not None:
+                r2_kmers = _compute_kmer_hashes(mids, k)
+                if len(r1_kmers) > 0 and len(r2_kmers) > 0:
+                    hashes = _canonical_combo_hash_v(
+                        np.repeat(r1_kmers, len(r2_kmers)),
+                        np.tile(r2_kmers, len(r1_kmers)),
                     )
                     index._bulk_add(hashes[hashes <= threshold])
-                r1_mids = None
+                r1_kmers = None
                 pairs_done += 1
                 if pairs_done % 50_000 == 0:
                     progress.update(task, completed=pairs_done)
@@ -523,21 +602,23 @@ def build_pe_combo_sketch(
 def build_intra_combo_sketch(
     lmdb_path: Path,
     density: float,
+    k: int = 7,
     out_lmdb: Path | None = None,
 ) -> CombSketchIndex:
     """Build a within-read combination minimizer sketch.
 
-    For each read, computes all C(n, 2) pairs from its minimizer IDs, hashes
-    each pair via :func:`_combo_hash_v`, and retains those whose hash value is
-    ≤ ``_UINT64_MAX × density``.
+    For each read, converts its minimizer ID sequence into canonical k-mer
+    hashes via :func:`_compute_kmer_hashes`, then computes all C(n, 2) pairs
+    of k-mer hashes via :func:`_canonical_combo_hash_v` (commutative), and
+    retains hashes ≤ ``_UINT64_MAX × density``.
 
     The thinning threshold is fixed at ``int(density × _UINT64_MAX)`` — no
-    training is needed because :func:`_combo_hash_v` (splitmix64) produces
-    values that are uniform over the full uint64 range.
+    training is needed because splitmix64 outputs are uniform over uint64.
 
     Args:
         lmdb_path: rust-mdbg reads LMDB directory (``{prefix}.index.lmdb``).
         density: Fraction of combination hashes to retain.
+        k: Number of consecutive minimizer IDs per k-mer.
         out_lmdb: If given, persist the sketch to this LMDB directory.
 
     Returns:
@@ -553,10 +634,11 @@ def build_intra_combo_sketch(
     with Progress(*_PROGRESS_COLUMNS) as progress:
         task = progress.add_task("Intra combo sketch", total=None)
         for _, mids in _iter_reads_lmdb(lmdb_path):
-            n = len(mids)
-            if n >= 2:
-                i_idx, j_idx = np.triu_indices(n, k=1)
-                hashes = _combo_hash_v(mids[i_idx], mids[j_idx])
+            kmers = _compute_kmer_hashes(mids, k)
+            n_k = len(kmers)
+            if n_k >= 2:
+                i_idx, j_idx = np.triu_indices(n_k, k=1)
+                hashes = _canonical_combo_hash_v(kmers[i_idx], kmers[j_idx])
                 index._bulk_add(hashes[hashes <= threshold])
             reads_done += 1
             if reads_done % 100_000 == 0:
@@ -672,6 +754,7 @@ def build_path_combo_sketch(
     bin_distances: list[float],
     density: float,
     bp_scale: float,
+    k: int = 7,
     use_exact_distances: bool = False,
     path: _OrientedPath | None = None,
     graph: rx.PyGraph | None = None,
@@ -720,6 +803,9 @@ def build_path_combo_sketch(
         density: Thinning density — fraction of combo hashes to retain.
         bp_scale: Average base pairs per minimizer (used for the approximate
             method and as fallback).
+        k: Number of consecutive minimizer IDs per k-mer.  Each position *i*
+            in the resulting k-mer array corresponds to minimizer position *i*
+            in *path_min_seq*, so distance calculations are unchanged.
         use_exact_distances: Use exact bp positions from sequence
             reconstruction rather than the average-scale approximation.
         path: Ordered ``(node_idx, is_forward)`` path — required for exact
@@ -767,33 +853,41 @@ def build_path_combo_sketch(
         "Path combo thinning: threshold=%d density=%.4f", int(threshold), density,
     )
 
+    # Convert minimizer sequence to canonical k-mer hashes.
+    # k-mer index i corresponds to minimizer index i (start of window), so
+    # all distance calculations and bp_scale usage remain unchanged.
+    path_kmer_seq = _compute_kmer_hashes(path_min_seq, k)
+
     sketches: list[CombSketchIndex] = [CombSketchIndex() for _ in range(n_bins)]
-    n = len(path_min_seq)
+    n = len(path_kmer_seq)
 
     if exact_positions is not None:
         # Exact method: use reconstructed bp positions.
+        # Trim exact_positions to n k-mer positions (each k-mer starts at the
+        # corresponding minimizer index, so positions[:n] is correct).
+        exact_pos_k = exact_positions[:n]
         # Same single-occurrence deduplication as the approximate method.
         hash_to_bin_ex: dict[int, int] = {}
         for i in range(n):
-            pos_i = exact_positions[i]
+            pos_i = exact_pos_k[i]
             lo_bp = pos_i + bin_distances[0]
             hi_bp = pos_i + bin_distances[-1]
-            j_lo = int(np.searchsorted(exact_positions, lo_bp, side="left"))
-            j_hi = int(np.searchsorted(exact_positions, hi_bp, side="right")) - 1
+            j_lo = int(np.searchsorted(exact_pos_k, lo_bp, side="left"))
+            j_hi = int(np.searchsorted(exact_pos_k, hi_bp, side="right")) - 1
             j_lo = max(j_lo, i + 1)
             if j_lo > j_hi:
                 continue
 
             j_range = np.arange(j_lo, j_hi + 1, dtype=np.intp)
-            a_arr = np.full(len(j_range), path_min_seq[i], dtype=np.uint64)
-            hashes = _combo_hash_v(a_arr, path_min_seq[j_range])
+            a_arr = np.full(len(j_range), path_kmer_seq[i], dtype=np.uint64)
+            hashes = _canonical_combo_hash_v(a_arr, path_kmer_seq[j_range])
 
             keep = hashes <= threshold
             if not np.any(keep):
                 continue
 
             kept_hashes = hashes[keep]
-            kept_dists = (exact_positions[j_range[keep]] - pos_i).astype(np.float64)
+            kept_dists = (exact_pos_k[j_range[keep]] - pos_i).astype(np.float64)
             bin_indices = np.searchsorted(bin_arr, kept_dists, side="right") - 1
             for h_val, b_idx in zip(kept_hashes.tolist(), bin_indices.tolist()):
                 if 0 <= b_idx < n_bins:
@@ -810,7 +904,7 @@ def build_path_combo_sketch(
         # Approximate method: scale minimizer-index gaps by bp_scale.
         # Use single-occurrence deduplication: each combo hash is assigned to
         # exactly one bin (the shortest distance at which it first appears).
-        # Hashes that appear in more than one bin (due to repeated minimizer IDs
+        # Hashes that appear in more than one bin (due to repeated k-mer hashes
         # in tandem-repeat or cyclic path sequences) are discarded entirely.
         # -1 in hash_to_bin signals a multi-bin conflict.
         hash_to_bin: dict[int, int] = {}
@@ -821,8 +915,8 @@ def build_path_combo_sketch(
                 break
 
             j_range = np.arange(j_lo, j_hi + 1, dtype=np.intp)
-            a_arr = np.full(len(j_range), path_min_seq[i], dtype=np.uint64)
-            hashes = _combo_hash_v(a_arr, path_min_seq[j_range])
+            a_arr = np.full(len(j_range), path_kmer_seq[i], dtype=np.uint64)
+            hashes = _canonical_combo_hash_v(a_arr, path_kmer_seq[j_range])
 
             keep = hashes <= threshold
             if not np.any(keep):
@@ -2139,6 +2233,7 @@ def build_top_path_combo_sketches(
     density: float,
     n_paths: int = 50,
     top_paths: list[tuple[_OrientedPath, int]] | None = None,
+    k: int = 7,
     use_exact_distances: bool = False,
     min_table: dict[int, str] | None = None,
     l: int = 12,
@@ -2274,6 +2369,7 @@ def build_top_path_combo_sketches(
                 bin_distances=bin_distances,
                 density=density,
                 bp_scale=bp_scale,
+                k=k,
                 use_exact_distances=use_exact_distances,
                 path=path if use_exact_distances else None,
                 graph=graph if use_exact_distances else None,
@@ -2354,6 +2450,13 @@ def main(
              "(arithmetic pairing: read 0↔1, 2↔3, …). "
              "Required to build the PE combination sketch.",
     )] = False,
+    combo_k: Annotated[int, typer.Option(
+        "--combo-k",
+        help="Number of consecutive minimizer IDs per combination k-mer. "
+             "Set to match the rust-mdbg -k value so each k-mer maps to one "
+             "assembly graph node.",
+        min=1,
+    )] = 7,
     combo_density: Annotated[float, typer.Option(
         "--combo-density",
         help="Thinning density: fraction of combination hashes to retain",
@@ -2506,6 +2609,7 @@ def main(
             pe_sketch_obj = build_pe_combo_sketch(
                 _lmdb_path,
                 density=combo_density,
+                k=combo_k,
                 out_lmdb=pe_combo_lmdb_out,
             )
             pe_combo_unique = len(pe_sketch_obj)
@@ -2518,6 +2622,7 @@ def main(
         intra_sketch_obj = build_intra_combo_sketch(
             _lmdb_path,
             density=combo_density,
+            k=combo_k,
             out_lmdb=intra_combo_lmdb_out,
         )
         intra_combo_unique = len(intra_sketch_obj)
@@ -2575,6 +2680,7 @@ def main(
                 density=combo_density,
                 n_paths=insert_size_paths,
                 top_paths=top_paths_sorted,
+                k=combo_k,
                 min_table=_min_table,
                 l=read_length,
                 seqs_prefix=read_minimizers_prefix,

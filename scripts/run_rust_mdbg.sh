@@ -114,11 +114,14 @@ fi
     --minimizer-table "${MINIMIZER_TABLE}" \
     --json "${PREFIX}.graph_summary.json" \
     "${_PAIRED_FLAGS[@]}" \
+    --combo-k "${K}" \
     --combo-density 0.05 \
     --estimate-insert-size \
     --insert-size-paths 100 \
     --insert-size-bins "150,300,500,700,1000" \
     --insert-size-inference nuts \
     --insert-size-min-bin-hashes 100 \
+    --pe-combo-lmdb-out "${PREFIX}.pe_index.lmdb" \
+    --intra-combo-lmdb-out "${PREFIX}.intra_index.lmdb" \
     "${GFA}"
 
