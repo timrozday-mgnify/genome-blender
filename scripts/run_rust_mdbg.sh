@@ -47,9 +47,9 @@ K=7
 
 # L: l-mer length (minimizer alphabet).  Together with density (derived below)
 #   this controls how many minimizers are sampled per read.
-#   Rule of thumb: L ≈ read_length × density × 1.25, so
-#     density = L / (read_length × 1.25).
-#   L=12 gives ~9–10 minimizers per 150 bp read at the derived density.
+#   Rule of thumb: L ≈ read_length × density × 0.75, so
+#     density = L / (read_length × 0.75).
+#   L=12 gives ~15–25 minimizers per 150 bp read at the derived density.
 #   Increasing L reduces the minimizer density but creates more unique minimizers.
 L=12
 
@@ -65,7 +65,7 @@ MINIMIZER_TABLE="${PREFIX}.minimizer_table"
 
 # Estimate mean read length from the first 1000 reads, then derive density.
 # The minimizer length l and density are related by:
-#   read_length * density * 1.25 = l  =>  density = l / (read_length * 1.25)
+#   read_length * density * 0.75 = l  =>  density = l / (read_length * 0.75)
 READS_STATS_JSON="${OUTPUT_DIR}/reads_stats.json"
 /Users/timrozday/miniforge3/envs/genome_blender_dev/bin/python \
     "$(dirname "$0")/reads_summary.py" "${READS_FILE}" -n 1000 \
@@ -76,10 +76,10 @@ MEAN_READ_LEN=$(
 )
 DENSITY=$(
     /Users/timrozday/miniforge3/envs/genome_blender_dev/bin/python3 -c \
-        "print(f'{${L} / (${MEAN_READ_LEN} * 1.25):.4f}')"
+        "print(f'{${L} / (${MEAN_READ_LEN} * 0.75):.4f}')"
 )
 echo "Estimated mean read length: ${MEAN_READ_LEN} bp"
-echo "Using density: ${DENSITY}  (l=${L} / (${MEAN_READ_LEN} * 1.25))"
+echo "Using density: ${DENSITY}  (l=${L} / (${MEAN_READ_LEN} * 0.75))"
 
 # Run rust-mdbg directly (local build from timrozday-mgnify/rust-mdbg, mg-summary branch)
 # --dump-read-minimizers writes the reads LMDB index ({PREFIX}.index.lmdb)
@@ -114,9 +114,10 @@ fi
     --minimizer-table "${MINIMIZER_TABLE}" \
     --json "${PREFIX}.graph_summary.json" \
     "${_PAIRED_FLAGS[@]}" \
+    --combo-density 0.05 \
     --estimate-insert-size \
     --insert-size-paths 100 \
-    --insert-size-bins "150,200,250,300,400,500,600,800,1000" \
+    --insert-size-bins "150,300,500,700,1000" \
     --insert-size-inference nuts \
     --insert-size-min-bin-hashes 100 \
     "${GFA}"

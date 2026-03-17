@@ -292,6 +292,12 @@ def _add_link(
 _READS_LMDB_MAP_SIZE: int = 32 * 1024 ** 3
 _READS_LMDB_MAX_DBS: int = 6
 
+# Maximum value of a uint64 — used as the fixed upper bound for combo hash
+# thinning so that threshold = density × UINT64_MAX is identical across all
+# sketch types (PE, intra, path).  Splitmix64 outputs are uniform over [0,
+# UINT64_MAX], so training a per-dataset max_hash is unnecessary.
+_UINT64_MAX: int = (1 << 64) - 1
+
 # splitmix64 mixing constants as numpy uint64 scalars
 _CM1 = np.uint64(0x9E3779B97F4A7C15)
 _CM2 = np.uint64(0xBF58476D1CE4E5B9)
@@ -461,73 +467,9 @@ def _iter_reads_lmdb(
         env.close()
 
 
-def _train_pe_combo_max_hash(
-    lmdb_path: Path,
-    n_train_pairs: int = 1000,
-) -> int:
-    """Return the max cross-pair combo hash from the first *n_train_pairs* pairs.
-
-    Reads are assumed to be interleaved (even read_id = R1, odd = R2).
-
-    Args:
-        lmdb_path: LMDB directory from ``rust-mdbg --dump-read-minimizers``.
-        n_train_pairs: Number of read pairs to sample.
-
-    Returns:
-        Maximum observed u64 combination hash value.
-    """
-    max_h = 0
-    r1_mids: np.ndarray | None = None
-    pairs_seen = 0
-    for read_id, mids in _iter_reads_lmdb(lmdb_path, limit=2 * n_train_pairs):
-        if read_id % 2 == 0:
-            r1_mids = mids
-        elif r1_mids is not None and len(r1_mids) > 0 and len(mids) > 0:
-            hashes = _combo_hash_v(
-                np.repeat(r1_mids, len(mids)),
-                np.tile(mids, len(r1_mids)),
-            )
-            h_max = int(hashes.max())
-            if h_max > max_h:
-                max_h = h_max
-            r1_mids = None
-            pairs_seen += 1
-            if pairs_seen >= n_train_pairs:
-                break
-    return max_h
-
-
-def _train_intra_combo_max_hash(
-    lmdb_path: Path,
-    n_train_reads: int = 1000,
-) -> int:
-    """Return the max intra-read combo hash from the first *n_train_reads* reads.
-
-    Args:
-        lmdb_path: LMDB directory from ``rust-mdbg --dump-read-minimizers``.
-        n_train_reads: Number of reads to sample.
-
-    Returns:
-        Maximum observed u64 combination hash value.
-    """
-    max_h = 0
-    for _, mids in _iter_reads_lmdb(lmdb_path, limit=n_train_reads):
-        n = len(mids)
-        if n < 2:
-            continue
-        i_idx, j_idx = np.triu_indices(n, k=1)
-        hashes = _combo_hash_v(mids[i_idx], mids[j_idx])
-        h_max = int(hashes.max())
-        if h_max > max_h:
-            max_h = h_max
-    return max_h
-
-
 def build_pe_combo_sketch(
     lmdb_path: Path,
     density: float,
-    max_hash: int | None = None,
-    n_train: int = 1000,
     out_lmdb: Path | None = None,
 ) -> CombSketchIndex:
     """Build a cross-pair (R1 × R2) combination minimizer sketch.
@@ -535,24 +477,21 @@ def build_pe_combo_sketch(
     For each interleaved read pair, computes the Cartesian product of R1 and
     R2 minimizer ID arrays, hashes each ``(R1_min, R2_min)`` pair via
     :func:`_combo_hash_v`, and retains those whose hash value is ≤
-    ``max_hash × density`` (minimizer-style thinning).
+    ``_UINT64_MAX × density`` (minimizer-style thinning).
+
+    The thinning threshold is fixed at ``int(density × _UINT64_MAX)`` — no
+    training is needed because :func:`_combo_hash_v` (splitmix64) produces
+    values that are uniform over the full uint64 range.
 
     Args:
         lmdb_path: rust-mdbg reads LMDB directory (``{prefix}.index.lmdb``).
         density: Fraction of combination hashes to retain (0 < density ≤ 1).
-        max_hash: Upper bound for thinning; trained from *n_train* pairs via
-            :func:`_train_pe_combo_max_hash` when ``None``.
-        n_train: Pairs used to train *max_hash* when not supplied.
         out_lmdb: If given, persist the sketch to this LMDB directory.
 
     Returns:
         Populated :class:`CombSketchIndex`.
     """
-    if max_hash is None:
-        logger.info("Training PE combo max hash from first %d pairs…", n_train)
-        max_hash = _train_pe_combo_max_hash(lmdb_path, n_train)
-        logger.info("PE combo max hash: %d", max_hash)
-    threshold = np.uint64(int(max_hash * density))
+    threshold = np.uint64(int(_UINT64_MAX * density))
     logger.info(
         "PE combo thinning: threshold=%d density=%.4f", int(threshold), density,
     )
@@ -584,34 +523,27 @@ def build_pe_combo_sketch(
 def build_intra_combo_sketch(
     lmdb_path: Path,
     density: float,
-    max_hash: int | None = None,
-    n_train: int = 1000,
     out_lmdb: Path | None = None,
 ) -> CombSketchIndex:
     """Build a within-read combination minimizer sketch.
 
     For each read, computes all C(n, 2) pairs from its minimizer IDs, hashes
     each pair via :func:`_combo_hash_v`, and retains those whose hash value is
-    ≤ ``max_hash × density``.
+    ≤ ``_UINT64_MAX × density``.
+
+    The thinning threshold is fixed at ``int(density × _UINT64_MAX)`` — no
+    training is needed because :func:`_combo_hash_v` (splitmix64) produces
+    values that are uniform over the full uint64 range.
 
     Args:
         lmdb_path: rust-mdbg reads LMDB directory (``{prefix}.index.lmdb``).
         density: Fraction of combination hashes to retain.
-        max_hash: Upper bound for thinning; trained from *n_train* reads via
-            :func:`_train_intra_combo_max_hash` when ``None``.
-        n_train: Reads used to train *max_hash* when not supplied.
         out_lmdb: If given, persist the sketch to this LMDB directory.
 
     Returns:
         Populated :class:`CombSketchIndex`.
     """
-    if max_hash is None:
-        logger.info(
-            "Training intra combo max hash from first %d reads…", n_train,
-        )
-        max_hash = _train_intra_combo_max_hash(lmdb_path, n_train)
-        logger.info("Intra combo max hash: %d", max_hash)
-    threshold = np.uint64(int(max_hash * density))
+    threshold = np.uint64(int(_UINT64_MAX * density))
     logger.info(
         "Intra combo thinning: threshold=%d density=%.4f", int(threshold), density,
     )
@@ -740,7 +672,6 @@ def build_path_combo_sketch(
     bin_distances: list[float],
     density: float,
     bp_scale: float,
-    max_hash: int | None = None,
     use_exact_distances: bool = False,
     path: _OrientedPath | None = None,
     graph: rx.PyGraph | None = None,
@@ -789,8 +720,6 @@ def build_path_combo_sketch(
         density: Thinning density — fraction of combo hashes to retain.
         bp_scale: Average base pairs per minimizer (used for the approximate
             method and as fallback).
-        max_hash: Thinning threshold numerator.  When ``None``, trained from
-            the first 10 000 minimizer pairs in the path.
         use_exact_distances: Use exact bp positions from sequence
             reconstruction rather than the average-scale approximation.
         path: Ordered ``(node_idx, is_forward)`` path — required for exact
@@ -833,23 +762,7 @@ def build_path_combo_sketch(
     min_gap = max(1, int(bin_distances[0] / bp_scale))
     max_gap = int(bin_distances[-1] / bp_scale) + 1
 
-    # --- Train max_hash -------------------------------------------------------
-    if max_hash is None:
-        max_h = 0
-        n_probe = min(len(path_min_seq), 10_000)
-        for i in range(n_probe):
-            j_lo = i + min_gap
-            j_hi = min(i + max_gap, n_probe - 1)
-            if j_lo > j_hi:
-                continue
-            a_arr = np.full(j_hi - j_lo + 1, path_min_seq[i], dtype=np.uint64)
-            h_max = int(_combo_hash_v(a_arr, path_min_seq[j_lo: j_hi + 1]).max())
-            if h_max > max_h:
-                max_h = h_max
-        max_hash = max_h
-        logger.info("Path combo max hash trained from path head: %d", max_hash)
-
-    threshold = np.uint64(int(max_hash * density))
+    threshold = np.uint64(int(_UINT64_MAX * density))
     logger.info(
         "Path combo thinning: threshold=%d density=%.4f", int(threshold), density,
     )
@@ -2202,7 +2115,6 @@ def build_top_path_combo_sketches(
     density: float,
     n_paths: int = 50,
     top_paths: list[tuple[_OrientedPath, int]] | None = None,
-    max_hash: int | None = None,
     use_exact_distances: bool = False,
     min_table: dict[int, str] | None = None,
     l: int = 12,
@@ -2230,15 +2142,14 @@ def build_top_path_combo_sketches(
 
     Args:
         graph: Parsed GFA graph (``Segment`` node data required).
-        lmdb_path: rust-mdbg reads LMDB directory — used to train
-            *max_hash* when not supplied.  May be ``None`` if
-            *max_hash* is provided directly.
+        lmdb_path: rust-mdbg reads LMDB directory (used for bp_scale
+            estimation only; thinning threshold is fixed at
+            ``int(density × _UINT64_MAX)``).
         bin_distances: Sorted bp breakpoints (``≥ 2`` values).
         density: Combination hash thinning density.
         n_paths: Maximum number of paths to process.
         top_paths: Pre-selected ``(path, bp_length)`` pairs, sorted
             longest-first.  Pass ``None`` to return empty results.
-        max_hash: Thinning threshold; trained from *lmdb_path* when ``None``.
         use_exact_distances: Forward to :func:`build_path_combo_sketch`.
         min_table: Minimizer hash → l-mer string mapping for exact distances.
         l: l-mer length; forwarded to :func:`build_path_combo_sketch`.
@@ -2296,30 +2207,6 @@ def build_top_path_combo_sketches(
             "Estimated bp_scale=%.2f from %d top path(s)", bp_scale, len(selected)
         )
 
-    # --- Train max_hash if not provided -----------------------------------------
-    if max_hash is None and node_min_seqs:
-        # Sample from the first path to train the thinning threshold.
-        first_path, _ = selected[0]
-        sample_mids: list[int] = []
-        for node_idx, is_fwd in first_path[:200]:
-            mids = node_min_seqs.get(int(graph[node_idx].name))
-            if mids is not None:
-                sample_mids.extend(mids.tolist())
-        if sample_mids:
-            probe = np.array(sample_mids[:5000], dtype=np.uint64)
-            n_probe = len(probe)
-            max_h = 0
-            for i in range(min(n_probe, 1000)):
-                j_hi = min(i + 50, n_probe - 1)
-                if i >= j_hi:
-                    continue
-                a_arr = np.full(j_hi - i, probe[i], dtype=np.uint64)
-                h_max = int(_combo_hash_v(a_arr, probe[i + 1: j_hi + 1]).max())
-                if h_max > max_h:
-                    max_h = h_max
-            max_hash = max_h
-            logger.info("Path combo max hash trained from first path: %d", max_hash)
-
     # --- Build sketches per path ------------------------------------------------
     path_sketch_lists: list[list[CombSketchIndex]] = []
     with Progress(*_PROGRESS_COLUMNS) as progress:
@@ -2363,7 +2250,6 @@ def build_top_path_combo_sketches(
                 bin_distances=bin_distances,
                 density=density,
                 bp_scale=bp_scale,
-                max_hash=max_hash,
                 use_exact_distances=use_exact_distances,
                 path=path if use_exact_distances else None,
                 graph=graph if use_exact_distances else None,
@@ -2450,16 +2336,6 @@ def main(
         min=0.0,
         max=1.0,
     )] = 0.001,
-    combo_train_reads: Annotated[int, typer.Option(
-        "--combo-train-reads",
-        help="Reads (or pairs for PE) used to train the thinning max hash",
-        min=1,
-    )] = 1000,
-    combo_max_hash: Annotated[int | None, typer.Option(
-        "--combo-max-hash",
-        help="Override the trained thinning max hash value "
-             "(applied to both PE and intra sketches)",
-    )] = None,
     pe_combo_lmdb_out: Annotated[Path | None, typer.Option(
         "--pe-combo-lmdb-out",
         help="Persist the PE combination sketch to this LMDB directory",
@@ -2606,8 +2482,6 @@ def main(
             pe_sketch_obj = build_pe_combo_sketch(
                 _lmdb_path,
                 density=combo_density,
-                max_hash=combo_max_hash,
-                n_train=combo_train_reads,
                 out_lmdb=pe_combo_lmdb_out,
             )
             pe_combo_unique = len(pe_sketch_obj)
@@ -2620,8 +2494,6 @@ def main(
         intra_sketch_obj = build_intra_combo_sketch(
             _lmdb_path,
             density=combo_density,
-            max_hash=combo_max_hash,
-            n_train=combo_train_reads,
             out_lmdb=intra_combo_lmdb_out,
         )
         intra_combo_unique = len(intra_sketch_obj)
@@ -2679,7 +2551,6 @@ def main(
                 density=combo_density,
                 n_paths=insert_size_paths,
                 top_paths=top_paths_sorted,
-                max_hash=combo_max_hash,
                 min_table=_min_table,
                 l=read_length,
                 seqs_prefix=read_minimizers_prefix,
