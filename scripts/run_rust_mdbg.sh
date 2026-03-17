@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-INPUT_DIR="$(cd ../genome-blender_run/single_short_shallow/output && pwd)"
+INPUT_DIR="$(cd ../genome-blender_run/multi_genome_full/output && pwd)"
 OUTPUT_DIR="${INPUT_DIR}/rust-mdbg"
 mkdir -p "${OUTPUT_DIR}"
 
@@ -118,7 +118,7 @@ fi
     --combo-density 0.05 \
     --estimate-insert-size \
     --insert-size-paths 100 \
-    --insert-size-bins "150,300,500,700,1000" \
+    --insert-size-bins "0,1000,2000,4000,8000,12000,16000,20000" \
     --insert-size-inference nuts \
     --insert-size-min-bin-hashes 100 \
     --pe-combo-lmdb-out "${PREFIX}.pe_index.lmdb" \

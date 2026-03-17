@@ -417,7 +417,7 @@ class CombSketchIndex:
             lmdb_path.mkdir(parents=True, exist_ok=True)
             self._env = _lmdb.open(
                 str(lmdb_path),
-                map_size=4 * 1024 ** 3,
+                map_size=32 * 1024 ** 3,
                 max_dbs=1,
             )
             self._lmdb_db = self._env.open_db(b"combo")
