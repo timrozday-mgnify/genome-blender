@@ -1238,23 +1238,30 @@ def _load_pe_pairs(bam_path: Path) -> dict[str, tuple[str, str]]:
     r1_seg: dict[str, str] = {}
     r2_seg: dict[str, str] = {}
 
-    with _pysam.AlignmentFile(str(bam_path), "rb") as bam:
-        for read in bam.fetch(until_eof=True):
-            if (
-                read.is_unmapped
-                or read.is_secondary
-                or read.is_supplementary
-                or not read.is_paired
-            ):
-                continue
-            seg = read.reference_name
-            name = read.query_name
-            if seg is None or name is None:
-                continue
-            if read.is_read1:
-                r1_seg[name] = seg
-            elif read.is_read2:
-                r2_seg[name] = seg
+    reads_seen = 0
+    with Progress(*_PROGRESS_COLUMNS) as progress:
+        task = progress.add_task("Loading PE pairs", total=None)
+        with _pysam.AlignmentFile(str(bam_path), "rb") as bam:
+            for read in bam.fetch(until_eof=True):
+                if (
+                    read.is_unmapped
+                    or read.is_secondary
+                    or read.is_supplementary
+                    or not read.is_paired
+                ):
+                    continue
+                seg = read.reference_name
+                name = read.query_name
+                if seg is None or name is None:
+                    continue
+                if read.is_read1:
+                    r1_seg[name] = seg
+                elif read.is_read2:
+                    r2_seg[name] = seg
+                reads_seen += 1
+                if reads_seen % 100_000 == 0:
+                    progress.update(task, completed=reads_seen)
+        progress.update(task, completed=reads_seen)
 
     pairs = {
         name: (r1_seg[name], r2_seg[name])
@@ -1691,47 +1698,50 @@ def _load_node_minimizer_seqs(
     node_seqs: dict[int, np.ndarray] = {}
     k_val = 1
 
-    for seqs_file in seqs_files:
-        try:
-            with _lz4.open(str(seqs_file), mode="rt") as fh:
-                for line in fh:
-                    line = line.rstrip("\n")
-                    if not line:
-                        continue
-                    if line.startswith("# k ="):
+    with Progress(*_PROGRESS_COLUMNS) as progress:
+        task = progress.add_task("Loading sequences files", total=len(seqs_files))
+        for seqs_file in seqs_files:
+            try:
+                with _lz4.open(str(seqs_file), mode="rt") as fh:
+                    for line in fh:
+                        line = line.rstrip("\n")
+                        if not line:
+                            continue
+                        if line.startswith("# k ="):
+                            try:
+                                k_val = int(line.split("=", 1)[1].strip())
+                            except ValueError:
+                                pass
+                            continue
+                        if line.startswith("#"):
+                            continue
+                        fields = line.split("\t")
+                        if len(fields) < 2:
+                            continue
                         try:
-                            k_val = int(line.split("=", 1)[1].strip())
-                        except ValueError:
-                            pass
-                        continue
-                    if line.startswith("#"):
-                        continue
-                    fields = line.split("\t")
-                    if len(fields) < 2:
-                        continue
-                    try:
-                        node_name = int(fields[0])
-                    except ValueError:
-                        continue
-                    min_str = fields[1].strip()
-                    if min_str.startswith("[") and min_str.endswith("]"):
-                        min_str = min_str[1:-1]
-                        try:
-                            mids = np.array(
-                                [
-                                    int(x.strip())
-                                    for x in min_str.split(",")
-                                    if x.strip()
-                                ],
-                                dtype=np.uint64,
-                            )
+                            node_name = int(fields[0])
                         except ValueError:
                             continue
-                        node_seqs[node_name] = mids
-        except Exception as exc:
-            logger.warning(
-                "Failed to read sequences file %s: %s", seqs_file, exc
-            )
+                        min_str = fields[1].strip()
+                        if min_str.startswith("[") and min_str.endswith("]"):
+                            min_str = min_str[1:-1]
+                            try:
+                                mids = np.array(
+                                    [
+                                        int(x.strip())
+                                        for x in min_str.split(",")
+                                        if x.strip()
+                                    ],
+                                    dtype=np.uint64,
+                                )
+                            except ValueError:
+                                continue
+                            node_seqs[node_name] = mids
+            except Exception as exc:
+                logger.warning(
+                    "Failed to read sequences file %s: %s", seqs_file, exc
+                )
+            progress.advance(task)
 
     logger.info(
         "Loaded minimizer sequences for %d nodes (k=%d) from %d file(s)",
@@ -1754,18 +1764,25 @@ def _load_minimizer_table(table_path: Path) -> dict[int, str]:
         Dict mapping integer minimizer hash ID to l-mer string.
     """
     table: dict[int, str] = {}
-    with table_path.open() as fh:
-        for line in fh:
-            line = line.rstrip("\n")
-            if not line or line.startswith("#"):
-                continue
-            fields = line.split("\t")
-            if len(fields) < 2:
-                continue
-            try:
-                table[int(fields[0])] = fields[1]
-            except ValueError:
-                continue
+    entries = 0
+    with Progress(*_PROGRESS_COLUMNS) as progress:
+        task = progress.add_task("Loading minimizer table", total=None)
+        with table_path.open() as fh:
+            for line in fh:
+                line = line.rstrip("\n")
+                if not line or line.startswith("#"):
+                    continue
+                fields = line.split("\t")
+                if len(fields) < 2:
+                    continue
+                try:
+                    table[int(fields[0])] = fields[1]
+                    entries += 1
+                    if entries % 500_000 == 0:
+                        progress.update(task, completed=entries)
+                except ValueError:
+                    continue
+        progress.update(task, completed=entries)
     logger.info("Loaded %d entries from minimizer table %s", len(table), table_path)
     return table
 
@@ -1792,12 +1809,15 @@ def aggregate_path_bin_sketches(
     n_bins = len(path_sketches[0])
     pooled: list[set[int]] = [set() for _ in range(n_bins)]
 
-    for sketch_list in path_sketches:
-        for b, sketch in enumerate(sketch_list):
-            if b >= n_bins:
-                break
-            # Path sketches are always in-memory (no LMDB).
-            pooled[b].update(sketch._buf.keys())
+    with Progress(*_PROGRESS_COLUMNS) as progress:
+        task = progress.add_task("Pooling path sketches", total=len(path_sketches))
+        for sketch_list in path_sketches:
+            for b, sketch in enumerate(sketch_list):
+                if b >= n_bins:
+                    break
+                # Path sketches are always in-memory (no LMDB).
+                pooled[b].update(sketch._buf.keys())
+            progress.advance(task)
 
     for b in range(n_bins):
         if len(pooled[b]) > max_pool_hashes:
@@ -2050,7 +2070,7 @@ def estimate_fragment_length(
             kernel,
             num_samples=num_samples,
             warmup_steps=num_warmup,
-            disable_progbar=True,
+            disable_progbar=False,
         )
         mcmc.run(*model_args)
         samples = mcmc.get_samples()
@@ -2064,10 +2084,14 @@ def estimate_fragment_length(
         svi_obj = SVI(
             _fragment_length_pyro_model, guide, optimizer, loss=Trace_ELBO()
         )
-        for step in range(2000):
-            loss = svi_obj.step(*model_args)
-            if step % 500 == 0:
-                logger.debug("ADVI step %d, ELBO=%.4f", step, -loss)
+        _advi_steps = 2000
+        with Progress(*_PROGRESS_COLUMNS) as progress:
+            task = progress.add_task("ADVI inference", total=_advi_steps)
+            for step in range(_advi_steps):
+                loss = svi_obj.step(*model_args)
+                if step % 500 == 0:
+                    logger.debug("ADVI step %d, ELBO=%.4f", step, -loss)
+                progress.advance(task)
         predictive = Predictive(
             _fragment_length_pyro_model,
             guide=guide,
