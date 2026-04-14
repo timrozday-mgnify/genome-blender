@@ -479,12 +479,20 @@ class CombSketchIndex:
 def _iter_reads_lmdb(
     lmdb_path: Path,
     limit: int | None = None,
-) -> Iterator[tuple[int, np.ndarray]]:
-    """Yield ``(read_id_0based, minimizer_ids)`` from a rust-mdbg reads LMDB.
+) -> Iterator[tuple[int, np.ndarray, np.ndarray | None]]:
+    """Yield ``(read_id_0based, minimizer_ids, minimizer_positions)`` from a rust-mdbg reads LMDB.
 
     Iterates the ``reads`` sub-database in ascending *numeric* key order.
     Keys are 1-based ASCII-decimal read indices (e.g. ``b'1'``, ``b'42'``);
-    values are packed little-endian u64 minimizer IDs.
+    values are either:
+
+    * **Old format** (no ``has_positions`` meta flag): packed little-endian
+      u64 minimizer IDs — 8 bytes per minimizer.  ``minimizer_positions``
+      is yielded as ``None``.
+    * **New format** (``has_positions`` == 1 in meta): interleaved
+      ``(hash u64 LE, pos u32 LE)`` — 12 bytes per minimizer.
+      ``minimizer_positions`` is a uint32 array of 0-based positions in the
+      original (non-HPC) read sequence.
 
     The LMDB default cursor iterates keys in lexicographic order, which does
     not preserve numeric order for ASCII-encoded integers.  This function
@@ -508,7 +516,16 @@ def _iter_reads_lmdb(
     )
     reads_db = env.open_db(b"reads")
     try:
+        meta_db = env.open_db(b"meta")
+    except _lmdb.ReadonlyError:
+        meta_db = None
+    try:
         with env.begin() as txn:
+            has_positions = (
+                meta_db is not None
+                and txn.get(b"has_positions", db=meta_db) == b"\x01"
+            )
+
             # Collect all keys and sort numerically.
             # ASCII-decimal keys are typically short (~1–7 bytes for ≤10M reads).
             all_keys: list[bytes] = []
@@ -529,12 +546,25 @@ def _iter_reads_lmdb(
                 if val is None:
                     continue
                 read_id = int(key) - 1  # 1-based → 0-based
-                n = len(val) // 8
-                mids = (
-                    np.frombuffer(val, dtype="<u8").copy()
-                    if n else np.empty(0, dtype=np.uint64)
-                )
-                yield read_id, mids
+                if has_positions:
+                    # New format: interleaved (u64 hash, u32 pos) = 12 bytes each
+                    n = len(val) // 12
+                    if n:
+                        raw = np.frombuffer(val, dtype=np.uint8).reshape(n, 12)
+                        mids = np.frombuffer(raw[:, :8].tobytes(), dtype="<u8").copy()
+                        pos = np.frombuffer(raw[:, 8:12].tobytes(), dtype="<u4").copy()
+                    else:
+                        mids = np.empty(0, dtype=np.uint64)
+                        pos = np.empty(0, dtype=np.uint32)
+                    yield read_id, mids, pos
+                else:
+                    # Old format: packed u64 hashes only
+                    n = len(val) // 8
+                    mids = (
+                        np.frombuffer(val, dtype="<u8").copy()
+                        if n else np.empty(0, dtype=np.uint64)
+                    )
+                    yield read_id, mids, None
                 count += 1
     finally:
         env.close()
@@ -569,7 +599,7 @@ def build_pe_combo_sketch(
     Returns:
         Populated :class:`CombSketchIndex`.
     """
-    threshold = np.uint64(int(_UINT64_MAX * density))
+    threshold = _UINT64_MAX if density >= 1.0 else np.uint64(np.float64(_UINT64_MAX) * density)
     logger.info(
         "PE combo thinning: threshold=%d density=%.4f", int(threshold), density,
     )
@@ -579,7 +609,7 @@ def build_pe_combo_sketch(
     pairs_done = 0
     with Progress(*_PROGRESS_COLUMNS) as progress:
         task = progress.add_task("PE combo sketch", total=None)
-        for read_id, mids in _iter_reads_lmdb(lmdb_path):
+        for read_id, mids, _pos in _iter_reads_lmdb(lmdb_path):
             if read_id % 2 == 0:
                 r1_kmers = _compute_kmer_hashes(mids, k)
             elif r1_kmers is not None:
@@ -624,7 +654,7 @@ def build_intra_combo_sketch(
     Returns:
         Populated :class:`CombSketchIndex`.
     """
-    threshold = np.uint64(int(_UINT64_MAX * density))
+    threshold = _UINT64_MAX if density >= 1.0 else np.uint64(np.float64(_UINT64_MAX) * density)
     logger.info(
         "Intra combo thinning: threshold=%d density=%.4f", int(threshold), density,
     )
@@ -633,7 +663,7 @@ def build_intra_combo_sketch(
     reads_done = 0
     with Progress(*_PROGRESS_COLUMNS) as progress:
         task = progress.add_task("Intra combo sketch", total=None)
-        for _, mids in _iter_reads_lmdb(lmdb_path):
+        for _, mids, _pos in _iter_reads_lmdb(lmdb_path):
             kmers = _compute_kmer_hashes(mids, k)
             n_k = len(kmers)
             if n_k >= 2:
@@ -848,7 +878,7 @@ def build_path_combo_sketch(
     min_gap = max(1, int(bin_distances[0] / bp_scale))
     max_gap = int(bin_distances[-1] / bp_scale) + 1
 
-    threshold = np.uint64(int(_UINT64_MAX * density))
+    threshold = _UINT64_MAX if density >= 1.0 else np.uint64(np.float64(_UINT64_MAX) * density)
     logger.info(
         "Path combo thinning: threshold=%d density=%.4f", int(threshold), density,
     )
@@ -998,6 +1028,30 @@ def _overlap_length(cigar: str) -> float:
         return 1.0
     lengths = _CIGAR_RE.findall(cigar)
     return float(sum(int(n) for n in lengths)) if lengths else 1.0
+
+
+def _path_bp_length(
+    graph: rx.PyGraph,
+    path: _OrientedPath,
+) -> int:
+    """Compute the overlap-corrected base-pair length of a path.
+
+    Sums segment lengths and subtracts the bp overlap (from GFA link CIGAR
+    strings) between each pair of consecutive segments.  This avoids the
+    double-counting that occurs when naively summing ``Segment.length``
+    values along a path in a k-order minimizer-space de Bruijn graph, where
+    consecutive nodes share k−1 minimizers and their corresponding DNA.
+    """
+    if not path:
+        return 0
+    bp = sum(graph[idx].length for idx, _ in path)
+    for i in range(1, len(path)):
+        prev_idx = path[i - 1][0]
+        cur_idx = path[i][0]
+        edges = graph.get_all_edge_data(prev_idx, cur_idx)
+        if edges:
+            bp -= int(_overlap_length(edges[0].overlap))
+    return bp
 
 
 def leaf_nodes(graph: rx.PyGraph) -> list[int]:
@@ -1231,7 +1285,7 @@ def _iter_sampled_paths(
         task = progress.add_task("Sampling paths", total=n_samples)
         for _ in range(n_samples):
             path = _random_simple_path(graph, start_nodes, weight_mode)
-            bp = sum(graph[idx].length for idx, _ in path)
+            bp = _path_bp_length(graph, path)
             yield path, bp
             progress.advance(task)
 
@@ -1393,8 +1447,7 @@ def _path_pair_distances(
     Returns:
         List of bp distances, one per pair found in the path.
     """
-    node_indices = [idx for idx, _ in path]
-    node_pos = {node: i for i, node in enumerate(node_indices)}
+    node_pos = {idx: i for i, (idx, _) in enumerate(path)}
     distances: list[int] = []
 
     for seg1_idx, seg2_idx in pair_seg_indices:
@@ -1404,7 +1457,7 @@ def _path_pair_distances(
         j = node_pos[seg2_idx]
         if i > j:
             i, j = j, i
-        dist = sum(graph[node_indices[k]].length for k in range(i, j + 1))
+        dist = _path_bp_length(graph, path[i : j + 1])
         distances.append(dist)
 
     return distances

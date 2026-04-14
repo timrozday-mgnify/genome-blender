@@ -47,11 +47,11 @@ K=7
 
 # L: l-mer length (minimizer alphabet).  Together with density (derived below)
 #   this controls how many minimizers are sampled per read.
-#   Rule of thumb: L ≈ read_length × density × 0.75, so
-#     density = L / (read_length × 0.75).
-#   L=12 gives ~15–25 minimizers per 150 bp read at the derived density.
+#   Rule of thumb: L ≈ read_length × density × 1.5, so
+#     density = L / (read_length × 1.5).
+#   L=21 gives ~15–25 minimizers per 150 bp read at the derived density.
 #   Increasing L reduces the minimizer density but creates more unique minimizers.
-L=12
+L=21
 
 # MINABUND: minimum number of times a minimizer must appear to be kept in the
 #   graph.  Filters low-frequency (likely error-derived) minimizers.
@@ -65,7 +65,7 @@ MINIMIZER_TABLE="${PREFIX}.minimizer_table"
 
 # Estimate mean read length from the first 1000 reads, then derive density.
 # The minimizer length l and density are related by:
-#   read_length * density * 0.75 = l  =>  density = l / (read_length * 0.75)
+#   read_length * density * 1.5 = l  =>  density = l / (read_length * 1.5)
 READS_STATS_JSON="${OUTPUT_DIR}/reads_stats.json"
 /Users/timrozday/miniforge3/envs/genome_blender_dev/bin/python \
     "$(dirname "$0")/reads_summary.py" "${READS_FILE}" -n 1000 \
@@ -76,15 +76,30 @@ MEAN_READ_LEN=$(
 )
 DENSITY=$(
     /Users/timrozday/miniforge3/envs/genome_blender_dev/bin/python3 -c \
-        "print(f'{${L} / (${MEAN_READ_LEN} * 0.75):.4f}')"
+        "print(f'{${L} / (${MEAN_READ_LEN} * 1.5):.4f}')"
 )
 echo "Estimated mean read length: ${MEAN_READ_LEN} bp"
 echo "Using density: ${DENSITY}  (l=${L} / (${MEAN_READ_LEN} * 0.75))"
 
 # Run rust-mdbg directly (local build from timrozday-mgnify/rust-mdbg, mg-summary branch)
-# --dump-read-minimizers writes the reads LMDB index ({PREFIX}.index.lmdb)
-# and {PREFIX}.minimizer_table (plain-text TSV: hash <-> l-mer lookup).
-# When --reads2 is given, R1 gets odd indices (1, 3, 5, …) and R2 gets even (2, 4, 6, …).
+# --dump-read-minimizers  writes the reads LMDB index ({PREFIX}.index.lmdb)
+#                         and {PREFIX}.minimizer_table (plain-text TSV: hash <-> l-mer lookup).
+#                         When --reads2 is given, R1 gets odd indices (1, 3, 5, …) and R2 gets
+#                         even (2, 4, 6, …).
+# --dump-kminmer-index    writes the inverted k-min-mer LMDB ({PREFIX}.kminmer_index.lmdb):
+#                         for each canonical k-mer of K consecutive minimizers, stores the
+#                         sorted list of 1-based read indices that contain it (DUPSORT layout).
+# --kminmer-bloom         writes a bloom filter ({PREFIX}.kminmer_bloom.bin) for rapid
+#                         membership testing without opening LMDB (~128 MB, ~1% FPR).
+# COMBO_DENSITY: fraction of combination hashes retained for PE/intra combo indexes.
+# Lower values → smaller indexes, faster query, less signal.  0.05 is a good default.
+COMBO_DENSITY=0.05
+
+# COMBO_MAX_DISTANCE: maximum bp distance between a R1 and R2 minimizer for PE combo
+# inclusion.  Pairs further apart than this are discarded.  Set to roughly 2× the
+# expected insert size to keep signal while rejecting spurious long-range pairs.
+COMBO_MAX_DISTANCE=2000
+
 "$(dirname "$0")/../bin/rust-mdbg" \
     "${READS_FILE}" \
     "${READS2_FLAG[@]}" \
@@ -94,6 +109,12 @@ echo "Using density: ${DENSITY}  (l=${L} / (${MEAN_READ_LEN} * 0.75))"
     --minabund "${MINABUND}" \
     --prefix "${PREFIX}" \
     --dump-read-minimizers \
+    --dump-kminmer-index \
+    --kminmer-bloom \
+    --dump-combo-index \
+    --combo-density "${COMBO_DENSITY}" \
+    --combo-max-distance "${COMBO_MAX_DISTANCE}" \
+    --combo-bloom \
 2>&1 | tee "${OUTPUT_DIR}/output.txt"
 
 UNIQUE_MINIMIZERS=$(grep -vc '^#' "${MINIMIZER_TABLE}" 2>/dev/null || echo 0)

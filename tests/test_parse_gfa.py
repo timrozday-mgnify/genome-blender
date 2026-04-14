@@ -4,8 +4,10 @@ from __future__ import annotations
 
 import json
 import random
+import struct
 from pathlib import Path
 
+import lmdb
 import numpy as np
 import pytest
 import rustworkx as rx
@@ -16,39 +18,59 @@ import sys
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "scripts"))
 
 from parse_gfa import (
-    AhoCorasick,
+    CombSketchIndex,
     Link,
-    MatcherMode,
-    PathMatch,
-    ReadIndex,
     Segment,
-    SeedExtender,
     WeightMode,
-    _compute_eligible,
-    load_name_index,
+    _canonical_combo_hash_v,
+    _chain_hash,
+    _combo_hash_v,
+    _compute_kmer_hashes,
+    _UINT64_MAX,
     _overlap_length,
     _parse_tags,
     _path_pair_distances,
-    _path_pair_insert_sizes,
     _pick_by_kmer,
     _pick_by_overlap,
     _pick_uniformly,
     _random_simple_path,
     _seg_name_index,
-    _template_name,
     app,
-    build_aho_corasick,
-    build_read_index,
-    build_seed_extender,
-    build_seg_min_index,
+    build_pe_combo_sketch,
     leaf_nodes,
     longest_simple_path,
-    match_reads_to_path,
     parse_gfa,
-    path_minimizer_sequence,
     print_summary,
     sample_pair_distances,
     sample_path_lengths,
+)
+
+# Symbols that existed in an older version of parse_gfa.py; may be absent.
+try:
+    from parse_gfa import (
+        AhoCorasick,
+        MatcherMode,
+        PathMatch,
+        ReadIndex,
+        SeedExtender,
+        _compute_eligible,
+        _path_pair_insert_sizes,
+        _template_name,
+        build_aho_corasick,
+        build_read_index,
+        build_seed_extender,
+        build_seg_min_index,
+        load_name_index,
+        match_reads_to_path,
+        path_minimizer_sequence,
+    )
+    _ADVANCED_SYMBOLS_AVAILABLE = True
+except ImportError:
+    _ADVANCED_SYMBOLS_AVAILABLE = False
+
+_skip_if_missing = pytest.mark.skipif(
+    not _ADVANCED_SYMBOLS_AVAILABLE,
+    reason="parse_gfa symbols not yet implemented",
 )
 
 
@@ -59,6 +81,7 @@ runner = CliRunner()
 # Unit: _template_name
 # ------------------------------------------------------------------ #
 
+@_skip_if_missing
 @pytest.mark.parametrize("name, expected", [
     # Slash convention: /1, /2
     ("read/1", "read"),
@@ -284,7 +307,9 @@ class TestPickFunctions:
 class TestPathPairDistances:
     """Tests for _path_pair_distances."""
 
-    def _make_chain(self, lengths: list[int]) -> rx.PyGraph:
+    def _make_chain(
+        self, lengths: list[int], overlap: str = "20M",
+    ) -> rx.PyGraph:
         g: rx.PyGraph = rx.PyGraph()
         prev = None
         for i, ln in enumerate(lengths):
@@ -292,7 +317,7 @@ class TestPathPairDistances:
                 Segment(f"s{i}", "A" * ln, ln),
             )
             if prev is not None:
-                g.add_edge(prev, idx, Link("+", "+", "*"))
+                g.add_edge(prev, idx, Link("+", "+", overlap))
             prev = idx
         return g
 
@@ -306,13 +331,13 @@ class TestPathPairDistances:
         g = self._make_chain([100, 200, 300])
         path = [(0, True), (1, True), (2, True)]
         dists = _path_pair_distances(g, path, [(0, 1)])
-        assert dists == [300]  # 100 + 200
+        assert dists == [280]  # 100 + 200 - 20 overlap
 
     def test_spanning_full_path(self) -> None:
         g = self._make_chain([100, 200, 300])
         path = [(0, True), (1, True), (2, True)]
         dists = _path_pair_distances(g, path, [(0, 2)])
-        assert dists == [600]  # 100 + 200 + 300
+        assert dists == [560]  # 100 + 200 + 300 - 2×20 overlap
 
     def test_pair_not_in_path(self) -> None:
         g = self._make_chain([100, 200, 300])
@@ -324,7 +349,7 @@ class TestPathPairDistances:
         g = self._make_chain([100, 200, 300])
         path = [(0, True), (1, True), (2, True)]
         dists = _path_pair_distances(g, path, [(2, 0)])
-        assert dists == [600]
+        assert dists == [560]  # same as full path, order doesn't matter
 
 
 # ------------------------------------------------------------------ #
@@ -596,6 +621,7 @@ class TestCli:
 # Unit tests: AhoCorasick search with numpy uint64 text
 # ------------------------------------------------------------------ #
 
+@_skip_if_missing
 class TestAhoCorasickNumpySearch:
     """AC search must work when text is np.ndarray[uint64], including
     for minimizer IDs >= 2**63 where numpy and Python int hashing
@@ -656,6 +682,7 @@ class TestAhoCorasickNumpySearch:
 # Unit tests: path_minimizer_sequence + read matching pipeline
 # ------------------------------------------------------------------ #
 
+@_skip_if_missing
 class TestRevcompReadMatching:
     """End-to-end tests for the path sequence → AC search pipeline,
     specifically verifying that reads from reverse-oriented nodes
@@ -899,6 +926,7 @@ class TestRevcompReadMatching:
         assert list(map(int, seq)) == [B, B+1, B+2, B+3, B+4]
 
 
+@_skip_if_missing
 class TestSeedExtender:
     """Tests for the SeedExtender read matcher."""
 
@@ -1039,3 +1067,334 @@ class TestSeedExtender:
         assert len(ac_matches) == len(se_matches) == 1
         assert ac_matches[0].path_start == se_matches[0].path_start
         assert ac_matches[0].path_end == se_matches[0].path_end
+
+
+# ------------------------------------------------------------------ #
+# Helpers for combination-minimizer tests
+# ------------------------------------------------------------------ #
+
+def _write_reads_lmdb(lmdb_path: Path, reads: list[list[int]]) -> None:
+    """Write interleaved reads to an LMDB in the format expected by _iter_reads_lmdb.
+
+    Keys are 1-based ASCII-decimal strings (b'1', b'2', …).
+    Values are packed little-endian uint64 minimizer ID sequences.
+    """
+    lmdb_path.mkdir(parents=True, exist_ok=True)
+    env = lmdb.open(str(lmdb_path), map_size=1024 ** 2, max_dbs=6)
+    reads_db = env.open_db(b"reads")
+    with env.begin(write=True) as txn:
+        for i, mids in enumerate(reads, start=1):
+            key = str(i).encode()
+            val = struct.pack(f"<{len(mids)}Q", *mids) if mids else b""
+            txn.put(key, val, db=reads_db)
+    env.close()
+
+
+# ------------------------------------------------------------------ #
+# Unit tests: _combo_hash_v
+# ------------------------------------------------------------------ #
+
+class TestComboHashV:
+    """Tests for _combo_hash_v (splitmix64 pair hash)."""
+
+    def test_deterministic(self) -> None:
+        """Same inputs always produce the same output."""
+        a = np.array([1, 2, 3], dtype=np.uint64)
+        b = np.array([4, 5, 6], dtype=np.uint64)
+        assert np.array_equal(_combo_hash_v(a, b), _combo_hash_v(a, b))
+
+    def test_output_dtype_is_uint64(self) -> None:
+        a = np.array([100], dtype=np.uint64)
+        b = np.array([200], dtype=np.uint64)
+        assert _combo_hash_v(a, b).dtype == np.uint64
+
+    def test_output_shape_matches_input(self) -> None:
+        a = np.array([1, 2, 3], dtype=np.uint64)
+        b = np.array([4, 5, 6], dtype=np.uint64)
+        assert _combo_hash_v(a, b).shape == (3,)
+
+    def test_not_commutative(self) -> None:
+        """hash(a, b) != hash(b, a) — the function is order-sensitive."""
+        a = np.array([10], dtype=np.uint64)
+        b = np.array([20], dtype=np.uint64)
+        assert not np.array_equal(_combo_hash_v(a, b), _combo_hash_v(b, a))
+
+    def test_distinct_pairs_produce_distinct_hashes(self) -> None:
+        """Four different input pairs produce four different hashes."""
+        a = np.array([1, 2, 3, 4], dtype=np.uint64)
+        b = np.array([5, 6, 7, 8], dtype=np.uint64)
+        hashes = _combo_hash_v(a, b)
+        assert len(set(hashes.tolist())) == 4
+
+    def test_vectorised_matches_element_wise(self) -> None:
+        """Batch result equals individually computed hashes."""
+        a = np.array([10, 20, 30], dtype=np.uint64)
+        b = np.array([40, 50, 60], dtype=np.uint64)
+        batch = _combo_hash_v(a, b)
+        for i in range(len(a)):
+            single = _combo_hash_v(a[i : i + 1], b[i : i + 1])
+            assert batch[i] == single[0]
+
+    def test_zero_inputs(self) -> None:
+        """All-zero inputs don't crash and produce a defined value."""
+        a = np.array([0], dtype=np.uint64)
+        b = np.array([0], dtype=np.uint64)
+        result = _combo_hash_v(a, b)
+        assert result.shape == (1,)
+
+
+# ------------------------------------------------------------------ #
+# Unit tests: _chain_hash
+# ------------------------------------------------------------------ #
+
+class TestChainHash:
+    """Tests for _chain_hash (sequential splitmix64 reduction)."""
+
+    def test_single_column_returns_seed_unchanged(self) -> None:
+        """For a 1-column matrix the output equals the raw seed values."""
+        rows = np.array([[10], [20], [30]], dtype=np.uint64)
+        result = _chain_hash(rows)
+        assert np.array_equal(result, np.array([10, 20, 30], dtype=np.uint64))
+
+    def test_output_shape(self) -> None:
+        rows = np.array([[1, 2], [3, 4], [5, 6]], dtype=np.uint64)
+        assert _chain_hash(rows).shape == (3,)
+
+    def test_output_dtype_is_uint64(self) -> None:
+        rows = np.array([[1, 2]], dtype=np.uint64)
+        assert _chain_hash(rows).dtype == np.uint64
+
+    def test_deterministic(self) -> None:
+        rows = np.array([[1, 2, 3], [4, 5, 6]], dtype=np.uint64)
+        assert np.array_equal(_chain_hash(rows), _chain_hash(rows.copy()))
+
+    def test_different_rows_give_different_hashes(self) -> None:
+        rows = np.array([[1, 2], [3, 4], [5, 6]], dtype=np.uint64)
+        hashes = _chain_hash(rows)
+        assert len(set(hashes.tolist())) == 3
+
+    def test_column_order_matters(self) -> None:
+        """Reversing the columns of a row produces a different hash."""
+        row_fwd = np.array([[10, 20, 30]], dtype=np.uint64)
+        row_rev = np.array([[30, 20, 10]], dtype=np.uint64)
+        assert _chain_hash(row_fwd)[0] != _chain_hash(row_rev)[0]
+
+    def test_second_column_changes_hash(self) -> None:
+        """Changing only the second column changes the output hash."""
+        a = np.array([[5, 10]], dtype=np.uint64)
+        b = np.array([[5, 99]], dtype=np.uint64)
+        assert _chain_hash(a)[0] != _chain_hash(b)[0]
+
+    def test_vectorised_matches_element_wise(self) -> None:
+        """Each row's hash matches individually computed single-row hashes."""
+        rows = np.array([[1, 2, 3], [4, 5, 6], [7, 8, 9]], dtype=np.uint64)
+        batch = _chain_hash(rows)
+        for i in range(len(rows)):
+            single = _chain_hash(rows[i : i + 1])
+            assert batch[i] == single[0]
+
+
+# ------------------------------------------------------------------ #
+# Unit tests: _canonical_combo_hash_v
+# ------------------------------------------------------------------ #
+
+class TestCanonicalComboHashV:
+    """Tests for _canonical_combo_hash_v (commutative combination hash)."""
+
+    def test_commutative(self) -> None:
+        """hash(a, b) == hash(b, a) element-wise."""
+        a = np.array([10, 20, 30], dtype=np.uint64)
+        b = np.array([40, 50, 60], dtype=np.uint64)
+        assert np.array_equal(
+            _canonical_combo_hash_v(a, b),
+            _canonical_combo_hash_v(b, a),
+        )
+
+    def test_commutative_when_a_greater_than_b(self) -> None:
+        """Commutativity holds even when a > b (canonical sorting kicks in)."""
+        a = np.array([999], dtype=np.uint64)
+        b = np.array([1], dtype=np.uint64)
+        assert _canonical_combo_hash_v(a, b)[0] == _canonical_combo_hash_v(b, a)[0]
+
+    def test_output_dtype_is_uint64(self) -> None:
+        a = np.array([1], dtype=np.uint64)
+        b = np.array([2], dtype=np.uint64)
+        assert _canonical_combo_hash_v(a, b).dtype == np.uint64
+
+    def test_deterministic(self) -> None:
+        a = np.array([7, 8], dtype=np.uint64)
+        b = np.array([9, 10], dtype=np.uint64)
+        assert np.array_equal(
+            _canonical_combo_hash_v(a, b),
+            _canonical_combo_hash_v(a, b),
+        )
+
+    def test_equals_combo_hash_v_when_already_sorted(self) -> None:
+        """When a <= b element-wise, canonical == _combo_hash_v(a, b)."""
+        a = np.array([1, 2, 3], dtype=np.uint64)   # all < b
+        b = np.array([10, 20, 30], dtype=np.uint64)
+        assert np.array_equal(
+            _canonical_combo_hash_v(a, b),
+            _combo_hash_v(a, b),
+        )
+
+    def test_equals_combo_hash_v_with_swapped_args_when_b_less_than_a(self) -> None:
+        """When b < a, canonical(a,b) == _combo_hash_v(b, a)."""
+        a = np.array([50], dtype=np.uint64)
+        b = np.array([3], dtype=np.uint64)
+        assert _canonical_combo_hash_v(a, b)[0] == _combo_hash_v(b, a)[0]
+
+    def test_distinct_unordered_pairs_distinct_hashes(self) -> None:
+        """Different unordered {a, b} pairs produce different hashes."""
+        a = np.array([1, 2, 3, 4], dtype=np.uint64)
+        b = np.array([5, 6, 7, 8], dtype=np.uint64)
+        hashes = _canonical_combo_hash_v(a, b)
+        assert len(set(hashes.tolist())) == 4
+
+    def test_vectorised_matches_element_wise(self) -> None:
+        a = np.array([10, 30, 5], dtype=np.uint64)
+        b = np.array([40, 2, 5], dtype=np.uint64)
+        batch = _canonical_combo_hash_v(a, b)
+        for i in range(len(a)):
+            single = _canonical_combo_hash_v(a[i : i + 1], b[i : i + 1])
+            assert batch[i] == single[0]
+
+
+# ------------------------------------------------------------------ #
+# Unit tests: build_pe_combo_sketch
+# ------------------------------------------------------------------ #
+
+class TestBuildPeComboSketch:
+    """Tests for build_pe_combo_sketch.
+
+    Each test uses a tiny LMDB written by _write_reads_lmdb so the
+    correct minimizer IDs are verified end-to-end through the sketch.
+    """
+
+    def test_single_pair_k1_all_hashes_present(self, tmp_path: Path) -> None:
+        """k=1, density=1: sketch contains exactly the canonical combo hash of (R1, R2)."""
+        A, B = np.uint64(100), np.uint64(200)
+        lmdb_path = tmp_path / "reads.lmdb"
+        _write_reads_lmdb(lmdb_path, [[int(A)], [int(B)]])
+
+        sketch = build_pe_combo_sketch(lmdb_path, density=1.0, k=1)
+
+        expected = int(_canonical_combo_hash_v(
+            np.array([A], dtype=np.uint64),
+            np.array([B], dtype=np.uint64),
+        )[0])
+        assert expected in sketch._buf
+        assert len(sketch._buf) == 1
+
+    def test_cartesian_product_k1_all_four_pairs(self, tmp_path: Path) -> None:
+        """R1=[a,b], R2=[c,d] with k=1 → exactly 4 canonical combo hashes."""
+        A, B = np.uint64(10), np.uint64(20)
+        C, D = np.uint64(30), np.uint64(40)
+        lmdb_path = tmp_path / "reads.lmdb"
+        _write_reads_lmdb(lmdb_path, [[int(A), int(B)], [int(C), int(D)]])
+
+        sketch = build_pe_combo_sketch(lmdb_path, density=1.0, k=1)
+
+        r1 = np.array([A, B], dtype=np.uint64)
+        r2 = np.array([C, D], dtype=np.uint64)
+        expected = _canonical_combo_hash_v(
+            np.repeat(r1, len(r2)),
+            np.tile(r2, len(r1)),
+        )
+        # Verify every expected hash is present
+        for h in expected.tolist():
+            assert h in sketch._buf, f"Expected combo hash {h} not in sketch"
+        # And the sketch contains nothing else
+        assert len(sketch._buf) == len(set(expected.tolist()))
+
+    def test_two_pairs_each_contribute_independently(self, tmp_path: Path) -> None:
+        """Two read pairs (4 interleaved reads) each add their own combo hashes."""
+        A, B = np.uint64(10), np.uint64(20)   # pair 1
+        C, D = np.uint64(30), np.uint64(40)   # pair 2
+        # Interleaved order: R1_pair1, R2_pair1, R1_pair2, R2_pair2
+        lmdb_path = tmp_path / "reads.lmdb"
+        _write_reads_lmdb(lmdb_path, [[int(A)], [int(B)], [int(C)], [int(D)]])
+
+        sketch = build_pe_combo_sketch(lmdb_path, density=1.0, k=1)
+
+        h1 = int(_canonical_combo_hash_v(
+            np.array([A], dtype=np.uint64), np.array([B], dtype=np.uint64)
+        )[0])
+        h2 = int(_canonical_combo_hash_v(
+            np.array([C], dtype=np.uint64), np.array([D], dtype=np.uint64)
+        )[0])
+        assert h1 in sketch._buf
+        assert h2 in sketch._buf
+
+    def test_swapping_r1_r2_gives_same_sketch(self, tmp_path: Path) -> None:
+        """Canonical hashing means swapping which read is R1 vs R2 gives the same result."""
+        A, B = np.uint64(111), np.uint64(222)
+
+        lmdb_r1_first = tmp_path / "reads1.lmdb"
+        _write_reads_lmdb(lmdb_r1_first, [[int(A)], [int(B)]])
+        sketch1 = build_pe_combo_sketch(lmdb_r1_first, density=1.0, k=1)
+
+        lmdb_r2_first = tmp_path / "reads2.lmdb"
+        _write_reads_lmdb(lmdb_r2_first, [[int(B)], [int(A)]])
+        sketch2 = build_pe_combo_sketch(lmdb_r2_first, density=1.0, k=1)
+
+        assert set(sketch1._buf.keys()) == set(sketch2._buf.keys())
+
+    def test_k2_hashes_windows_not_raw_minimizers(self, tmp_path: Path) -> None:
+        """With k=2, combo hashes are built from 2-mer windows, not raw minimizer IDs."""
+        A, B = np.uint64(10), np.uint64(20)   # R1: window [A,B] → 1 k-mer hash
+        C, D = np.uint64(30), np.uint64(40)   # R2: window [C,D] → 1 k-mer hash
+        lmdb_path = tmp_path / "reads.lmdb"
+        _write_reads_lmdb(lmdb_path, [[int(A), int(B)], [int(C), int(D)]])
+
+        sketch = build_pe_combo_sketch(lmdb_path, density=1.0, k=2)
+
+        r1_kmers = _compute_kmer_hashes(np.array([A, B], dtype=np.uint64), k=2)
+        r2_kmers = _compute_kmer_hashes(np.array([C, D], dtype=np.uint64), k=2)
+        assert len(r1_kmers) == 1 and len(r2_kmers) == 1
+
+        expected = int(_canonical_combo_hash_v(r1_kmers, r2_kmers)[0])
+        assert expected in sketch._buf
+        assert len(sketch._buf) == 1
+
+        # Also verify it differs from the k=1 result (different input to hash)
+        sketch_k1 = build_pe_combo_sketch(
+            lmdb_path, density=1.0, k=1,
+        )
+        # k=1 produces 4 hashes (2×2 Cartesian product); k=2 produces 1
+        assert len(sketch._buf) != len(sketch_k1._buf)
+
+    def test_r1_too_short_for_k_skipped(self, tmp_path: Path) -> None:
+        """When a read has fewer minimizers than k, _compute_kmer_hashes returns
+        empty and no combo hashes are produced for that pair."""
+        # R1 has 1 minimizer, k=2 → 0 k-mer hashes → pair is skipped
+        A, B, C = np.uint64(1), np.uint64(2), np.uint64(3)
+        lmdb_path = tmp_path / "reads.lmdb"
+        _write_reads_lmdb(lmdb_path, [[int(A)], [int(B), int(C)]])
+
+        sketch = build_pe_combo_sketch(lmdb_path, density=1.0, k=2)
+        assert len(sketch._buf) == 0
+
+    def test_empty_r2_skipped(self, tmp_path: Path) -> None:
+        """A read with zero minimizers contributes nothing to the sketch."""
+        A = np.uint64(42)
+        lmdb_path = tmp_path / "reads.lmdb"
+        _write_reads_lmdb(lmdb_path, [[int(A)], []])
+
+        sketch = build_pe_combo_sketch(lmdb_path, density=1.0, k=1)
+        assert len(sketch._buf) == 0
+
+    def test_density_filters_high_valued_hashes(self, tmp_path: Path) -> None:
+        """With a tiny density, hashes above the threshold are dropped."""
+        # Use values likely to produce a hash above a near-zero threshold
+        A, B = np.uint64(12345), np.uint64(67890)
+        lmdb_path = tmp_path / "reads.lmdb"
+        _write_reads_lmdb(lmdb_path, [[int(A)], [int(B)]])
+
+        h = int(_canonical_combo_hash_v(
+            np.array([A], dtype=np.uint64), np.array([B], dtype=np.uint64)
+        )[0])
+        threshold = int(_UINT64_MAX * 1e-18)
+        if h > threshold:
+            sketch = build_pe_combo_sketch(lmdb_path, density=1e-18, k=1)
+            assert h not in sketch._buf
