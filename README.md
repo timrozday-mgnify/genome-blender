@@ -270,6 +270,121 @@ Runs [rust-mdbg](https://github.com/ekimb/rust-mdbg) to build a minimizer-space 
 | `--minabund` | `2` | Minimum k-min-mer abundance |
 | `--prefix` | output path | Output file prefix |
 
+#### `asf_sample.py` — Assembly-free minimizer path sampling
+
+Samples paths through the implicit minimizer-space de Bruijn graph without constructing an assembly, using only the LMDB indexes produced by rust-mdbg. Starting from a random read, it extends a path forward and backward by finding unambiguous (single-supported) successor/predecessor minimizers until the path reaches a branch, a dead end, or the length cap. Also estimates the insert size distribution of the input library in both minimizer space and basepair space.
+
+```bash
+python scripts/asf_sample.py rust_mdbg_out \
+    --n-paths 200 \
+    --max-path-mers 5000 \
+    --min-support 2 \
+    --insert-size-inference nuts \
+    --output paths.jsonl
+```
+
+Output is a JSONL file where each line is a JSON object with keys `minimizer_ids` (ordered list of u64 hashes), `distances` (minimizer-count distances between consecutive nodes), and `support` (read-vote counts for each extension step).
+
+---
+
+#### `reconstruct_sequences.py` — Basepair sequence reconstruction from minimizer paths
+
+Translates sampled minimizer paths back into basepair sequences by mapping the original paired-end reads onto each path in minimizer space, scoring the alignments by a composite likelihood, extracting inter-minimizer gap sequences from high-scoring reads, and stitching everything together.
+
+This is necessary because the path sampling step (`asf_sample.py`) and the LMDB indexes it uses store only minimizer hashes — no basepair information. The original FASTQ files are the sole source of basepair sequence.
+
+```bash
+python scripts/reconstruct_sequences.py paths.jsonl \
+    --prefix rust_mdbg_out \
+    --reads R1.fq.gz --reads R2.fq.gz \
+    --insert-size-json insert_estimate.json \
+    --mode best \
+    --output reconstructed.fa
+```
+
+| Option | Default | Description |
+|--------|---------|-------------|
+| `paths_file` (positional) | — | JSONL paths file from `asf_sample.py` |
+| `--prefix` | — | rust-mdbg output prefix (locates `.read_minimizers` files and `minimizer_table`) |
+| `--reads` | — | FASTQ/FASTA input; repeat twice for paired-end (R1 then R2) |
+| `--output` / `-o` | `reconstructed.fa` | Output FASTA |
+| `--mode` | `best` | Gap sequence selection strategy: `best`, `random`, `common`, or `consensus` |
+| `--insert-size-json` | — | JSON from `asf_sample.py` with `mu_bp`/`sigma_bp` or `median_bp`/`sigma_bp` keys |
+| `--insert-size-mean` / `--insert-size-std` | — | Explicit insert size in bp (alternative to `--insert-size-json`) |
+| `--min-anchors` | `3` | Minimum chained minimizer hits to keep a read alignment |
+| `--max-reads-per-minimizer` | `200` | Cap on candidate reads examined per path minimizer |
+| `--min-coverage-fraction` | `0.5` | Skip paths where fewer than this fraction of minimizer positions have read coverage |
+| `--weight-coverage` / `--no-weight-coverage` | on | Include anchor-count in alignment scoring |
+| `--weight-insert` / `--no-weight-insert` | on | Include insert-size log-likelihood in scoring |
+| `--weight-mate` / `--no-weight-mate` | on | Add mate-concordance bonus to scoring |
+| `--gap-fill-char` | `N` | Character used to fill uncovered gaps |
+| `--seed` | `42` | Random seed for reproducibility |
+
+##### Algorithm
+
+The pipeline has six stages for each path:
+
+1. **Seed.** For each minimizer in the path, look up candidate reads from an in-memory reverse index built by scanning the `.read_minimizers` files. Only reads sharing at least one minimizer with any path are retained in memory, keeping memory usage proportional to the subset of reads that is actually relevant.
+
+2. **Chain.** For each candidate read, a linear-chaining DP (analogous to the seed-and-chain step in minimap2) finds the longest set of consistently placed anchor hits in minimizer space. Anchors are (path position, read minimizer index) pairs where the hashes match. A chain is valid when path offsets and read offsets agree within a configurable gap tolerance. Both strands are tried; the longer chain wins and the strand is recorded. Chains shorter than `--min-anchors` are discarded.
+
+3. **Score.** Each alignment receives a composite score (see below).
+
+4. **Extract.** For each pair of consecutive path minimizers (*i* → *i*+1), every alignment whose chain covers both positions contributes a candidate gap sequence: the raw read bytes between the end of the l-mer at position *i* and the start of the l-mer at position *i*+1 (reverse-complemented for minus-strand alignments). The known l-mer length and the per-read minimizer bp positions from the `.read_minimizers` files provide exact extraction coordinates.
+
+5. **Choose.** One gap sequence is selected per span according to `--mode`:
+   - **`best`** — the gap sequence from the highest-scoring alignment.
+   - **`random`** — one gap sequence sampled at random, optionally weighted by alignment score (softmax-style) when `--weight-coverage` is set.
+   - **`common`** — the most frequently observed exact gap sequence across all covering reads; ties broken by highest alignment score.
+   - **`consensus`** — all candidate gap sequences are submitted to `abpoa` (preferred) or `spoa` for partial-order alignment; the resulting consensus is used. Requires the aligner to be on `PATH`; raises an error otherwise.
+
+6. **Stitch.** The final basepair sequence is assembled as:
+
+   ```
+   lmer(m₀) + gap(m₀→m₁) + lmer(m₁) + gap(m₁→m₂) + … + lmer(mₙ)
+   ```
+
+   L-mer sequences are extracted from covering reads (in the correct strand orientation). For positions with no covering read, the l-mer falls back to the `minimizer_table` lookup (applying reverse complement when the majority of reads aligned on the minus strand). Uncovered gaps are filled with `--gap-fill-char` characters repeated for an estimated gap length derived from the minimizer-count distances stored in the path.
+
+##### Read likelihood scoring
+
+**Theory.** The goal is to find, for each inter-minimizer gap, the basepair sequence most likely to have produced the observed read data. Rather than computing a full probabilistic alignment, the script uses a tractable composite score that captures three independent sources of evidence:
+
+1. **Coverage (anchor count).** The probability that a read genuinely originates from a particular path region grows with the number of its minimizers that form a consistent chain with the path. If a read has *n* minimizers, and *k* of them chain consistently to the path, this is analogous to *k* independent observations confirming the placement. The score contribution is proportional to *k*.
+
+2. **Insert size log-likelihood.** For paired-end reads, the original DNA fragment spans both mates. The fragment length distribution was estimated from the data by `asf_sample.py` and is modelled as a log-normal:
+
+   $$P(\text{insert size} = x) = \frac{1}{x \, \sigma \sqrt{2\pi}} \exp\!\left(-\frac{(\ln x - \mu)^2}{2\sigma^2}\right)$$
+
+   The parameters $\mu$ and $\sigma$ are the log-scale mean and standard deviation inferred by `asf_sample.py` (keys `mu_bp`/`sigma_bp` or `median_bp`/`sigma_bp` in its output JSON). The insert size for a given PE alignment is estimated from the path span covered by the pair (in minimizer units) converted to basepairs using the local bp-per-minimizer ratio estimated from each mate's own anchor positions. The log-probability $\log P(\text{insert size})$ is added to the score (weighted by `--weight-insert`, default 0.5).
+
+3. **Mate concordance.** Both mates of a pair independently search for a chain to the path. When both succeed, there are two orthogonal alignment signals confirming the read originates from this path region. This is captured by a binary bonus (default weight 2.0) added when `mate_concordant = True`.
+
+**Implementation.** The composite score is:
+
+```
+score = w_cov × n_anchors
+      + w_insert × log P(insert_size | LogNormal(μ, σ))
+      + w_mate × concordant
+```
+
+where `w_cov = 1.0`, `w_insert = 0.5`, `w_mate = 2.0` by default (all adjustable). The insert size in basepairs is computed as:
+
+```
+path_span_bp ≈ (outer_path_end − outer_path_start) × bp_per_minimizer
+```
+
+where `bp_per_minimizer` is the mean of the local estimates from R1 and R2:
+
+```
+bp_per_minimizer_R1 = (positions[last_anchor_R1] + lmer_len − positions[first_anchor_R1])
+                      / (len(R1_chain) − 1)
+```
+
+This avoids needing a global density estimate and adapts to local variation in minimizer spacing along the path.
+
+---
+
 #### `parse_gfa.py` — GFA graph analysis
 
 Parses a GFA file into an undirected graph using [rustworkx](https://www.rustworkx.org/) and reports structural properties. Segments become nodes, links become edges.
