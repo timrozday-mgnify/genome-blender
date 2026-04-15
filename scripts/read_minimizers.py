@@ -176,7 +176,10 @@ def _iter_read_minimizers_file(
 ) -> Iterator[tuple[str, list[int], list[int]]]:
     """Yield ``(read_id, minimizer_ids, positions)`` from one file.
 
-    Auto-detects binary (``RMBG`` magic) vs. legacy LZ4-TSV format.
+    Auto-detects three formats:
+    1. Uncompressed binary (starts with ``RMBG`` magic directly).
+    2. LZ4-compressed binary (decompresses to ``RMBG`` magic).
+    3. LZ4-compressed TSV (legacy format).
 
     Args:
         path: Path to a ``*.read_minimizers`` file.
@@ -184,7 +187,11 @@ def _iter_read_minimizers_file(
     Yields:
         Tuples of ``(read_id, minimizer_ids, positions)``.
     """
-    raw = lz4.frame.decompress(path.read_bytes())
+    data = path.read_bytes()
+    if data[:4] == _RM_MAGIC:
+        yield from _iter_binary_file(data)
+        return
+    raw = lz4.frame.decompress(data)
     if raw[:4] == _RM_MAGIC:
         yield from _iter_binary_file(raw)
     else:

@@ -106,7 +106,10 @@
       "Bash(for f:*)",
       "Bash(do echo:*)",
       "Bash(done)",
-      "Bash(find:*)"
+      "Bash(find:*)",
+      "Bash(/Users/timrozday/miniforge3/envs/genome_blender_dev/bin/pip list:*)",
+      "Read(//Users/timrozday/Documents/genome-blender_run/multi_genome_deep/output/**)",
+      "Read(//Users/timrozday/Documents/genome-blender_run/multi_genome_deep/**)"
     ]
   }
 }

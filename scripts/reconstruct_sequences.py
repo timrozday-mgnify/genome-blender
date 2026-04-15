@@ -3,21 +3,24 @@
 
 For each minimizer path (produced by ``asf_sample.py``), this script:
 
-  1. **Seed** — for each path minimizer, find reads that contain it (via the
-     ``.read_minimizers`` files).
+  1. **Seed** — for each path minimizer, query the minimizer-index LMDB to find
+     candidate reads.
   2. **Chain** — align each candidate read to the path using a linear-chaining
-     DP in minimizer space (analogous to minimap2 seed-and-chain).
-  3. **Score** — rank alignments by anchor count, insert-size log-likelihood,
-     and paired-end mate concordance.
-  4. **Extract** — pull the inter-minimizer gap sequences from high-scoring reads.
-  5. **Choose** — select the final gap sequence per path span using ``--mode``.
-  6. **Stitch** — concatenate l-mer sequences and gap sequences into a single
-     basepair sequence per path.
+     DP in minimizer space.
+  3. **Score** — rank alignments by anchor count, insert-size log-likelihood
+     (in minimizer space, Poisson-corrected), and paired-end mate concordance.
+  4. **Extract** — pull the basepair span between consecutive path positions
+     from high-scoring reads using linear interpolation (no stored positions
+     needed).
+  5. **Choose** — select the final span per path gap using ``--mode``.
+  6. **Stitch** — concatenate per-gap spans into a single basepair sequence per
+     path.
 
-Reads spanning each path are found by scanning the ``{prefix}.*.read_minimizers``
-files (produced by rust-mdbg ``--dump-read-minimizers``).  Only reads that share
-at least one minimizer with a sampled path are kept in memory, making this
-approach practical for large datasets.
+Candidate reads are found via the ``{prefix}.minimizer_index*.lmdb`` shards.
+Read minimizer arrays are fetched from ``{prefix}.index*.lmdb`` shards.
+Paired-end reads are matched by arithmetic: rust-mdbg assigns IDs with stride 2;
+R1 read at FASTQ position i has ``read_id = 2i − 1`` (odd) and its R2 mate has
+``read_id = 2i`` (even).
 
 Usage::
 
@@ -34,13 +37,11 @@ from __future__ import annotations
 import json
 import logging
 import math
-import re
 import shutil
 import subprocess
 import sys
 import tempfile
 from collections import Counter, defaultdict
-from collections.abc import Iterable
 from dataclasses import dataclass
 from enum import Enum
 from pathlib import Path
@@ -57,10 +58,16 @@ from rich.progress import (
     TimeElapsedColumn,
 )
 
-# Import helpers from sibling scripts.
+# Import LMDB helpers from sibling script asf_sample.py.
 sys.path.insert(0, str(Path(__file__).parent))
-from read_minimizers import iter_records as _iter_read_minimizer_records  # noqa: E402
-from read_minimizers import load_minimizer_table  # noqa: E402
+from asf_sample import (  # noqa: E402
+    _LRUCache,
+    _get_read_cached,
+    _open_minimizer_lmdb,
+    _open_reads_lmdb,
+    _read_ids_for_minimizer_multi,
+    _reads_shard_ranges,
+)
 
 app = typer.Typer(add_completion=False)
 log = logging.getLogger(__name__)
@@ -77,17 +84,12 @@ _PROGRESS_COLUMNS: Final = (
     TimeElapsedColumn(),
 )
 
-_PAIR_SUFFIX_PATTERNS: Final = (
-    re.compile(r"/R?([12])$"),
-    re.compile(r"_R([12])$"),
-    re.compile(r"\.R?([12])$"),
-    re.compile(r"[ \t]([12]):.*$"),
-)
-
 _DEFAULT_GAP_FILL: Final = "N"
 _DEFAULT_MIN_ANCHORS: Final = 3
+_DEFAULT_TERMINAL_MIN_ANCHORS: Final = 1
 _DEFAULT_MAX_READS_PER_MIN: Final = 200
 _DEFAULT_MIN_COV_FRACTION: Final = 0.5
+_DEFAULT_DENSITY: Final = 0.01
 _COMP_TABLE: Final = str.maketrans("ACGTacgtNn", "TGCAtgcaNn")
 
 
@@ -122,32 +124,15 @@ class PathResult:
 
 @dataclass
 class InsertSizeDistribution:
-    """Log-normal insert-size distribution in basepair space.
+    """Log-normal insert-size distribution in minimizer space.
 
     Attributes:
-        mu_log: Log-scale mean (ln units).
-        sigma_log: Log-scale standard deviation.
+        mu_log: Log-scale mean (ln units, minimizer-count space).
+        sigma_log: Log-scale standard deviation (minimizer-count space).
     """
 
     mu_log: float
     sigma_log: float
-
-    def log_prob(self, insert_bp: float) -> float:
-        """Return log P(insert_bp) under this log-normal distribution.
-
-        Args:
-            insert_bp: Insert size in basepairs (must be > 0).
-
-        Returns:
-            Log probability; ``-inf`` if ``insert_bp <= 0``.
-        """
-        if insert_bp <= 0.0:
-            return -math.inf
-        log_x = math.log(insert_bp)
-        return (
-            -((log_x - self.mu_log) ** 2) / (2.0 * self.sigma_log ** 2)
-            - math.log(insert_bp * self.sigma_log * math.sqrt(2.0 * math.pi))
-        )
 
 
 @dataclass
@@ -170,8 +155,8 @@ class ReadAlignment:
     """A read aligned to a minimizer path.
 
     Attributes:
-        read_name: Original read name from the FASTQ.
-        chain: List of (path_pos, read_min_idx) anchor pairs, sorted by path_pos.
+        read_id: Integer read ID (1-based, stride-2 paired assignment from rust-mdbg).
+        chain: List of ``(path_pos, read_min_idx)`` anchor pairs, sorted by path_pos.
         strand: ``"+"`` if the read aligns in the forward path direction.
         anchor_count: Number of chained anchors.
         insert_size_ll: Log-likelihood of the insert size (0.0 if not computed).
@@ -179,7 +164,7 @@ class ReadAlignment:
         score: Composite alignment score (set after scoring).
     """
 
-    read_name: str
+    read_id: int
     chain: list[tuple[int, int]]
     strand: Literal["+", "-"]
     anchor_count: int
@@ -198,21 +183,20 @@ def _reverse_complement(seq: str) -> str:
     return seq.translate(_COMP_TABLE)[::-1]
 
 
-def _canonical_pair_name(name: str) -> tuple[str, int | None]:
-    """Strip R1/R2 suffixes and return the canonical name and pair number.
+def _mate_id(read_id: int) -> int:
+    """Return the paired-end mate ID for a stride-2 sequential read ID.
+
+    rust-mdbg assigns IDs with stride 2 in paired two-file mode:
+    R1 read at 1-based FASTQ position i has ``read_id = 2i − 1`` (odd).
+    R2 read at 1-based FASTQ position i has ``read_id = 2i`` (even).
 
     Args:
-        name: Read name, possibly with a pairing suffix.
+        read_id: 1-based integer read ID.
 
     Returns:
-        ``(canonical_name, pair_num)`` where ``pair_num`` is 1 or 2, or
-        ``(name, None)`` when no recognisable suffix is found.
+        ID of the paired mate.
     """
-    for pat in _PAIR_SUFFIX_PATTERNS:
-        m = pat.search(name)
-        if m:
-            return name[: m.start()], int(m.group(1))
-    return name, None
+    return read_id + 1 if read_id % 2 == 1 else read_id - 1
 
 
 # ---------------------------------------------------------------------------
@@ -220,85 +204,90 @@ def _canonical_pair_name(name: str) -> tuple[str, int | None]:
 # ---------------------------------------------------------------------------
 
 
-def _collect_relevant_reads(
-    prefix: Path,
-    path_min_set: set[int],
+def _collect_candidate_read_ids(
+    mi_txns_dbs: list[tuple],
+    path_hashes: list[int],
+    max_per_min: int,
+    read_id_width: int,
+    cache: _LRUCache,
     progress: Progress | None = None,
-) -> tuple[dict[str, tuple[list[int], list[int]]], dict[int, list[str]]]:
-    """Scan ``.read_minimizers`` files and retain reads overlapping the paths.
+) -> dict[int, list[int]]:
+    """Query the minimizer-index LMDB for all path minimizer hashes.
+
+    Populates *cache* so that per-path reconstruction can reuse results
+    without re-querying LMDB.
 
     Args:
-        prefix: rust-mdbg output prefix.
-        path_min_set: Set of minimizer hashes that appear in any sampled path.
-        progress: Optional Rich :class:`Progress` for display.
+        mi_txns_dbs: Sharded minimizer-index ``(txn, db)`` pairs.
+        path_hashes: Unique minimizer hashes to query.
+        max_per_min: Maximum read IDs to return per minimizer.
+        read_id_width: Byte width of read-ID values (4 or 8).
+        cache: LRU cache to populate with hash → read-ID-list results.
+        progress: Optional Rich progress display.
 
     Returns:
-        A tuple ``(relevant_reads, min_to_reads)`` where ``relevant_reads``
-        maps ``read_name → (minimizer_ids, bp_positions)`` for every read that
-        shares at least one minimizer with a path, and ``min_to_reads`` maps
-        each path minimizer hash to the list of matching read names.
+        Mapping of ``minimizer_hash → [read_id, ...]``.
     """
-    relevant_reads: dict[str, tuple[list[int], list[int]]] = {}
-    min_to_reads: dict[int, list[str]] = defaultdict(list)
-
     task = None
     if progress is not None:
-        task = progress.add_task("Scanning .read_minimizers …", total=None)
-
-    n_scanned = 0
-    n_kept = 0
-    for record in _iter_read_minimizer_records(prefix):
-        n_scanned += 1
-        path_hits = [mid for mid in record.minimizer_ids if mid in path_min_set]
-        if not path_hits:
-            continue
-        n_kept += 1
-        relevant_reads[record.read_id] = (record.minimizer_ids, record.positions)
-        for mid in path_hits:
-            min_to_reads[mid].append(record.read_id)
-        if progress is not None and n_scanned % 100_000 == 0:
-            progress.update(
-                task,
-                description=f"Scanning .read_minimizers … {n_kept:,} / {n_scanned:,}",
-            )
-
+        task = progress.add_task(
+            "Querying minimizer index …", total=len(path_hashes),
+        )
+    result: dict[int, list[int]] = {}
+    for h in path_hashes:
+        ids = _read_ids_for_minimizer_multi(mi_txns_dbs, h, max_per_min, read_id_width)
+        cache.put(h, ids)
+        result[h] = ids
+        if progress is not None and task is not None:
+            progress.advance(task)
     if progress is not None and task is not None:
+        n_with_reads = sum(1 for v in result.values() if v)
         progress.update(
             task,
-            description=f"Scanned {n_scanned:,} reads, kept {n_kept:,} relevant",
-            completed=n_kept,
-            total=n_kept,
+            description=f"Queried {len(path_hashes):,} minimizers, "
+                        f"{n_with_reads:,} with reads",
         )
-    log.info("Scanned %d reads; kept %d relevant to paths", n_scanned, n_kept)
-    return relevant_reads, min_to_reads
+    return result
 
 
-def _load_fastq(
-    fastq_paths: Iterable[Path],
-    relevant_names: set[str],
+def _load_read_sequences(
+    read_paths: list[Path],
+    candidate_ids: set[int],
     progress: Progress | None = None,
-) -> dict[str, tuple[str, str | None]]:
-    """Stream FASTQ/FASTA files and return sequences for relevant reads.
+) -> dict[int, str]:
+    """Stream FASTQ files and return sequences keyed by integer read ID.
+
+    rust-mdbg assigns IDs with stride 2 in paired two-file mode:
+    the first file (R1): read at 1-based position i → ``read_id = 2i − 1``.
+    the second file (R2): read at 1-based position i → ``read_id = 2i``.
+
+    Only reads whose IDs (or their mates) appear in *candidate_ids* are loaded.
 
     Args:
-        fastq_paths: Paths to FASTQ or FASTA input files (R1 and R2).
-        relevant_names: Set of read names to retain.
-        progress: Optional Rich :class:`Progress` for display.
+        read_paths: FASTQ/FASTA files; first is R1, second (if given) is R2.
+        candidate_ids: Integer read IDs required for reconstruction.
+        progress: Optional Rich progress display.
 
     Returns:
-        Mapping of ``read_name → (sequence, quality_or_None)``.
+        Mapping of ``read_id → sequence_string`` for the retained reads.
     """
-    seqs: dict[str, tuple[str, str | None]] = {}
-    for fq in fastq_paths:
+    needed_ids = candidate_ids | {_mate_id(r) for r in candidate_ids}
+    seqs: dict[int, str] = {}
+    for file_idx, fq in enumerate(read_paths):
         task = None
         if progress is not None:
             task = progress.add_task(f"Loading {fq.name} …", total=None)
         n = 0
         with pysam.FastxFile(str(fq)) as fh:
-            for read in fh:
-                if read.name in relevant_names:
-                    seqs[read.name] = (read.sequence, read.quality)
+            for pos, read in enumerate(fh, start=1):
+                # First file (idx 0): odd IDs = 2*pos - 1.
+                # Second file (idx 1): even IDs = 2*pos.
+                rid = 2 * pos - 1 + file_idx
+                if rid in needed_ids and read.sequence:
+                    seqs[rid] = read.sequence
                     n += 1
+                if progress is not None and task is not None:
+                    progress.advance(task)
         if progress is not None and task is not None:
             progress.update(
                 task,
@@ -310,32 +299,9 @@ def _load_fastq(
     return seqs
 
 
-def _build_pair_index(
-    read_names: Iterable[str],
-) -> tuple[dict[str, str], dict[str, tuple[str | None, str | None]]]:
-    """Index paired-end read names for mate lookup.
-
-    Args:
-        read_names: All relevant read names.
-
-    Returns:
-        A tuple ``(read_to_canonical, canonical_to_pair)`` where
-        ``read_to_canonical`` maps each read name to its canonical (suffix-free)
-        name, and ``canonical_to_pair`` maps canonical names to
-        ``(r1_name_or_None, r2_name_or_None)``.
-    """
-    read_to_canonical: dict[str, str] = {}
-    canonical_to_pair: dict[str, list[str | None]] = {}
-    for name in read_names:
-        canonical, pair_num = _canonical_pair_name(name)
-        read_to_canonical[name] = canonical
-        if canonical not in canonical_to_pair:
-            canonical_to_pair[canonical] = [None, None]
-        if pair_num == 1:
-            canonical_to_pair[canonical][0] = name
-        elif pair_num == 2:
-            canonical_to_pair[canonical][1] = name
-    return read_to_canonical, {k: (v[0], v[1]) for k, v in canonical_to_pair.items()}
+# ---------------------------------------------------------------------------
+# Insert-size model (minimizer space)
+# ---------------------------------------------------------------------------
 
 
 def _load_insert_size(
@@ -343,50 +309,41 @@ def _load_insert_size(
     insert_size_mean: float | None,
     insert_size_std: float | None,
 ) -> InsertSizeDistribution | None:
-    """Construct an insert-size distribution from CLI options.
+    """Construct an insert-size distribution in minimizer space from CLI options.
 
-    Parses a JSON file from ``asf_sample.py`` or uses explicit mean/std values.
+    When a JSON file is given, the top-level ``mu_log``/``sigma_log`` keys are
+    used directly.  These are the minimizer-space log-normal parameters produced
+    by ``asf_sample.py``.  The nested ``bp_space`` dict (if present) is ignored
+    because the bp-space sigma is typically near zero and unusable.
 
     Args:
-        insert_size_json: Path to JSON with ``median_bp`` and ``sigma_bp`` keys.
-        insert_size_mean: Mean insert size in bp (if no JSON given).
-        insert_size_std: Standard deviation in bp (if no JSON given).
+        insert_size_json: Path to an ``asf_sample.py`` insert-size JSON file.
+        insert_size_mean: Mean insert size in minimizer units (alternative to JSON).
+        insert_size_std: Standard deviation in minimizer units (with mean).
 
     Returns:
         An :class:`InsertSizeDistribution`, or ``None`` if no parameters given.
 
     Raises:
-        typer.BadParameter: If the JSON keys are missing or values are invalid.
+        typer.BadParameter: If required JSON keys are missing or values are invalid.
     """
     if insert_size_json is not None:
         data = json.loads(insert_size_json.read_text())
-        # asf_sample.py writes either mu_bp / sigma_bp or median_bp with sigma_bp.
-        if "mu_bp" in data and "sigma_bp" in data:
-            return InsertSizeDistribution(
-                mu_log=float(data["mu_bp"]),
-                sigma_log=float(data["sigma_bp"]),
+        mu_log = data.get("mu_log")
+        sigma_log = data.get("sigma_log")
+        if mu_log is None or sigma_log is None:
+            raise typer.BadParameter(
+                "JSON must contain top-level 'mu_log' and 'sigma_log' keys "
+                "(minimizer-space log-normal parameters from asf_sample.py)",
+                param_hint="--insert-size-json",
             )
-        if "median_bp" in data and "sigma_bp" in data:
-            median = float(data["median_bp"])
-            if median <= 0.0:
-                raise typer.BadParameter(
-                    f"median_bp must be positive, got {median}", param_hint="--insert-size-json"
-                )
-            return InsertSizeDistribution(
-                mu_log=math.log(median),
-                sigma_log=float(data["sigma_bp"]),
-            )
-        raise typer.BadParameter(
-            "JSON must contain 'mu_bp'/'sigma_bp' or 'median_bp'/'sigma_bp'",
-            param_hint="--insert-size-json",
-        )
+        return InsertSizeDistribution(mu_log=float(mu_log), sigma_log=float(sigma_log))
 
     if insert_size_mean is not None and insert_size_std is not None:
         if insert_size_mean <= 0.0:
             raise typer.BadParameter("--insert-size-mean must be positive")
         if insert_size_std <= 0.0:
             raise typer.BadParameter("--insert-size-std must be positive")
-        # Convert mean/std of normal to log-normal parameters.
         var = insert_size_std ** 2
         mu2 = insert_size_mean ** 2
         sigma_log = math.sqrt(math.log(1.0 + var / mu2))
@@ -394,6 +351,53 @@ def _load_insert_size(
         return InsertSizeDistribution(mu_log=mu_log, sigma_log=sigma_log)
 
     return None
+
+
+def _insert_log_prob_mers(n_mers: int, dist: InsertSizeDistribution) -> float:
+    """Return log P(n_mers) under a Poisson-corrected log-normal distribution.
+
+    The Poisson uncertainty in minimizer counting broadens the effective sigma:
+
+    .. math::
+        \\sigma_{\\text{eff}}^2 = \\sigma_{\\log}^2 + 1 / n_{\\text{mers}}
+
+    Without this correction, a small ``sigma_log`` produces a near-delta-function
+    likelihood that rejects most reads.
+
+    Args:
+        n_mers: Observed minimizer-space insert size (outermost-anchor span).
+        dist: Log-normal parameters for the minimizer-space insert distribution.
+
+    Returns:
+        Log probability; ``-inf`` if *n_mers* ≤ 0.
+    """
+    x = float(n_mers)
+    if x <= 0.0:
+        return -math.inf
+    sigma_eff = math.sqrt(dist.sigma_log ** 2 + 1.0 / n_mers)
+    z = (math.log(x) - dist.mu_log) / sigma_eff
+    return -0.5 * z * z - math.log(sigma_eff * x) - 0.5 * math.log(2.0 * math.pi)
+
+
+def _compute_insert_size_mers(
+    r1_chain: list[tuple[int, int]],
+    r2_chain: list[tuple[int, int]],
+) -> int | None:
+    """Return the minimizer-space insert size as the outermost-anchor span.
+
+    Args:
+        r1_chain: Alignment chain for the R1 read.
+        r2_chain: Alignment chain for the R2 read.
+
+    Returns:
+        Number of path minimizers spanning from the outermost R1 anchor to the
+        outermost R2 anchor, or ``None`` if either chain is empty.
+    """
+    if not r1_chain or not r2_chain:
+        return None
+    all_path_pos = [p for p, _ in r1_chain] + [p for p, _ in r2_chain]
+    span = max(all_path_pos) - min(all_path_pos)
+    return span if span > 0 else None
 
 
 # ---------------------------------------------------------------------------
@@ -470,7 +474,7 @@ def align_read_to_path(
 ) -> tuple[list[tuple[int, int]], Literal["+", "-"]]:
     """Align a read to a path in minimizer space, trying both strands.
 
-    The chain coordinates are always reported in terms of the read's original
+    Chain coordinates are always reported in terms of the read's original
     (un-reversed) minimizer indices, even for reverse-strand alignments.
 
     Args:
@@ -513,145 +517,54 @@ def _score_alignment(
     return score
 
 
-def _compute_insert_size_bp(
-    r1_chain: list[tuple[int, int]],
-    r2_chain: list[tuple[int, int]],
-    r1_positions: list[int],
-    r2_positions: list[int],
-    lmer_len: int,
-) -> float | None:
-    """Estimate insert size in basepairs for a concordant PE pair on the same path.
-
-    Uses the bp positions of the outermost minimizer anchors from each mate.
-
-    Args:
-        r1_chain: Alignment chain for R1.
-        r2_chain: Alignment chain for R2.
-        r1_positions: bp positions of R1 minimizers in the raw read.
-        r2_positions: bp positions of R2 minimizers in the raw read.
-        lmer_len: Length of each l-mer.
-
-    Returns:
-        Estimated insert size in bp, or ``None`` if it cannot be determined.
-    """
-    if not r1_chain or not r2_chain:
-        return None
-
-    def _read_span_bp(chain: list[tuple[int, int]], positions: list[int]) -> int:
-        min_rmi = min(c[1] for c in chain)
-        max_rmi = max(c[1] for c in chain)
-        return positions[max_rmi] + lmer_len - positions[min_rmi]
-
-    r1_span = _read_span_bp(r1_chain, r1_positions)
-    r2_span = _read_span_bp(r2_chain, r2_positions)
-
-    r1_path_start = r1_chain[0][0]
-    r1_path_end = r1_chain[-1][0]
-    r2_path_start = r2_chain[0][0]
-    r2_path_end = r2_chain[-1][0]
-
-    # Path distance between the outermost anchors (in minimizer units).
-    outer_start = min(r1_path_start, r2_path_start)
-    outer_end = max(r1_path_end, r2_path_end)
-    path_span_mers = outer_end - outer_start
-
-    if path_span_mers <= 0:
-        return None
-
-    # Estimate bp per minimizer from the reads themselves.
-    bp_per_mer_r1 = r1_span / max(len(r1_chain) - 1, 1)
-    bp_per_mer_r2 = r2_span / max(len(r2_chain) - 1, 1)
-    bp_per_mer = (bp_per_mer_r1 + bp_per_mer_r2) / 2.0
-
-    return path_span_mers * bp_per_mer
-
-
 # ---------------------------------------------------------------------------
-# Basepair gap extraction
+# Basepair span extraction
 # ---------------------------------------------------------------------------
 
 
-def _gap_seq(
+def _extract_read_span(
     read_seq: str,
-    read_min_positions: list[int],
+    read_min_count: int,
     chain: list[tuple[int, int]],
     strand: Literal["+", "-"],
-    path_gap_start: int,
-    path_gap_end: int,
-    lmer_len: int,
-) -> str | None:
-    """Extract the inter-minimizer gap sequence between two consecutive path positions.
+    *,
+    extend_to_read_start: bool = False,
+    extend_to_read_end: bool = False,
+) -> str:
+    """Extract the basepair span covered by chain anchors via linear interpolation.
 
-    The returned sequence is the bp between the *end* of the l-mer at
-    ``path_gap_start`` and the *start* of the l-mer at ``path_gap_end``,
-    in path orientation.
+    Given a read of length L with m total minimizers, minimizer at index k is
+    estimated to start at bp position ``k * L / m``.  The extracted span runs
+    from the first to the last chained minimizer (inclusive), covering the gap
+    and both flanking l-mer regions.
+
+    When *extend_to_read_start* is ``True``, the left boundary is clamped to 0
+    (the physical start of the read) regardless of the first anchor position.
+    When *extend_to_read_end* is ``True``, the right boundary is clamped to L
+    (the physical end of the read).  These flags are used for partial terminal
+    reads that only anchor at one side of the first or last path gap.
 
     Args:
-        read_seq: Full raw (pre-HPC) read sequence.
-        read_min_positions: bp position of each minimizer in the read (0-based).
-        chain: Sorted list of ``(path_pos, read_min_idx)`` anchor pairs.
-        strand: Alignment orientation.
-        path_gap_start: Path minimizer index at the gap start (inclusive).
-        path_gap_end: Path minimizer index at the gap end (exclusive).
-        lmer_len: Length of each l-mer.
+        read_seq: Full read sequence (forward strand).
+        read_min_count: Total number of minimizers in the read (from LMDB).
+        chain: ``(path_pos, read_min_idx)`` anchor pairs; must be non-empty.
+        strand: ``"+"`` for forward; ``"-"`` for reverse (span is reverse-complemented).
+        extend_to_read_start: If ``True``, force the left bp boundary to 0.
+        extend_to_read_end: If ``True``, force the right bp boundary to ``len(read_seq)``.
 
     Returns:
-        Gap sequence string (may be empty for adjacent minimizers), or ``None``
-        if the alignment does not cover both ``path_gap_start`` and ``path_gap_end``.
+        Extracted sequence in path orientation; empty string if span is zero length.
     """
-    chain_dict = {p: r for p, r in chain}
-    if path_gap_start not in chain_dict or path_gap_end not in chain_dict:
-        return None
-
-    rmi_start = chain_dict[path_gap_start]
-    rmi_end = chain_dict[path_gap_end]
-
-    if strand == "+":
-        bp_after = read_min_positions[rmi_start] + lmer_len
-        bp_before = read_min_positions[rmi_end]
-        if bp_after > bp_before:
-            return ""
-        return read_seq[bp_after:bp_before]
-
-    # "-" strand: rmi_start > rmi_end (path advances → read position decreases).
-    # In the original (forward) read the gap_end minimizer is to the left of gap_start.
-    bp_after = read_min_positions[rmi_end] + lmer_len
-    bp_before = read_min_positions[rmi_start]
-    if bp_after > bp_before:
+    first_rmi = min(c[1] for c in chain)
+    last_rmi = max(c[1] for c in chain)
+    L = len(read_seq)
+    m = max(read_min_count, 1)
+    bp_start = 0 if extend_to_read_start else int(first_rmi * L / m)
+    bp_end = L if extend_to_read_end else min(int((last_rmi + 1) * L / m), L)
+    if bp_start >= bp_end:
         return ""
-    return _reverse_complement(read_seq[bp_after:bp_before])
-
-
-def _lmer_from_alignment(
-    read_seq: str,
-    read_min_positions: list[int],
-    chain: list[tuple[int, int]],
-    strand: Literal["+", "-"],
-    path_pos: int,
-    lmer_len: int,
-) -> str | None:
-    """Extract the l-mer sequence at a given path position from a read alignment.
-
-    Args:
-        read_seq: Full raw read sequence.
-        read_min_positions: bp positions of minimizers in the read.
-        chain: Alignment chain.
-        strand: Alignment strand.
-        path_pos: Path minimizer position to extract.
-        lmer_len: Length of the l-mer.
-
-    Returns:
-        l-mer string in path orientation, or ``None`` if not covered.
-    """
-    chain_dict = {p: r for p, r in chain}
-    if path_pos not in chain_dict:
-        return None
-    rmi = chain_dict[path_pos]
-    bp = read_min_positions[rmi]
-    raw_lmer = read_seq[bp: bp + lmer_len]
-    if strand == "-":
-        return _reverse_complement(raw_lmer)
-    return raw_lmer
+    span = read_seq[bp_start:bp_end]
+    return _reverse_complement(span) if strand == "-" else span
 
 
 # ---------------------------------------------------------------------------
@@ -674,7 +587,7 @@ def _choose_gap_seq(
         weight_coverage: Whether to weight random selection by alignment score.
 
     Returns:
-        The chosen gap sequence, or ``None`` if ``candidates`` is empty.
+        The chosen gap sequence, or ``None`` if *candidates* is empty.
     """
     if not candidates:
         return None
@@ -711,8 +624,7 @@ def _choose_gap_seq(
 def _call_consensus_aligner(seqs: list[str]) -> str:
     """Compute a multi-sequence consensus using abpoa or spoa.
 
-    Searches PATH for ``abpoa`` first, then ``spoa``.  Raises
-    :class:`RuntimeError` if neither is found.
+    Searches PATH for ``abpoa`` first, then ``spoa``.
 
     Args:
         seqs: Input sequences (all should be similar in length and orientation).
@@ -736,9 +648,7 @@ def _call_consensus_aligner(seqs: list[str]) -> str:
             "Install one of them to use --mode consensus."
         )
 
-    with tempfile.NamedTemporaryFile(
-        mode="w", suffix=".fa", delete=False
-    ) as tmp:
+    with tempfile.NamedTemporaryFile(mode="w", suffix=".fa", delete=False) as tmp:
         for i, seq in enumerate(seqs):
             tmp.write(f">seq{i}\n{seq}\n")
         tmp_path = tmp.name
@@ -749,14 +659,12 @@ def _call_consensus_aligner(seqs: list[str]) -> str:
             cmd = [aligner, "-m", "0", tmp_path]
         else:
             cmd = [aligner, tmp_path]
-
         result = subprocess.run(cmd, capture_output=True, text=True, check=True)
     finally:
         import os as _os
         _os.unlink(tmp_path)
 
-    # Parse all FASTA sequences from the output; return the last one.
-    # abpoa -m 0 emits only the consensus; spoa emits the MSA followed by the consensus.
+    # Parse all FASTA sequences from stdout; return the last (consensus).
     all_seqs: list[str] = []
     current: list[str] = []
     for line in result.stdout.splitlines():
@@ -772,20 +680,89 @@ def _call_consensus_aligner(seqs: list[str]) -> str:
 
 
 # ---------------------------------------------------------------------------
+# Terminal-gap alignment helpers
+# ---------------------------------------------------------------------------
+
+
+def _align_terminal_reads(
+    terminal_positions: set[int],
+    candidate_ids: set[int],
+    path_min_ids: list[int],
+    read_seqs: dict[int, str],
+    reads_txns_dbs: list[tuple],
+    shard_ranges: list[tuple],
+    read_id_width: int,
+    read_cache: _LRUCache,
+    min_anchors: int,
+    terminal_min_anchors: int,
+) -> list[ReadAlignment]:
+    """Return weak alignments whose chains touch a terminal path position.
+
+    Reads that already produced a chain of length ≥ *min_anchors* are in the
+    main alignment list and are *not* returned here.  This function returns
+    only reads with chain length in ``[terminal_min_anchors, min_anchors)``
+    that have at least one anchor in *terminal_positions*, so they can be used
+    to fill the first or last path gap when no full-spanning read is available.
+
+    Args:
+        terminal_positions: Path positions to check for anchor presence
+            (typically ``{0}`` for the first gap or ``{n-1}`` for the last).
+        candidate_ids: Read IDs to consider.
+        path_min_ids: Ordered minimizer hashes of the path.
+        read_seqs: ``{read_id: sequence}`` loaded from FASTQ.
+        reads_txns_dbs: Sharded reads-index ``(txn, db)`` pairs.
+        shard_ranges: Per-shard ``(lo, hi)`` key ranges.
+        read_id_width: Byte width of read-ID keys (4 or 8).
+        read_cache: LRU cache for read_id → minimizer-hash array.
+        min_anchors: Main anchor threshold; reads meeting this are excluded.
+        terminal_min_anchors: Minimum chain length to accept here.
+
+    Returns:
+        List of :class:`ReadAlignment` objects for qualifying reads.
+    """
+    results: list[ReadAlignment] = []
+    for read_id in candidate_ids:
+        if read_id not in read_seqs:
+            continue
+        min_ids_arr = _get_read_cached(
+            reads_txns_dbs, shard_ranges, read_id, read_cache, read_id_width,
+        )
+        if min_ids_arr is None or len(min_ids_arr) == 0:
+            continue
+        min_ids: list[int] = [int(x) for x in min_ids_arr]
+        chain, strand = align_read_to_path(path_min_ids, min_ids)
+        n_anchors = len(chain)
+        if n_anchors < terminal_min_anchors or n_anchors >= min_anchors:
+            continue
+        chain_positions = {p for p, _ in chain}
+        if not chain_positions & terminal_positions:
+            continue
+        results.append(ReadAlignment(
+            read_id=read_id,
+            chain=chain,
+            strand=strand,
+            anchor_count=n_anchors,
+        ))
+    return results
+
+
+# ---------------------------------------------------------------------------
 # Path reconstruction
 # ---------------------------------------------------------------------------
 
 
 def _reconstruct_path(
     path: PathResult,
-    relevant_reads: dict[str, tuple[list[int], list[int]]],
-    min_to_reads: dict[int, list[str]],
-    read_seqs: dict[str, tuple[str, str | None]],
-    read_to_canonical: dict[str, str],
-    canonical_to_pair: dict[str, tuple[str | None, str | None]],
-    minimizer_table: dict[int, str],
-    lmer_len: int,
+    mi_txns_dbs: list[tuple],
+    reads_txns_dbs: list[tuple],
+    shard_ranges: list[tuple],
+    read_id_width: int,
+    read_seqs: dict[int, str],
+    read_cache: _LRUCache,
+    minimizer_cache: _LRUCache,
+    density: float,
     min_anchors: int,
+    terminal_min_anchors: int,
     max_reads_per_min: int,
     mode: Mode,
     weights: ScoringWeights,
@@ -799,92 +776,106 @@ def _reconstruct_path(
 
     Args:
         path: The minimizer path to reconstruct.
-        relevant_reads: ``{read_name: (min_ids, positions)}`` for reads overlapping paths.
-        min_to_reads: ``{min_hash: [read_name]}`` for path minimizers.
-        read_seqs: ``{read_name: (seq, qual)}`` loaded from FASTQ.
-        read_to_canonical: ``{read_name: canonical_name}`` for pair lookup.
-        canonical_to_pair: ``{canonical_name: (r1_name, r2_name)}``.
-        minimizer_table: ``{hash: lmer_string}`` from rust-mdbg.
-        lmer_len: Length of each l-mer.
-        min_anchors: Minimum chain length to keep an alignment.
-        max_reads_per_min: Maximum candidate reads looked up per minimizer.
-        mode: Sequence selection strategy.
+        mi_txns_dbs: Sharded minimizer-index ``(txn, db)`` pairs.
+        reads_txns_dbs: Sharded reads-index ``(txn, db)`` pairs.
+        shard_ranges: Per-shard ``(lo, hi)`` key ranges for the reads index.
+        read_id_width: Byte width of read-ID keys (4 or 8).
+        read_seqs: ``{read_id: sequence}`` loaded from FASTQ.
+        read_cache: LRU cache for read_id → minimizer-hash array (from LMDB).
+        minimizer_cache: LRU cache for minimizer_hash → read-ID list.
+        density: Minimizer density in minimizers per basepair (used for gap-fill size).
+        min_anchors: Minimum chain length to keep a read alignment globally.
+        terminal_min_anchors: Minimum chain length for reads used only at terminal
+            path gaps (first and last).  Ignored when ≥ *min_anchors*.
+        max_reads_per_min: Maximum candidate reads examined per path minimizer.
+        mode: Sequence selection strategy for each gap span.
         weights: Alignment scoring weights.
-        insert_dist: Insert-size distribution, or ``None`` if not used.
-        gap_fill_char: Character used for uncovered gaps.
-        min_cov_fraction: Minimum fraction of path minimizers with read coverage.
-        weight_coverage: Weight random gap selection by alignment score.
+        insert_dist: Minimizer-space insert-size distribution, or ``None``.
+        gap_fill_char: Character for uncovered path spans.
+        min_cov_fraction: Minimum fraction of path positions needing read coverage.
+        weight_coverage: Weight random span selection by alignment score.
         rng: Random number generator.
 
     Returns:
-        A tuple ``(sequence_or_None, n_minimizers, n_covered_minimizers)``.
-        ``sequence_or_None`` is ``None`` when coverage is below the threshold.
+        A tuple ``(sequence_or_None, n_minimizers, n_covered_positions)``.
+        ``sequence_or_None`` is ``None`` when coverage is below *min_cov_fraction*.
     """
     n_path = len(path.minimizer_ids)
     if n_path == 0:
         return None, 0, 0
 
-    # --- Collect candidate reads (up to max_reads_per_min per minimizer) -------
-    candidate_names: set[str] = set()
+    # --- Collect candidate reads (cached minimizer LMDB lookups) ----------------
+    candidate_ids: set[int] = set()
     for mid in path.minimizer_ids:
-        reads_for_min = min_to_reads.get(mid, [])
-        candidate_names.update(reads_for_min[:max_reads_per_min])
+        cached = minimizer_cache.get(mid)
+        if cached is not None:
+            ids: list[int] = cached  # type: ignore[assignment]
+        else:
+            ids = _read_ids_for_minimizer_multi(mi_txns_dbs, mid, max_reads_per_min, read_id_width)
+            minimizer_cache.put(mid, ids)
+        candidate_ids.update(ids[:max_reads_per_min])
 
-    # --- Align each candidate read to the path --------------------------------
+    # --- Align each candidate read to the path ----------------------------------
     alignments: list[ReadAlignment] = []
-    for read_name in candidate_names:
-        if read_name not in relevant_reads or read_name not in read_seqs:
+    for read_id in candidate_ids:
+        if read_id not in read_seqs:
             continue
-        min_ids, _ = relevant_reads[read_name]
+        min_ids_arr = _get_read_cached(
+            reads_txns_dbs, shard_ranges, read_id, read_cache, read_id_width,
+        )
+        if min_ids_arr is None or len(min_ids_arr) == 0:
+            continue
+        min_ids: list[int] = [int(x) for x in min_ids_arr]
         chain, strand = align_read_to_path(path.minimizer_ids, min_ids)
         if len(chain) < min_anchors:
             continue
-        alignments.append(
-            ReadAlignment(
-                read_name=read_name,
-                chain=chain,
-                strand=strand,
-                anchor_count=len(chain),
-            )
+        alignments.append(ReadAlignment(
+            read_id=read_id,
+            chain=chain,
+            strand=strand,
+            anchor_count=len(chain),
+        ))
+
+    # --- Collect weak alignments for terminal gaps ------------------------------
+    # Reads with chains shorter than min_anchors are normally discarded, but for
+    # the first and last path gap they can still provide basepair sequence if
+    # they anchor at the terminal path position.
+    if n_path >= 2 and terminal_min_anchors < min_anchors:
+        terminal_alns = _align_terminal_reads(
+            terminal_positions={0, n_path - 1},
+            candidate_ids=candidate_ids,
+            path_min_ids=path.minimizer_ids,
+            read_seqs=read_seqs,
+            reads_txns_dbs=reads_txns_dbs,
+            shard_ranges=shard_ranges,
+            read_id_width=read_id_width,
+            read_cache=read_cache,
+            min_anchors=min_anchors,
+            terminal_min_anchors=terminal_min_anchors,
         )
+        alignments.extend(terminal_alns)
 
-    # --- Compute insert-size LL and mate concordance --------------------------
-    # Build a lookup: path positions covered → alignment index, for mate checking.
-    aln_by_name: dict[str, ReadAlignment] = {a.read_name: a for a in alignments}
+    # --- Compute insert-size LL and mate concordance ----------------------------
+    aln_by_id: dict[int, ReadAlignment] = {a.read_id: a for a in alignments}
     for aln in alignments:
-        canonical = read_to_canonical.get(aln.read_name)
-        if canonical is None:
+        mate = aln_by_id.get(_mate_id(aln.read_id))
+        if mate is None:
             continue
-        r1_name, r2_name = canonical_to_pair.get(canonical, (None, None))
-        mate_name = r2_name if aln.read_name == r1_name else r1_name
-        if mate_name is None or mate_name not in aln_by_name:
-            continue
-        mate_aln = aln_by_name[mate_name]
         aln.mate_concordant = True
-        mate_aln.mate_concordant = True
+        mate.mate_concordant = True
 
-        if insert_dist is not None and aln.read_name == r1_name:
-            _, r1_pos = relevant_reads[aln.read_name]
-            _, r2_pos = relevant_reads[mate_name]
-            insert_bp = _compute_insert_size_bp(
-                aln.chain, mate_aln.chain,
-                r1_pos, r2_pos,
-                lmer_len,
-            )
-            if insert_bp is not None:
-                ll = insert_dist.log_prob(insert_bp)
+        # Compute insert-size LL only once per pair (when processing R1).
+        if insert_dist is not None and aln.read_id % 2 == 1:
+            n_mers = _compute_insert_size_mers(aln.chain, mate.chain)
+            if n_mers is not None:
+                ll = _insert_log_prob_mers(n_mers, insert_dist)
                 aln.insert_size_ll = ll
-                mate_aln.insert_size_ll = ll
+                mate.insert_size_ll = ll
 
     for aln in alignments:
         aln.score = _score_alignment(aln, weights)
 
-    # --- Determine dominant strand for minimizer_table fallback ---------------
-    n_fwd = sum(1 for a in alignments if a.strand == "+")
-    dominant_strand: Literal["+", "-"] = "+" if n_fwd >= len(alignments) - n_fwd else "-"
-
-    # --- Build per-position l-mer and per-gap sequences -----------------------
-    # For each position, pick the best covering alignment.
+    # --- Determine coverage: best alignment per path position -------------------
     best_aln_at: dict[int, ReadAlignment] = {}
     for aln in sorted(alignments, key=lambda a: a.score):
         for path_pos, _ in aln.chain:
@@ -894,47 +885,80 @@ def _reconstruct_path(
     if n_path > 1 and n_covered / n_path < min_cov_fraction:
         return None, n_path, n_covered
 
-    # Collect l-mers.
-    lmers: list[str | None] = []
-    for i, mid in enumerate(path.minimizer_ids):
-        if i in best_aln_at:
-            aln = best_aln_at[i]
-            read_seq_str, _ = read_seqs[aln.read_name]
-            _, pos = relevant_reads[aln.read_name]
-            lmer = _lmer_from_alignment(read_seq_str, pos, aln.chain, aln.strand, i, lmer_len)
-        else:
-            lmer = minimizer_table.get(mid)
-            if lmer is not None and dominant_strand == "-":
-                lmer = _reverse_complement(lmer)
-        lmers.append(lmer)
-
-    # Collect gap sequences (per mode).
-    gaps: list[str | None] = []
+    # --- Extract per-gap spans and stitch --------------------------------------
+    # For each consecutive pair (i, i+1), find alignments with anchors at both
+    # positions and extract the bp span using linear interpolation.
+    # For the first and last gap, partial reads anchoring at only ONE side are
+    # also accepted; the missing boundary is the read's physical start or end.
+    # Adjacent spans share ~1/density bp at their junction (acceptable overlap).
+    parts: list[str] = []
     for i in range(n_path - 1):
-        gap_start, gap_end = i, i + 1
-        # Gather all alignments that cover both positions.
+        is_first_gap = i == 0
+        is_last_gap = i == n_path - 2
+        is_terminal = is_first_gap or is_last_gap
+
         candidates: list[tuple[str, float]] = []
         for aln in alignments:
-            read_seq_str, _ = read_seqs[aln.read_name]
-            _, pos = relevant_reads[aln.read_name]
-            seq = _gap_seq(read_seq_str, pos, aln.chain, aln.strand, gap_start, gap_end, lmer_len)
-            if seq is not None:
-                candidates.append((seq, aln.score))
+            chain_dict = {p: r for p, r in aln.chain}
+            has_i = i in chain_dict
+            has_i1 = (i + 1) in chain_dict
+
+            if not has_i and not has_i1:
+                continue
+            if not is_terminal and (not has_i or not has_i1):
+                continue
+
+            read_seq = read_seqs.get(aln.read_id)
+            if read_seq is None:
+                continue
+            min_ids_arr = _get_read_cached(
+                reads_txns_dbs, shard_ranges, aln.read_id, read_cache, read_id_width,
+            )
+            if min_ids_arr is None:
+                continue
+
+            # Determine sub-chain and whether to extend to the read boundary.
+            if has_i and has_i1:
+                sub_chain = [(i, chain_dict[i]), (i + 1, chain_dict[i + 1])]
+                extend_start = False
+                extend_end = False
+            elif is_first_gap and not has_i:
+                # Read starts inside the first gap; extend left to read start.
+                sub_chain = [(i + 1, chain_dict[i + 1])]
+                extend_start = True
+                extend_end = False
+            elif is_first_gap:
+                # has_i but not has_i1: read ends before path pos 1.
+                sub_chain = [(i, chain_dict[i])]
+                extend_start = False
+                extend_end = True
+            elif is_last_gap and not has_i1:
+                # Read ends inside the last gap; extend right to read end.
+                sub_chain = [(i, chain_dict[i])]
+                extend_start = False
+                extend_end = True
+            else:
+                # is_last_gap and has_i1 but not has_i: read starts after n-2.
+                sub_chain = [(i + 1, chain_dict[i + 1])]
+                extend_start = True
+                extend_end = False
+
+            span = _extract_read_span(
+                read_seq, len(min_ids_arr), sub_chain, aln.strand,
+                extend_to_read_start=extend_start,
+                extend_to_read_end=extend_end,
+            )
+            if span:
+                candidates.append((span, aln.score))
+
         if candidates:
             chosen = _choose_gap_seq(candidates, mode, rng, weight_coverage=weight_coverage)
+            parts.append(chosen or "")
         else:
-            # No read covers this gap; fill with Ns.
-            est_gap_len = max(0, path.distances[i] - 1) if i < len(path.distances) else 0
-            chosen = gap_fill_char * est_gap_len
-        gaps.append(chosen)
-
-    # --- Stitch ---------------------------------------------------------------
-    parts: list[str] = []
-    for i in range(n_path):
-        lmer_i = lmers[i] or (gap_fill_char * lmer_len)
-        parts.append(lmer_i)
-        if i < n_path - 1:
-            parts.append(gaps[i] or "")
+            # No read covers this gap; fill with estimated basepair count.
+            dist_mers = path.distances[i] if i < len(path.distances) else 1
+            est_bp = max(1, int(dist_mers / density))
+            parts.append(gap_fill_char * est_bp)
 
     return "".join(parts), n_path, n_covered
 
@@ -952,13 +976,12 @@ def main(
     )],
     prefix: Annotated[Path, typer.Option(
         "--prefix",
-        help="rust-mdbg output prefix (used to locate .read_minimizers files "
-             "and minimizer_table).",
+        help="rust-mdbg output prefix (used to locate LMDB index files).",
     )],
     reads: Annotated[list[Path], typer.Option(
         "--reads",
-        help="FASTQ/FASTA file with original reads.  Repeat twice for paired-end "
-             "(R1 then R2).",
+        help="FASTQ/FASTA file with original reads.  Repeat twice for "
+             "paired-end (R1 then R2).",
         exists=True, readable=True,
     )],
     output: Annotated[Path, typer.Option(
@@ -971,16 +994,16 @@ def main(
     )] = Mode.best,
     insert_size_json: Annotated[Path | None, typer.Option(
         "--insert-size-json",
-        help="JSON file from asf_sample.py with insert-size estimate "
-             "(keys: 'mu_bp'/'sigma_bp' or 'median_bp'/'sigma_bp').",
+        help="JSON file from asf_sample.py with minimizer-space insert-size "
+             "estimate (top-level keys: 'mu_log' and 'sigma_log').",
     )] = None,
     insert_size_mean: Annotated[float | None, typer.Option(
         "--insert-size-mean",
-        help="Mean insert size in bp (alternative to --insert-size-json).",
+        help="Mean insert size in minimizer units (alternative to --insert-size-json).",
     )] = None,
     insert_size_std: Annotated[float | None, typer.Option(
         "--insert-size-std",
-        help="Standard deviation of insert size in bp "
+        help="Standard deviation of insert size in minimizer units "
              "(required when --insert-size-mean is given).",
     )] = None,
     min_anchors: Annotated[int, typer.Option(
@@ -988,6 +1011,13 @@ def main(
         help="Minimum chained minimizer hits required to keep a read alignment.",
         min=1,
     )] = _DEFAULT_MIN_ANCHORS,
+    terminal_min_anchors: Annotated[int, typer.Option(
+        "--terminal-min-anchors",
+        help="Minimum chain length for partial reads used only at the first and last "
+             "path gap.  Can be lower than --min-anchors to recover reads that only "
+             "partially overlap a path end.",
+        min=1,
+    )] = _DEFAULT_TERMINAL_MIN_ANCHORS,
     max_reads_per_min: Annotated[int, typer.Option(
         "--max-reads-per-minimizer",
         help="Maximum candidate reads examined per path minimizer.",
@@ -1013,9 +1043,14 @@ def main(
     )] = True,
     gap_fill_char: Annotated[str, typer.Option(
         "--gap-fill-char",
-        help="Character used to fill uncovered path gaps.",
-        min_length=1, max_length=1,
+        help="Character used to fill uncovered path gaps (must be exactly one character).",
     )] = _DEFAULT_GAP_FILL,
+    density: Annotated[float, typer.Option(
+        "--density",
+        help="Minimizer density in minimizers per basepair, used for gap-fill "
+             "length estimation when no read covers a span.",
+        min=1e-6,
+    )] = _DEFAULT_DENSITY,
     seed: Annotated[int, typer.Option(
         "--seed",
         help="Random seed for reproducibility.",
@@ -1034,14 +1069,20 @@ def main(
     )
     rng = random.Random(seed)
 
-    # --- Validate insert-size options ----------------------------------------
+    # --- Validate gap_fill_char -------------------------------------------------
+    if len(gap_fill_char) != 1:
+        raise typer.BadParameter(
+            "--gap-fill-char must be exactly one character",
+            param_hint="--gap-fill-char",
+        )
+
+    # --- Validate insert-size options ------------------------------------------
     if insert_size_mean is not None and insert_size_std is None:
         raise typer.BadParameter(
             "--insert-size-std is required when --insert-size-mean is given"
         )
     insert_dist = _load_insert_size(insert_size_json, insert_size_mean, insert_size_std)
 
-    # Adjust weights based on flags.
     scoring_weights = ScoringWeights(
         coverage=1.0,
         insert=0.5 if (weight_insert and insert_dist is not None) else 0.0,
@@ -1049,25 +1090,6 @@ def main(
     )
 
     with Progress(*_PROGRESS_COLUMNS) as progress:
-        # --- Load minimizer table ------------------------------------------------
-        table_path = Path(f"{prefix}.minimizer_table")
-        if not table_path.exists():
-            typer.echo(
-                f"Error: minimizer_table not found: {table_path}",
-                err=True,
-            )
-            raise typer.Exit(1)
-        load_task = progress.add_task("Loading minimizer_table …", total=None)
-        minimizer_table = load_minimizer_table(table_path)
-        # Detect l-mer length from the first entry.
-        lmer_len = len(next(iter(minimizer_table.values()))) if minimizer_table else 17
-        progress.update(
-            load_task,
-            description=f"Loaded {len(minimizer_table):,} minimizers (l={lmer_len})",
-            completed=1, total=1,
-        )
-        log.info("Loaded minimizer_table: %d entries, lmer_len=%d", len(minimizer_table), lmer_len)
-
         # --- Load paths ----------------------------------------------------------
         paths_task = progress.add_task("Loading paths …", total=None)
         paths: list[PathResult] = []
@@ -1089,54 +1111,85 @@ def main(
         )
         log.info("Loaded %d paths from %s", len(paths), paths_file)
 
-        # --- Collect path minimizer hashes ---------------------------------------
+        # --- Collect unique path minimizer hashes --------------------------------
         path_min_set: set[int] = set()
         for p in paths:
             path_min_set.update(p.minimizer_ids)
         log.info("%d unique minimizer hashes across all paths", len(path_min_set))
 
-        # --- Scan .read_minimizers files -----------------------------------------
-        relevant_reads, min_to_reads = _collect_relevant_reads(
-            prefix, path_min_set, progress=progress,
-        )
+        # --- Open LMDB indexes ---------------------------------------------------
+        lmdb_task = progress.add_task("Opening LMDB indexes …", total=None)
+        reads_shards, read_id_width = _open_reads_lmdb(prefix)
+        shard_ranges = _reads_shard_ranges(reads_shards, read_id_width)
+        reads_txns_dbs = [(env.begin(), db) for env, db, _ in reads_shards]
 
-        # --- Build pair name index -----------------------------------------------
-        pair_task = progress.add_task("Building pair index …", total=None)
-        read_to_canonical, canonical_to_pair = _build_pair_index(relevant_reads.keys())
-        n_pairs = sum(
-            1 for v in canonical_to_pair.values() if v[0] is not None and v[1] is not None
-        )
+        mi_shards, _ = _open_minimizer_lmdb(prefix)
+        mi_txns_dbs = [(env.begin(), db) for env, db, _ in mi_shards]
+
         progress.update(
-            pair_task,
-            description=f"Indexed {len(relevant_reads):,} reads, {n_pairs:,} complete pairs",
+            lmdb_task,
+            description=(
+                f"Opened {len(reads_shards)} reads shard(s), "
+                f"{len(mi_shards)} minimizer shard(s) "
+                f"(read_id_width={read_id_width})"
+            ),
             completed=1, total=1,
         )
+        log.info(
+            "LMDB: %d reads shards, %d minimizer shards, read_id_width=%d",
+            len(reads_shards), len(mi_shards), read_id_width,
+        )
 
-        # --- Load FASTQ sequences ------------------------------------------------
-        read_seqs = _load_fastq(reads, set(relevant_reads.keys()), progress=progress)
-        n_missing = len(relevant_reads) - len(read_seqs)
+        # --- Query minimizer index for all path minimizers -----------------------
+        minimizer_cache = _LRUCache(maxsize=len(path_min_set) + 10_000)
+        min_to_read_ids = _collect_candidate_read_ids(
+            mi_txns_dbs,
+            list(path_min_set),
+            max_reads_per_min,
+            read_id_width,
+            minimizer_cache,
+            progress=progress,
+        )
+        candidate_ids: set[int] = set()
+        for ids in min_to_read_ids.values():
+            candidate_ids.update(ids)
+        log.info(
+            "Collected %d candidate read IDs from %d path minimizers",
+            len(candidate_ids), len(path_min_set),
+        )
+
+        # --- Load FASTQ sequences for candidate reads ----------------------------
+        read_seqs = _load_read_sequences(reads, candidate_ids, progress=progress)
+        n_missing = len(candidate_ids) - sum(
+            1 for r in candidate_ids if r in read_seqs
+        )
         if n_missing > 0:
             log.warning(
-                "%d reads in .read_minimizers have no matching FASTQ entry", n_missing
+                "%d candidate read IDs have no matching FASTQ entry "
+                "(FASTQ may not cover all reads in the index)",
+                n_missing,
             )
 
         # --- Reconstruct paths ---------------------------------------------------
+        read_cache = _LRUCache(maxsize=20_000)
         recon_task = progress.add_task("Reconstructing paths …", total=len(paths))
         n_written = 0
         n_skipped = 0
 
         with open(output, "w") as out_fh:
             for path_idx, path in enumerate(paths):
-                seq, n_mers, n_covered = _reconstruct_path(
+                seq, n_mers, n_cov = _reconstruct_path(
                     path=path,
-                    relevant_reads=relevant_reads,
-                    min_to_reads=min_to_reads,
+                    mi_txns_dbs=mi_txns_dbs,
+                    reads_txns_dbs=reads_txns_dbs,
+                    shard_ranges=shard_ranges,
+                    read_id_width=read_id_width,
                     read_seqs=read_seqs,
-                    read_to_canonical=read_to_canonical,
-                    canonical_to_pair=canonical_to_pair,
-                    minimizer_table=minimizer_table,
-                    lmer_len=lmer_len,
+                    read_cache=read_cache,
+                    minimizer_cache=minimizer_cache,
+                    density=density,
                     min_anchors=min_anchors,
+                    terminal_min_anchors=terminal_min_anchors,
                     max_reads_per_min=max_reads_per_min,
                     mode=mode,
                     weights=scoring_weights,
@@ -1152,14 +1205,14 @@ def main(
                     n_skipped += 1
                     log.debug(
                         "Path %d skipped: %d/%d minimizers covered",
-                        path_idx, n_covered, n_mers,
+                        path_idx, n_cov, n_mers,
                     )
                     continue
 
                 header = (
                     f">path_{path_idx} "
                     f"n_minimizers={n_mers} "
-                    f"covered_minimizers={n_covered} "
+                    f"covered_minimizers={n_cov} "
                     f"seq_len={len(seq)}"
                 )
                 out_fh.write(f"{header}\n{seq}\n")
@@ -1172,6 +1225,12 @@ def main(
                 f"({n_skipped:,} skipped for low coverage)"
             ),
         )
+
+        # --- Close LMDB transactions ---------------------------------------------
+        for txn, _ in reads_txns_dbs:
+            txn.abort()
+        for txn, _ in mi_txns_dbs:
+            txn.abort()
 
     typer.echo(
         f"Wrote {n_written} sequences to {output} "
