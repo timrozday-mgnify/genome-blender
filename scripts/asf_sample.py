@@ -1396,6 +1396,7 @@ def _fragment_length_pyro_model(
     observed_mask: object,
     read_length: float = 150.0,
     combo_max_distance: int | None = None,
+    prior_mu_log: float = math.log(500.0),
 ) -> None:
     """Pyro generative model for fragment length from per-path containment rates.
 
@@ -1428,7 +1429,7 @@ def _fragment_length_pyro_model(
     mu_log = _pyro.sample(  # type: ignore[union-attr]
         "mu_log",
         _pyro_dist.Normal(  # type: ignore[union-attr]
-            _torch.tensor(math.log(500.0)),  # type: ignore[union-attr]
+            _torch.tensor(prior_mu_log),  # type: ignore[union-attr]
             _torch.tensor(1.5),  # type: ignore[union-attr]
         ),
     )
@@ -1477,6 +1478,7 @@ def estimate_fragment_length(
     num_warmup: int = 200,
     read_length_bp: float = 150.0,
     combo_max_distance: int | None = None,
+    prior_mu_log: float | None = None,
 ) -> FragmentLengthEstimate:
     """Estimate insert size by fitting a log-normal to per-path containment rates.
 
@@ -1514,7 +1516,8 @@ def estimate_fragment_length(
         pe_shards, path_bin_sketches, bin_distances, min_path_hashes_per_bin,
     )
 
-    mu0 = math.log(8000.0)
+    _prior_mu = prior_mu_log if prior_mu_log is not None else math.log(_DEFAULT_FRAG_PRIOR_MEDIAN_BP)
+    mu0 = _prior_mu
     if cd.n_bins_used == 0:
         return FragmentLengthEstimate(
             mu_log=mu0, sigma_log=0.5,
@@ -1535,10 +1538,11 @@ def estimate_fragment_length(
     model_kwargs = {
         "read_length": read_length_bp,
         "combo_max_distance": combo_max_distance,
+        "prior_mu_log": _prior_mu,
     }
 
     init_vals = {
-        "mu_log": _torch.tensor(math.log(_DEFAULT_FRAG_PRIOR_MEDIAN_BP)),  # type: ignore[union-attr]
+        "mu_log": _torch.tensor(_prior_mu),  # type: ignore[union-attr]
         "sigma_log": _torch.tensor(0.4),                       # type: ignore[union-attr]
         "rho": _torch.tensor(0.05),                            # type: ignore[union-attr]
         "norm": _torch.tensor(0.5),                            # type: ignore[union-attr]
@@ -1676,6 +1680,7 @@ def estimate_fragment_length_map(
     lr: float = 0.01,
     read_length_bp: float = 150.0,
     combo_max_distance: int | None = None,
+    prior_mu_log: float | None = None,
 ) -> FragmentLengthMAP:
     """Find MAP parameter values for the fragment length model via SVI.
 
@@ -1710,7 +1715,8 @@ def estimate_fragment_length_map(
         pe_shards, path_bin_sketches, bin_distances, min_path_hashes_per_bin,
     )
 
-    mu0 = math.log(_DEFAULT_FRAG_PRIOR_MEDIAN_BP)
+    _prior_mu = prior_mu_log if prior_mu_log is not None else math.log(_DEFAULT_FRAG_PRIOR_MEDIAN_BP)
+    mu0 = _prior_mu
     if cd.n_bins_used == 0:
         return FragmentLengthMAP(
             mu_log=mu0, sigma_log=0.5, rho=0.1, norm=0.5,
@@ -1727,6 +1733,7 @@ def estimate_fragment_length_map(
     model_kwargs = {
         "read_length": read_length_bp,
         "combo_max_distance": combo_max_distance,
+        "prior_mu_log": _prior_mu,
     }
 
     _pyro.clear_param_store()  # type: ignore[union-attr]

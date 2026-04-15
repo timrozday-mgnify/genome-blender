@@ -114,9 +114,10 @@ WEIGHT_MATE=1       # --weight-mate     / --no-weight-mate
 # Gap-fill character for path spans with no read coverage.
 GAP_FILL_CHAR=N
 
-# Minimizer density (minimizers per bp); must match rust-mdbg indexing.
+# Minimizer density (minimizers per bp); empirically measured as
+# mean_minimizers_per_read / mean_read_length_bp (e.g. 19.285/150 = 0.1286).
 # Also used by estimate_insert_size_pe_combo.py for unit conversion.
-DENSITY=0.01
+DENSITY=0.1286
 
 RECONSTRUCTED_FA="${OUTPUT_DIR}/pe_paths_reconstructed.fa"
 
@@ -159,7 +160,12 @@ INFERENCE=map
 INSERT_SIZE_BINS="0,200,400,600,800,1000,1500,2000,3000,4000,6000,8000,12000,16000,20000"
 
 # PE combo thinning density; must match rust-mdbg --pe-combo-density.
-PE_COMBO_DENSITY=0.05
+PE_COMBO_DENSITY=0.5
+
+# rust-mdbg --combo-max-distance used when building the PE-combo index.
+# Setting to 1 forces the rectangular kernel in the model (values in [0,1]),
+# which is required for MAP/NUTS inference to converge correctly.
+COMBO_MAX_DISTANCE=1
 
 # Estimated read length in basepairs; converted to minimizer units internally.
 READ_LENGTH=150
@@ -188,6 +194,7 @@ echo "Running estimate_insert_size_pe_combo.py ..."
     --read-length "${READ_LENGTH}" \
     --insert-size-paths "${INSERT_SIZE_PATHS}" \
     --min-path-hashes "${MIN_PATH_HASHES}" \
+    --combo-max-distance "${COMBO_MAX_DISTANCE}" \
     --seed "${SEED}" \
     --output "${INSERT_SIZE_JSON}" \
     --verbose \

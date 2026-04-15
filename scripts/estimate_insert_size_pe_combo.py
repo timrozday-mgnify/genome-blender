@@ -54,6 +54,7 @@ from rich.progress import (
 sys.path.insert(0, str(Path(__file__).parent))
 from asf_sample import (  # noqa: E402
     PathResult,
+    _DEFAULT_FRAG_PRIOR_MEDIAN_BP,
     _DEFAULT_INSERT_BINS,
     _build_path_bin_sketches,
     _deconvolve_to_bp_space,
@@ -278,6 +279,17 @@ def main(
         )
 
         # --- Run inference -------------------------------------------------------
+        # Compute prior centre in minimizer space so the model prior is aligned
+        # with the data regardless of which unit space the bins are in.
+        prior_mu_log = math.log(density * _DEFAULT_FRAG_PRIOR_MEDIAN_BP)
+        log.info(
+            "Prior: mu_log ~ Normal(%.3f, 1.5)  "
+            "(= log(%.1f bp × %.4f density) = log(%.1f min))",
+            prior_mu_log,
+            _DEFAULT_FRAG_PRIOR_MEDIAN_BP, density,
+            density * _DEFAULT_FRAG_PRIOR_MEDIAN_BP,
+        )
+
         is_dict: dict[str, object]
         raw_samples: dict | None = None
 
@@ -289,6 +301,7 @@ def main(
                 num_steps=num_steps,
                 read_length_bp=read_length_mers,
                 combo_max_distance=combo_max_distance,
+                prior_mu_log=prior_mu_log,
             )
             progress.update(inf_task, description="MAP inference complete", completed=1, total=1)
             log.info(
@@ -319,6 +332,7 @@ def main(
                 inference=inference,
                 read_length_bp=read_length_mers,
                 combo_max_distance=combo_max_distance,
+                prior_mu_log=prior_mu_log,
             )
             progress.update(inf_task, description="NUTS inference complete", completed=1, total=1)
             raw_samples = result_nuts.raw_samples
