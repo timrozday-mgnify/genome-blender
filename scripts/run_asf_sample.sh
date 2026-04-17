@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-INPUT_DIR="$(cd ../genome-blender_run/multi_genome_deep/output && pwd)"
+INPUT_DIR="$(cd ../genome-blender_run/ERR10889718 && pwd)"
 RUST_MDBG_DIR="${INPUT_DIR}/rust-mdbg"
 OUTPUT_DIR="${RUST_MDBG_DIR}/asf_sample"
 mkdir -p "${RUST_MDBG_DIR}" "${OUTPUT_DIR}"
@@ -72,23 +72,16 @@ DENSITY=$(
 echo "Estimated mean read length: ${MEAN_READ_LEN} bp"
 echo "Using density: ${DENSITY}  (l=${L} / (${MEAN_READ_LEN} * 1.5))"
 export RUST_BACKTRACE=full
-"$(dirname "$0")/../bin/rust-mdbg" \
-    "${READS_FILE}" \
+"$(dirname "$0")/noodle/target/release/noodle" index \
+    --reads "${READS_FILE}" \
     "${READS2_FLAG[@]}" \
-    -k "${K}" \
     --density "${DENSITY}" \
     -l "${L}" \
     --minabund "${MINABUND}" \
     --prefix "${PREFIX}" \
-    --dump-reads-index \
-    --dump-minimizer-index \
-    --minimizer-bloom \
-    --dump-combo-index \
     --pe-combo-density "${PE_COMBO_DENSITY}" \
     --intra-combo-density "${INTRA_COMBO_DENSITY}" \
     --combo-max-distance "${COMBO_MAX_DISTANCE}" \
-    --combo-bloom \
-    --index-only \
     --minimizer-batch-size 50000000 \
     --combo-batch-size 50000000 \
     --reads-batch-size 50000000 \

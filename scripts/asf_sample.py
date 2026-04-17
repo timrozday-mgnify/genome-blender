@@ -403,32 +403,31 @@ def _reads_shard_ranges(
     """Return the inclusive (lo, hi) read-ID range stored in each reads shard.
 
     Reads are assigned sequential IDs and shards are filled in order, so each
-    shard owns a contiguous ID range.  The range is discovered by reading the
-    first and last key from each shard's ``"reads"`` sub-database.
+    shard owns a contiguous ID range.  Ranges are computed from entry counts
+    rather than cursor positions: cursor.first()/last() return the
+    lexicographically first/last keys, which do NOT correspond to the
+    numerically smallest/largest IDs for little-endian integer keys under
+    LMDB's default lexicographic sort.
 
     Args:
         shards: List of ``(env, db, meta_db)`` tuples from
             :func:`_open_reads_lmdb`.
-        read_id_width: Byte width of read ID keys (4 or 8).
+        read_id_width: Unused; kept for API compatibility.
 
     Returns:
         List of ``(lo, hi)`` pairs (inclusive).  Both values are ``None`` for
         an empty shard.
     """
-    fmt = "<I" if read_id_width == 4 else "<Q"
     ranges: list[tuple[int | None, int | None]] = []
+    offset = 0
     for env, db, _ in shards:
         with env.begin() as txn:
-            cursor = txn.cursor(db=db)
-            if not cursor.first():
-                ranges.append((None, None))
-                continue
-            lo_raw = cursor.key()
-            cursor.last()
-            hi_raw = cursor.key()
-        lo = struct.unpack(fmt, lo_raw)[0] if len(lo_raw) == read_id_width else None
-        hi = struct.unpack(fmt, hi_raw)[0] if len(hi_raw) == read_id_width else None
-        ranges.append((lo, hi))
+            n = txn.stat(db=db)["entries"]
+        if n == 0:
+            ranges.append((None, None))
+        else:
+            ranges.append((offset + 1, offset + n))
+        offset += n
     return ranges
 
 

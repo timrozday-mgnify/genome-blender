@@ -58,10 +58,8 @@ L=21
 #   MINABUND=2 is standard; increase for very high-coverage data (≥100×).
 MINABUND=2
 
-# rust-mdbg output paths
+# noodle index output prefix
 PREFIX="${OUTPUT_DIR}/rust_mdbg_out"
-GFA="${PREFIX}.gfa"
-MINIMIZER_TABLE="${PREFIX}.minimizer_table"
 
 # Estimate mean read length from the first 1000 reads, then derive density.
 # The minimizer length l and density are related by:
@@ -81,16 +79,6 @@ DENSITY=$(
 echo "Estimated mean read length: ${MEAN_READ_LEN} bp"
 echo "Using density: ${DENSITY}  (l=${L} / (${MEAN_READ_LEN} * 0.75))"
 
-# Run rust-mdbg directly (local build from timrozday-mgnify/rust-mdbg, mg-summary branch)
-# --dump-read-minimizers  writes the reads LMDB index ({PREFIX}.index.lmdb)
-#                         and {PREFIX}.minimizer_table (plain-text TSV: hash <-> l-mer lookup).
-#                         When --reads2 is given, R1 gets odd indices (1, 3, 5, …) and R2 gets
-#                         even (2, 4, 6, …).
-# --dump-kminmer-index    writes the inverted k-min-mer LMDB ({PREFIX}.kminmer_index.lmdb):
-#                         for each canonical k-mer of K consecutive minimizers, stores the
-#                         sorted list of 1-based read indices that contain it (DUPSORT layout).
-# --kminmer-bloom         writes a bloom filter ({PREFIX}.kminmer_bloom.bin) for rapid
-#                         membership testing without opening LMDB (~128 MB, ~1% FPR).
 # COMBO_DENSITY: fraction of combination hashes retained for PE/intra combo indexes.
 # Lower values → smaller indexes, faster query, less signal.  0.05 is a good default.
 COMBO_DENSITY=0.05
@@ -100,52 +88,18 @@ COMBO_DENSITY=0.05
 # expected insert size to keep signal while rejecting spurious long-range pairs.
 COMBO_MAX_DISTANCE=2000
 
-"$(dirname "$0")/../bin/rust-mdbg" \
-    "${READS_FILE}" \
+# Build LMDB indexes using noodle (replaces the old rust-mdbg binary).
+"$(dirname "$0")/noodle/target/release/noodle" index \
+    --reads "${READS_FILE}" \
     "${READS2_FLAG[@]}" \
-    -k "${K}" \
     --density "${DENSITY}" \
     -l "${L}" \
     --minabund "${MINABUND}" \
     --prefix "${PREFIX}" \
-    --dump-read-minimizers \
-    --dump-kminmer-index \
-    --kminmer-bloom \
-    --dump-combo-index \
-    --combo-density "${COMBO_DENSITY}" \
+    --pe-combo-density "${COMBO_DENSITY}" \
+    --intra-combo-density "${COMBO_DENSITY}" \
     --combo-max-distance "${COMBO_MAX_DISTANCE}" \
-    --combo-bloom \
 2>&1 | tee "${OUTPUT_DIR}/output.txt"
-
-UNIQUE_MINIMIZERS=$(grep -vc '^#' "${MINIMIZER_TABLE}" 2>/dev/null || echo 0)
-echo "Unique minimizers in minimizer_table: ${UNIQUE_MINIMIZERS}"
-
-# Build parse_gfa.py paired-end flags.
-# --interleaved-pairs: arithmetic pairing (0↔1, 2↔3, …) derived from the
-#   interleaved 1-based read indices written by rust-mdbg v2 --reads2 mode.
-_PAIRED_FLAGS=()
-if [[ "${PAIRED_END}" -eq 1 ]]; then
-    _PAIRED_FLAGS+=(--interleaved-pairs)
-fi
-
-/Users/timrozday/miniforge3/envs/genome_blender_dev/bin/python "$(dirname "$0")/parse_gfa.py" \
-    -n 100000 \
-    --sample-component-proportion 0.5 \
-    --read-minimizers "${PREFIX}" \
-    --minimizer-table "${MINIMIZER_TABLE}" \
-    --json "${PREFIX}.graph_summary.json" \
-    "${_PAIRED_FLAGS[@]}" \
-    --combo-k "${K}" \
-    --combo-density 0.05 \
-    --estimate-insert-size \
-    --insert-size-paths 100 \
-    --insert-size-bins "0,1000,2000,4000,8000,12000,16000,20000" \
-    --insert-size-inference nuts \
-    --insert-size-min-bin-hashes 100 \
-    --pe-combo-lmdb-out "${PREFIX}.pe_index.lmdb" \
-    --intra-combo-lmdb-out "${PREFIX}.intra_index.lmdb" \
-    --debug-path-bins "${PREFIX}.path_bins.jsonl" \
-    "${GFA}"
 
 /Users/timrozday/miniforge3/envs/genome_blender_dev/bin/python "$(dirname "$0")/plot_path_bin_pe_counts.py" \
     --debug-bins "${PREFIX}.path_bins.jsonl" \

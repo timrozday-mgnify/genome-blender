@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-INPUT_DIR="$(cd ../genome-blender_run/multi_genome_deep/output && pwd)"
+INPUT_DIR="$(cd ../genome-blender_run/ERR10889718 && pwd)"
 RUST_MDBG_DIR="${INPUT_DIR}/rust-mdbg"
 OUTPUT_DIR="${RUST_MDBG_DIR}/greedy_insert_size"
 mkdir -p "${OUTPUT_DIR}"
@@ -24,7 +24,7 @@ PREFIX="${RUST_MDBG_DIR}/rust_mdbg_out"
 SAMPLE_MODE=greedy
 
 # Target number of output paths.
-N_PATHS=1000
+N_PATHS=400
 
 # Minimum read support per extension step.
 MIN_SUPPORT=2
@@ -34,7 +34,7 @@ MAX_READS_PER_KMER=200
 
 # In greedy mode: max-path-mers caps only the bridge-seeking phase (forward
 # extension before R2 is found).  No limit applies after bridging.
-MAX_PATH_MERS=500
+MAX_PATH_MERS=400
 
 # Minimum path length in minimizers; short paths are discarded.
 MIN_PATH_MERS=100
@@ -69,7 +69,6 @@ echo "Running pe_path_sample.py (greedy, min ${MIN_PATH_MERS} minimizers) ..."
     --min-path-mers "${MIN_PATH_MERS}" \
     --sample-factor "${SAMPLE_FACTOR}" \
     --seed "${SEED}" \
-    --verbose \
 2>&1 | tee "${OUTPUT_DIR}/pe_path_sample.log"
 
 echo "Paths written to: ${PATHS_JSONL}"

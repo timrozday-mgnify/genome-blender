@@ -109,7 +109,13 @@
       "Bash(find:*)",
       "Bash(/Users/timrozday/miniforge3/envs/genome_blender_dev/bin/pip list:*)",
       "Read(//Users/timrozday/Documents/genome-blender_run/multi_genome_deep/output/**)",
-      "Read(//Users/timrozday/Documents/genome-blender_run/multi_genome_deep/**)"
+      "Read(//Users/timrozday/Documents/genome-blender_run/multi_genome_deep/**)",
+      "Bash(zcat /Users/timrozday/Documents/genome-blender_run/ERR10889718/*_R1.fastq.gz)",
+      "Bash(zcat /Users/timrozday/Documents/genome-blender_run/multi_genome_deep/output/sim_reads_R1.fastq.gz)",
+      "Bash(gunzip -c /Users/timrozday/Documents/genome-blender_run/ERR10889718/ERR10889718_R1.fastq.gz)",
+      "Bash(gunzip -c /Users/timrozday/Documents/genome-blender_run/multi_genome_deep/output/sim_reads_R1.fastq.gz)",
+      "Bash(cargo doc *)",
+      "Bash(cargo test *)"
     ]
   }
 }
