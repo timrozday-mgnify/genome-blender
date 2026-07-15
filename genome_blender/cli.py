@@ -32,11 +32,9 @@ from genome_blender._progress import (
     set_inner_progress,
 )
 from genome_blender.error_model import (
+    SkiverModelConfig,
     apply_error_model,
-    build_quality_calibration,
-    default_illumina_profile,
-    default_nanopore_profile,
-    default_pacbio_profile,
+    resolve_skiver_model,
 )
 from genome_blender.fragments import (
     amplicon_fragments,
@@ -50,9 +48,6 @@ from genome_blender.io import (
 )
 from genome_blender.models import (
     ErrorModel,
-    ErrorModelProfile,
-    QualityCalibration,
-    QualityCalibrationModel,
     ReadBatch,
 )
 from genome_blender.reads import generate_reads
@@ -64,7 +59,6 @@ app = typer.Typer()
 # Mapping from YAML key names to enum classes needing conversion
 _ENUM_PARAMS: dict[str, type[Enum]] = {
     "error_model": ErrorModel,
-    "quality_calibration_model": QualityCalibrationModel,
 }
 
 
@@ -107,7 +101,12 @@ def _apply_yaml_config(
         if source is not click.core.ParameterSource.COMMANDLINE:
             if key in _ENUM_PARAMS and isinstance(value, str):
                 value = _ENUM_PARAMS[key](value)
-            elif key == "input_csv" and isinstance(value, str):
+            elif key in {
+                "input_csv",
+                "skiver_model",
+                "skiver_params",
+                "skiver_phred_calibration",
+            } and isinstance(value, str):
                 value = Path(value)
             ctx.params[key] = value
 
@@ -163,44 +162,38 @@ def main(
         help="Random seed for reproducibility",
     )] = None,
     error_model: Annotated[ErrorModel, typer.Option(
-        help="Sequencing error model profile",
+        help="Sequencing error model: 'none', or a platform preset "
+        "(illumina, pacbio, nanopore) resolved to a Skiver model.",
         case_sensitive=False,
     )] = ErrorModel.none,
-    quality_calibration_model: Annotated[
-        QualityCalibrationModel, typer.Option(
-            help="Quality-score-to-error-rate "
-            "calibration model",
-            case_sensitive=False,
-        )
-    ] = QualityCalibrationModel.phred,
-    qcal_variability: Annotated[float, typer.Option(
-        help="Per-run noise multiplier for calibration "
-        "parameters; 0 = no noise",
-    )] = 0.0,
-    qcal_intercept: Annotated[float, typer.Option(
-        help="Log-linear model intercept (log10 scale)",
-    )] = -0.3,
-    qcal_slope: Annotated[float, typer.Option(
-        help="Log-linear model slope",
-    )] = -0.08,
-    qcal_floor: Annotated[float, typer.Option(
-        help="Minimum error probability "
-        "(log-linear and sigmoid)",
-    )] = 1e-7,
-    qcal_ceiling: Annotated[float, typer.Option(
-        help="Maximum error probability "
-        "(log-linear and sigmoid)",
-    )] = 0.5,
-    qcal_steepness: Annotated[float, typer.Option(
-        help="Sigmoid model steepness",
-    )] = 0.25,
-    qcal_midpoint: Annotated[float, typer.Option(
-        help="Sigmoid model midpoint "
-        "(Q-score at inflection)",
-    )] = 15.0,
+    skiver_model: Annotated[Path | None, typer.Option(
+        help="Skiver context error model .pt artifact. "
+        "When set, overrides --error-model.",
+    )] = None,
+    skiver_components: Annotated[str | None, typer.Option(
+        help="Skiver component string (e.g. 'AdditiveContext(7)+Strand'); "
+        "requires --skiver-params. Overrides --error-model.",
+    )] = None,
+    skiver_params: Annotated[Path | None, typer.Option(
+        help="Parameter values (JSON or .pt) for --skiver-components.",
+    )] = None,
+    skiver_use_vi: Annotated[bool, typer.Option(
+        "--skiver-use-vi/--skiver-use-mle",
+        help="Use Skiver VI posterior-mean parameters instead of MLE.",
+    )] = False,
+    skiver_phred_calibration: Annotated[Path | None, typer.Option(
+        help="Skiver P(Q | error_type) calibration JSON.",
+    )] = None,
+    skiver_max_ins_run: Annotated[int, typer.Option(
+        help="Maximum consecutive Skiver insertions before forcing "
+        "reference advancement.",
+    )] = 10,
+    skiver_generate_cmd: Annotated[str, typer.Option(
+        help="Command used to invoke Skiver's generative interface "
+        "(shell-split). Default assumes 'skiver-generate' is on PATH.",
+    )] = "skiver-generate",
     error_rate_scale: Annotated[float, typer.Option(
-        help="Multiplier applied to error probabilities "
-        "after quality calibration; "
+        help="Multiplier applied to non-match error probabilities; "
         "<1 reduces errors, >1 increases them",
     )] = 1.0,
     long_read: Annotated[bool, typer.Option(
@@ -248,22 +241,27 @@ def main(
         paired_end = p["paired_end"]
         seed = p.get("seed")
         error_model = ErrorModel(p["error_model"])
-        quality_calibration_model = (
-            QualityCalibrationModel(
-                p["quality_calibration_model"]
-            )
+        skiver_model = (
+            Path(p["skiver_model"])
+            if p.get("skiver_model") else None
         )
-        qcal_variability = p["qcal_variability"]
-        qcal_intercept = p["qcal_intercept"]
-        qcal_slope = p["qcal_slope"]
-        qcal_floor = p["qcal_floor"]
-        qcal_ceiling = p["qcal_ceiling"]
-        qcal_steepness = p["qcal_steepness"]
-        qcal_midpoint = p["qcal_midpoint"]
+        skiver_components = p.get("skiver_components")
+        skiver_params = (
+            Path(p["skiver_params"])
+            if p.get("skiver_params") else None
+        )
+        skiver_use_vi = p.get("skiver_use_vi", False)
+        skiver_phred_calibration = (
+            Path(p["skiver_phred_calibration"])
+            if p.get("skiver_phred_calibration") else None
+        )
+        skiver_max_ins_run = p.get("skiver_max_ins_run", 10)
+        skiver_generate_cmd = p.get("skiver_generate_cmd", "skiver-generate")
         error_rate_scale = p.get("error_rate_scale", 1.0)
         long_read = p.get("long_read", False)
         amplicon = p["amplicon"]
         chunk_size = p.get("chunk_size", 1_000_000)
+        compress = p.get("compress", True)
 
     # Validate required parameters
     if input_csv is None:
@@ -304,7 +302,7 @@ def main(
         amplicon=amplicon,
         chunk_size=chunk_size,
         error_model=error_model,
-        quality_calibration_model=quality_calibration_model,
+        skiver_model=skiver_model,
         seed=seed,
     )
 
@@ -318,20 +316,17 @@ def main(
         rng.seed()
         logger.info("Using random seed")
 
-    # Resolve error model profile
-    profile = _resolve_error_profile(error_model)
-
-    # Build quality calibration model
-    calibration = build_quality_calibration(
-        model_name=quality_calibration_model.value,
-        variability=qcal_variability,
-        rng=rng,
-        intercept=qcal_intercept,
-        slope=qcal_slope,
-        floor=qcal_floor,
-        ceiling=qcal_ceiling,
-        steepness=qcal_steepness,
-        midpoint=qcal_midpoint,
+    # Resolve the Skiver error model (or None to skip error application).
+    model_cfg = resolve_skiver_model(
+        error_model=error_model,
+        skiver_model=skiver_model,
+        skiver_components=skiver_components,
+        skiver_params=skiver_params,
+        skiver_use_vi=skiver_use_vi,
+        skiver_phred_calibration=skiver_phred_calibration,
+        skiver_max_ins_run=skiver_max_ins_run,
+        error_rate_scale=error_rate_scale,
+        skiver_generate_cmd=skiver_generate_cmd,
     )
 
     # Determine whether to show progress bars
@@ -367,9 +362,8 @@ def main(
         amplicon=amplicon,
         chunk_size=chunk_size,
         rng=rng,
-        profile=profile,
-        calibration=calibration,
-        error_rate_scale=error_rate_scale,
+        model_cfg=model_cfg,
+        seed=seed if seed is not None else 0,
         compress=compress,
     )
 
@@ -414,7 +408,7 @@ def _log_parameters(
     amplicon: bool,
     chunk_size: int,
     error_model: ErrorModel,
-    quality_calibration_model: QualityCalibrationModel,
+    skiver_model: Path | None,
     seed: int | None,
 ) -> None:
     """Log all resolved parameters at DEBUG level."""
@@ -445,36 +439,9 @@ def _log_parameters(
         "  error_model     = %s", error_model.value,
     )
     logger.debug(
-        "  quality_cal     = %s",
-        quality_calibration_model.value,
+        "  skiver_model    = %s", skiver_model,
     )
     logger.debug("  seed            = %s", seed)
-
-
-def _resolve_error_profile(
-    error_model: ErrorModel,
-) -> ErrorModelProfile | None:
-    """Return the error model profile, or None for 'none'."""
-    profile_map = {
-        "illumina": default_illumina_profile,
-        "pacbio": default_pacbio_profile,
-        "nanopore": default_nanopore_profile,
-    }
-    error_model_str = error_model.value
-    profile = (
-        profile_map[error_model_str]()
-        if error_model_str != "none" else None
-    )
-    if profile is not None:
-        logger.debug(
-            "Error profile: %d HMM states, "
-            "sub=%.0f%% ins=%.0f%% del=%.0f%%",
-            profile.num_states,
-            profile.substitution_ratio * 100,
-            profile.insertion_ratio * 100,
-            profile.deletion_ratio * 100,
-        )
-    return profile
 
 
 def _run_pipeline(
@@ -492,9 +459,8 @@ def _run_pipeline(
     amplicon: bool,
     chunk_size: int,
     rng: torch.Generator,
-    profile: ErrorModelProfile | None,
-    calibration: QualityCalibration | None,
-    error_rate_scale: float,
+    model_cfg: SkiverModelConfig | None,
+    seed: int,
     compress: bool,
     outer_progress: Progress | None,
     inner_progress: Progress | None,
@@ -621,8 +587,7 @@ def _run_pipeline(
                 long_read=long_read,
             )
             read_batch = apply_error_model(
-                read_batch, profile, rng, calibration,
-                error_rate_scale,
+                read_batch, model_cfg, seed=seed + chunk_idx,
             )
 
             write_fastqs(

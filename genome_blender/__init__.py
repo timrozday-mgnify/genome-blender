@@ -18,15 +18,9 @@ from genome_blender.cli import (
     main,
 )
 from genome_blender.error_model import (
-    _build_emission_logits,
-    _build_sticky_transitions,
+    SkiverModelConfig,
     apply_error_model,
-    apply_errors_to_sequence,
-    batch_sample_quality_scores,
-    build_quality_calibration,
-    default_illumina_profile,
-    default_nanopore_profile,
-    default_pacbio_profile,
+    resolve_skiver_model,
 )
 from genome_blender.fragments import (
     amplicon_fragments,
@@ -41,15 +35,9 @@ from genome_blender.io import (
 )
 from genome_blender.models import (
     ErrorModel,
-    ErrorModelProfile,
     Fragment,
-    LogLinearCalibration,
-    PhredCalibration,
-    QualityCalibration,
-    QualityCalibrationModel,
     Read,
     ReadBatch,
-    SigmoidCalibration,
 )
 from genome_blender.reads import generate_reads
 
@@ -58,12 +46,7 @@ __all__ = [
     "Read",
     "ReadBatch",
     "ErrorModel",
-    "ErrorModelProfile",
-    "QualityCalibration",
-    "QualityCalibrationModel",
-    "PhredCalibration",
-    "LogLinearCalibration",
-    "SigmoidCalibration",
+    "SkiverModelConfig",
     "app",
     "main",
     "load_genomes",
@@ -71,18 +54,11 @@ __all__ = [
     "amplicon_fragments",
     "generate_reads",
     "apply_error_model",
-    "apply_errors_to_sequence",
-    "batch_sample_quality_scores",
-    "build_quality_calibration",
-    "default_illumina_profile",
-    "default_pacbio_profile",
-    "default_nanopore_profile",
+    "resolve_skiver_model",
     "write_fastq",
     "write_bam",
     "write_bam_chunk",
     "build_bam_header",
-    "_build_emission_logits",
-    "_build_sticky_transitions",
     "_gc_fraction",
     "_reverse_complement",
     "_nb_params_from_mean_variance",
