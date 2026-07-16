@@ -211,8 +211,12 @@ def apply_error_model(
     if not flat:
         return read_batch
 
+    # ponytail: dir=cwd, not system TMPDIR — under Singularity /tmp is often a
+    # small node-local tmpfs; overflowing it while skiver-generate mmaps this
+    # file causes a SIGBUS crash instead of a normal I/O error. cwd is the
+    # per-task work dir (real scratch disk) when run as a Nextflow process.
     with tempfile.NamedTemporaryFile(
-        "w", suffix=".fasta", delete=False,
+        "w", suffix=".fasta", delete=False, dir=Path.cwd(),
     ) as tf:
         _write_fasta(flat, paired, tf)
         input_path = Path(tf.name)
