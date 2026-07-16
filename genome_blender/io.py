@@ -144,6 +144,7 @@ def write_bam_chunk(
     ref_name_to_idx: dict[str, int],
     fragments: list[Fragment],
     read_batch: ReadBatch,
+    minimal: bool = False,
 ) -> None:
     """Write a chunk of ground-truth alignments to an open BAM.
 
@@ -153,6 +154,9 @@ def write_bam_chunk(
         ref_name_to_idx: Reference name to index mapping.
         fragments: Source fragments.
         read_batch: Generated reads.
+        minimal: If True, omit read SEQ/QUAL (written as '*'), keeping only
+            names, positions, flags and CIGAR. The ground-truth truth tables
+            never read SEQ/QUAL, so this shrinks the BAM ~10-1000x.
     """
     def write_pe(
         i: int, frag: Fragment, ref_id: int,
@@ -179,7 +183,8 @@ def write_bam_chunk(
 
         a1 = pysam.AlignedSegment(header)
         a1.query_name = qname
-        a1.query_sequence = r1_seq
+        if not minimal:
+            a1.query_sequence = r1_seq
         a1.flag = 0
         a1.is_paired = True
         a1.is_proper_pair = True
@@ -190,16 +195,18 @@ def write_bam_chunk(
         a1.reference_start = r1_start
         a1.cigar = r1_cigar
         a1.mapping_quality = 255
-        a1.query_qualities = (
-            pysam.qualitystring_to_array(r1_qual)
-        )
+        if not minimal:
+            a1.query_qualities = (
+                pysam.qualitystring_to_array(r1_qual)
+            )
         a1.next_reference_id = ref_id
         a1.next_reference_start = r2_start
         a1.template_length = r1_tlen
 
         a2 = pysam.AlignedSegment(header)
         a2.query_name = qname
-        a2.query_sequence = r2_seq
+        if not minimal:
+            a2.query_sequence = r2_seq
         a2.flag = 0
         a2.is_paired = True
         a2.is_proper_pair = True
@@ -210,9 +217,10 @@ def write_bam_chunk(
         a2.reference_start = r2_start
         a2.cigar = r2_cigar
         a2.mapping_quality = 255
-        a2.query_qualities = (
-            pysam.qualitystring_to_array(r2_qual)
-        )
+        if not minimal:
+            a2.query_qualities = (
+                pysam.qualitystring_to_array(r2_qual)
+            )
         a2.next_reference_id = ref_id
         a2.next_reference_start = r1_start
         a2.template_length = r2_tlen
@@ -231,16 +239,18 @@ def write_bam_chunk(
         )
         a = pysam.AlignedSegment(header)
         a.query_name = read.name
-        a.query_sequence = seq
+        if not minimal:
+            a.query_sequence = seq
         a.flag = 0
         a.is_reverse = is_reverse
         a.reference_id = ref_id
         a.reference_start = ref_start
         a.cigar = cigar
         a.mapping_quality = 255
-        a.query_qualities = (
-            pysam.qualitystring_to_array(qual)
-        )
+        if not minimal:
+            a.query_qualities = (
+                pysam.qualitystring_to_array(qual)
+            )
         bam.write(a)
 
     write_alignment = (
@@ -264,6 +274,7 @@ def write_bam(
     read_batch: ReadBatch,
     genomes: dict[str, list],
     output_path: Path,
+    minimal: bool = False,
 ) -> None:
     """Write ground-truth alignments to a BAM file.
 
@@ -282,6 +293,6 @@ def write_bam(
     ) as bam:
         write_bam_chunk(
             bam, header, ref_name_to_idx,
-            fragments, read_batch,
+            fragments, read_batch, minimal=minimal,
         )
     logger.info("Wrote ground-truth BAM to %s", output_path)

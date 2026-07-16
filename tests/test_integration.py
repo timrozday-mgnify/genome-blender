@@ -385,3 +385,27 @@ class TestWriteBam:
             refs = bam.references
         assert "genome1:contigA" in refs
         assert "genome1:contigB" in refs
+
+    def test_minimal_bam_omits_seq_qual(
+        self, tmp_path, single_genome,
+    ) -> None:
+        # minimal=True drops SEQ/QUAL but keeps name, position, ref and CIGAR,
+        # so the truth-table pipeline (name + reference only) is unaffected.
+        genomes, _ = single_genome
+        frag = Fragment(
+            "genome1", "contigA", 10, 30, "+", "ACGT" * 5,
+        )
+        read = Read("r1", "ACGT" * 5, "I" * 20)
+        batch = ReadBatch(single=[read])
+        bam_path = tmp_path / "minimal.bam"
+        write_bam([frag], batch, genomes, bam_path, minimal=True)
+
+        with pysam.AlignmentFile(bam_path, "rb") as bam:
+            alns = list(bam)
+        assert len(alns) == 1
+        assert alns[0].query_sequence is None
+        assert alns[0].query_qualities is None
+        assert alns[0].query_name == "r1"
+        assert alns[0].reference_start == 10
+        assert alns[0].reference_name == "genome1:contigA"
+        assert alns[0].cigarstring is not None

@@ -217,6 +217,13 @@ def main(
         "(.fastq.gz).  Enabled by default; use "
         "--no-compress for plain-text FASTQ.",
     )] = True,
+    minimal_bam: Annotated[bool, typer.Option(
+        "--minimal-bam",
+        help="Omit read SEQ/QUAL from the ground-truth BAM "
+        "(written as '*'); keeps names, positions, flags and "
+        "CIGAR. Shrinks the BAM ~10-1000x; truth tables are "
+        "unaffected.",
+    )] = False,
 ) -> None:
     """Generate simulated WGS reads from reference genomes."""
     # Apply YAML config: values from the file fill in anything
@@ -262,6 +269,7 @@ def main(
         amplicon = p["amplicon"]
         chunk_size = p.get("chunk_size", 1_000_000)
         compress = p.get("compress", True)
+        minimal_bam = p.get("minimal_bam", False)
 
     # Validate required parameters
     if input_csv is None:
@@ -365,6 +373,7 @@ def main(
         model_cfg=model_cfg,
         seed=seed if seed is not None else 0,
         compress=compress,
+        minimal_bam=minimal_bam,
     )
 
     if disable_progress:
@@ -462,6 +471,7 @@ def _run_pipeline(
     model_cfg: SkiverModelConfig | None,
     seed: int,
     compress: bool,
+    minimal_bam: bool,
     outer_progress: Progress | None,
     inner_progress: Progress | None,
 ) -> None:
@@ -596,7 +606,7 @@ def _run_pipeline(
 
             write_bam_chunk(
                 bam, header, ref_name_to_idx,
-                fragments, read_batch,
+                fragments, read_batch, minimal=minimal_bam,
             )
 
             if (
