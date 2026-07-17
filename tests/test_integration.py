@@ -256,6 +256,32 @@ class TestGenerateReads:
             assert "/1" in r1.name
             assert "/2" in r2.name
 
+    def test_names_unique_for_identical_coordinates(
+        self, rng,
+    ) -> None:
+        # Two fragments at the same locus (as amplicon copies are) must
+        # still get distinct read names, so merged chunk BAMs have no
+        # colliding query_names.
+        dup = [
+            Fragment("g1", "c1", 0, 100, "+", "ACGT" * 25),
+            Fragment("g1", "c1", 0, 100, "+", "ACGT" * 25),
+        ]
+        batch = generate_reads(
+            dup, read_length_mean=50.0, read_length_variance=1.0,
+            paired_end=False, rng=rng,
+        )
+        names = [r.name for r in batch.single]
+        assert len(set(names)) == len(names)
+
+    def test_name_prefix_applied(self, fragments, rng) -> None:
+        batch = generate_reads(
+            fragments, read_length_mean=50.0,
+            read_length_variance=1.0, paired_end=False, rng=rng,
+            name_prefix="chunk7:",
+        )
+        for r in batch.single:
+            assert r.name.startswith("chunk7:")
+
 
 # ------------------------------------------------------------------ #
 # apply_error_model

@@ -137,6 +137,10 @@ def main(
     output_prefix: Annotated[str | None, typer.Option(
         help="Output file prefix",
     )] = None,
+    read_prefix: Annotated[str, typer.Option(
+        help="String prepended to every read name; use a per-chunk-unique "
+        "value so read IDs stay unique when chunk BAMs/FASTQs are merged",
+    )] = "",
     fragment_mean: Annotated[float, typer.Option(
         help="Mean fragment length",
     )] = 300.0,
@@ -240,6 +244,7 @@ def main(
         )
         num_reads = p.get("num_reads")
         output_prefix = p.get("output_prefix")
+        read_prefix = p.get("read_prefix", "")
         fragment_mean = p["fragment_mean"]
         fragment_variance = p["fragment_variance"]
         read_length_mean = p["read_length_mean"]
@@ -374,6 +379,7 @@ def main(
         seed=seed if seed is not None else 0,
         compress=compress,
         minimal_bam=minimal_bam,
+        read_prefix=read_prefix,
     )
 
     if disable_progress:
@@ -472,6 +478,7 @@ def _run_pipeline(
     seed: int,
     compress: bool,
     minimal_bam: bool,
+    read_prefix: str,
     outer_progress: Progress | None,
     inner_progress: Progress | None,
 ) -> None:
@@ -595,6 +602,7 @@ def _run_pipeline(
                 rng=rng,
                 read_index_offset=chunk_start,
                 long_read=long_read,
+                name_prefix=read_prefix,
             )
             read_batch = apply_error_model(
                 read_batch, model_cfg, seed=seed + chunk_idx,

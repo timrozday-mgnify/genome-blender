@@ -23,11 +23,14 @@ logger = logging.getLogger(__name__)
 
 def _generate_long_read(
     frag: Fragment, global_idx: int, read_len: int,
+    name_prefix: str = "",
 ) -> Read:
     """Generate a long read spanning the entire fragment."""
+    # global_idx makes the name unique within a run (fragments can share
+    # coordinates, e.g. amplicon copies); name_prefix disambiguates chunks.
     base_name = (
-        f"{frag.genome_id}:{frag.contig_id}:"
-        f"{frag.start}-{frag.end}:{frag.strand}"
+        f"{name_prefix}{frag.genome_id}:{frag.contig_id}:"
+        f"{frag.start}-{frag.end}:{frag.strand}:{global_idx}"
     )
     seq = frag.sequence
     qual = "I" * len(seq)  # Q40 Phred+33
@@ -40,11 +43,12 @@ def _generate_long_read(
 
 def _generate_se_read(
     frag: Fragment, global_idx: int, read_len: int,
+    name_prefix: str = "",
 ) -> Read:
     """Generate a single-end read from a fragment."""
     base_name = (
-        f"{frag.genome_id}:{frag.contig_id}:"
-        f"{frag.start}-{frag.end}:{frag.strand}"
+        f"{name_prefix}{frag.genome_id}:{frag.contig_id}:"
+        f"{frag.start}-{frag.end}:{frag.strand}:{global_idx}"
     )
     seq = frag.sequence[:read_len]
     qual = "I" * len(seq)  # Q40 Phred+33
@@ -57,11 +61,12 @@ def _generate_se_read(
 
 def _generate_pe_read(
     frag: Fragment, global_idx: int, read_len: int,
+    name_prefix: str = "",
 ) -> tuple[Read, Read]:
     """Generate a paired-end read pair from a fragment."""
     base_name = (
-        f"{frag.genome_id}:{frag.contig_id}:"
-        f"{frag.start}-{frag.end}:{frag.strand}"
+        f"{name_prefix}{frag.genome_id}:{frag.contig_id}:"
+        f"{frag.start}-{frag.end}:{frag.strand}:{global_idx}"
     )
     frag_len = len(frag.sequence)
     r1_len = min(read_len, frag_len)
@@ -92,6 +97,7 @@ def generate_reads(
     rng: torch.Generator,
     read_index_offset: int = 0,
     long_read: bool = False,
+    name_prefix: str = "",
 ) -> ReadBatch:
     """Generate reads from fragments.
 
@@ -171,7 +177,9 @@ def generate_reads(
                 )
                 read_len = min(sampled_len, frag_len)
             reads.append(
-                generate_read(frag, global_idx, read_len),
+                generate_read(
+                    frag, global_idx, read_len, name_prefix,
+                ),
             )
             step()
 
