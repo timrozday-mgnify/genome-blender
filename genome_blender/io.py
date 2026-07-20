@@ -84,6 +84,12 @@ def build_bam_header(
     for genome_id, records in genomes.items():
         for record in records:
             name = f"{genome_id}:{record.id}"
+            if name in ref_name_to_idx:
+                raise ValueError(
+                    f"Duplicate reference contig {name!r}: genome "
+                    f"{genome_id!r} contains {record.id!r} more than "
+                    "once. Deduplicate the input FASTA."
+                )
             ref_name_to_idx[name] = len(ref_names)
             ref_names.append(name)
             ref_lengths.append(len(record.seq))

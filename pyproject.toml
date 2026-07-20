@@ -22,3 +22,4 @@ dev = ["pytest"]
 
 [project.scripts]
 generate-reads = "genome_blender.cli:app"
+normalise-fasta = "genome_blender.normalise:app"
