@@ -255,6 +255,9 @@ class TestGenerateReads:
         assert batch.single is not None
         assert len(batch.single) == 2
         assert not batch.is_paired
+        # SE headers end in /1 too, so AAP's fastq_suffix_header_check passes.
+        for read in batch.single:
+            assert read.name.endswith("/1")
 
     def test_paired_end_count(self, fragments, rng) -> None:
         batch = generate_reads(

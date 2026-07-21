@@ -244,7 +244,9 @@ def write_bam_chunk(
             _bam_fields_for_read(read, frag, is_reverse)
         )
         a = pysam.AlignedSegment(header)
-        a.query_name = read.name
+        # Bare qname (drop the " read_N/1" comment+suffix): SAM qnames can't hold
+        # spaces, and this matches the PE path (write_pe) and the mate-stripped name.
+        a.query_name = read.name.split()[0]
         if not minimal:
             a.query_sequence = seq
         a.flag = 0

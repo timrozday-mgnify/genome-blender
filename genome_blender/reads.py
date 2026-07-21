@@ -52,8 +52,10 @@ def _generate_se_read(
     )
     seq = frag.sequence[:read_len]
     qual = "I" * len(seq)  # Q40 Phred+33
+    # End in /1 so AAP's fastq_suffix_header_check passes (SE files still expect
+    # the /1 strand suffix). BAM qname strips it back off (see write_se).
     return Read(
-        name=f"{base_name} read_{global_idx}",
+        name=f"{base_name} read_{global_idx}/1",
         sequence=seq,
         quality=qual,
     )
