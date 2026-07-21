@@ -169,7 +169,7 @@ def write_bam_chunk(
     ) -> None:
         assert read_batch.paired is not None
         r1, r2 = read_batch.paired[i]
-        qname = r1.name.split("/")[0]
+        qname = r1.name.split()[0]
         tlen = frag.end - frag.start
 
         r1_is_reverse = frag.strand == "-"

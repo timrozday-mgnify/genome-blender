@@ -75,18 +75,20 @@ def _generate_pe_read(
     r1_seq = frag.sequence[:r1_len]
     r2_seq = reverse_complement(frag.sequence[-r2_len:])
 
-    # /1 and /2 must be the final two chars of the header line: the AAP's
-    # fastq_suffix_header_check compares line[-2:] against the strand suffix, so
-    # a trailing " read_{idx}" comment (global_idx is already in base_name) would
-    # flag every read. ponytail: keep the suffix last, drop the redundant comment.
+    # Header must satisfy two mgnify-amplicon (AAP) checks at once, so it mirrors
+    # AAP's own test reads ("@<id> <comment>/1"):
+    #   - record.id (text before the first space) is shared by both mates, so
+    #     remove_ambiguous_reads can pair them by id;
+    #   - the line ENDS in /1 or /2, so fastq_suffix_header_check (line[-2:]) passes.
+    # Keep the /1,/2 the final two chars — a comment after it breaks the suffix check.
     return (
         Read(
-            name=f"{base_name}/1",
+            name=f"{base_name} read_{global_idx}/1",
             sequence=r1_seq,
             quality="I" * len(r1_seq),
         ),
         Read(
-            name=f"{base_name}/2",
+            name=f"{base_name} read_{global_idx}/2",
             sequence=r2_seq,
             quality="I" * len(r2_seq),
         ),

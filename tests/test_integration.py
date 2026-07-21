@@ -12,15 +12,53 @@ from genome_blender import (
     Fragment,
     Read,
     ReadBatch,
+    SkiverModelConfig,
     amplicon_fragments,
     apply_error_model,
-    default_illumina_profile,
     generate_reads,
     load_genomes,
     sample_fragments,
     write_bam,
     write_fastq,
 )
+
+import sys
+import textwrap
+
+# A stub `skiver-generate` that echoes each input read unchanged with a
+# full-length M CIGAR and uniform quality.  Lets us test genome-blender's
+# subprocess plumbing (FASTA out, FASTQ + cigar in, pairing, name preservation)
+# without depending on a real Skiver install.
+_STUB_SCRIPT = textwrap.dedent('''
+    import sys
+    args = sys.argv[1:]
+    inp = args[args.index("--input") + 1]
+    name, seq = None, []
+    recs = []
+    for line in open(inp):
+        line = line.rstrip("\\n")
+        if line.startswith(">"):
+            if name is not None:
+                recs.append((name, "".join(seq)))
+            name, seq = line[1:].split()[0], []
+        elif line:
+            seq.append(line)
+    if name is not None:
+        recs.append((name, "".join(seq)))
+    out = sys.stdout
+    for nm, s in recs:
+        cig = f"{len(s)}M" if s else ""
+        out.write(f"@{nm} cigar:{cig}\\n{s}\\n+\\n{'I' * len(s)}\\n")
+''')
+
+
+def _stub_model_cfg(tmp_path) -> SkiverModelConfig:
+    stub = tmp_path / "stub_skiver_generate.py"
+    stub.write_text(_STUB_SCRIPT)
+    return SkiverModelConfig(
+        preset="hq-illumina",
+        generate_cmd=[sys.executable, str(stub)],
+    )
 
 
 # ------------------------------------------------------------------ #
@@ -253,8 +291,12 @@ class TestGenerateReads:
             read_length_variance=1.0, paired_end=True, rng=rng,
         )
         for r1, r2 in batch.paired:
-            assert "/1" in r1.name
-            assert "/2" in r2.name
+            # Mirrors AAP's read headers: shared record.id (token before the first
+            # space) so mates pair by id, and the line ends in /1,/2 so the suffix
+            # check passes.
+            assert r1.name.split()[0] == r2.name.split()[0]
+            assert r1.name.endswith("/1")
+            assert r2.name.endswith("/2")
 
     def test_names_unique_for_identical_coordinates(
         self, rng,
@@ -288,36 +330,46 @@ class TestGenerateReads:
 # ------------------------------------------------------------------ #
 
 class TestApplyErrorModel:
-    """Tests for apply_error_model integration."""
+    """Tests for apply_error_model via the skiver-generate subprocess."""
 
-    def test_none_profile_returns_unchanged(self, rng) -> None:
+    def test_none_config_returns_unchanged(self) -> None:
         r = Read("r1", "ACGT", "IIII")
         batch = ReadBatch(single=[r])
-        result = apply_error_model(batch, None, rng)
+        result = apply_error_model(batch, None, seed=0)
+        assert result.single is not None
         assert result.single[0].sequence == "ACGT"
 
-    def test_illumina_modifies_reads(self, rng) -> None:
-        torch.manual_seed(42)
+    def test_single_end_subprocess(self, tmp_path) -> None:
         seq = "ACGTACGTAC" * 10
-        r = Read("r1", seq, "I" * len(seq))
+        r = Read("read_0", seq, "I" * len(seq))
         batch = ReadBatch(single=[r])
-        profile = default_illumina_profile()
-        result = apply_error_model(batch, profile, rng)
+        result = apply_error_model(
+            batch, _stub_model_cfg(tmp_path), seed=0,
+        )
         assert result.single is not None
         assert len(result.single) == 1
-        # CIGAR should be present
-        assert result.single[0].cigar is not None
+        out = result.single[0]
+        # Stub echoes the sequence; plumbing must preserve name and parse CIGAR.
+        assert out.name == "read_0"
+        assert out.sequence == seq
+        assert out.cigar == [(0, len(seq))]
 
-    def test_paired_end_error_model(self, rng) -> None:
-        torch.manual_seed(42)
-        seq = "ACGTACGTAC" * 5
-        r1 = Read("r1/1", seq, "I" * len(seq))
-        r2 = Read("r1/2", seq, "I" * len(seq))
+    def test_paired_end_subprocess(self, tmp_path) -> None:
+        s1, s2 = "ACGTACGTAC" * 5, "TTTTGGGGCC" * 5
+        r1 = Read("r0/1 read_0", s1, "I" * len(s1))
+        r2 = Read("r0/2 read_0", s2, "I" * len(s2))
         batch = ReadBatch(paired=[(r1, r2)])
-        profile = default_illumina_profile()
-        result = apply_error_model(batch, profile, rng)
+        result = apply_error_model(
+            batch, _stub_model_cfg(tmp_path), seed=0,
+        )
         assert result.is_paired
+        assert result.paired is not None
         assert len(result.paired) == 1
+        out1, out2 = result.paired[0]
+        # Order-based round-trip keeps mates aligned to their source reads.
+        assert out1.name == "r0/1 read_0" and out1.sequence == s1
+        assert out2.name == "r0/2 read_0" and out2.sequence == s2
+        assert out1.cigar == [(0, len(s1))]
 
 
 # ------------------------------------------------------------------ #
@@ -381,8 +433,8 @@ class TestWriteBam:
         frag = Fragment(
             "genome1", "contigA", 10, 50, "+", "ACGT" * 10,
         )
-        r1 = Read("r1/1 read_0", "ACGT" * 5, "I" * 20)
-        r2 = Read("r1/2 read_0", "ACGT" * 5, "I" * 20)
+        r1 = Read("r1 read_0/1", "ACGT" * 5, "I" * 20)
+        r2 = Read("r1 read_0/2", "ACGT" * 5, "I" * 20)
         batch = ReadBatch(paired=[(r1, r2)])
         bam_path = tmp_path / "out.bam"
         write_bam([frag], batch, genomes, bam_path)
@@ -391,6 +443,8 @@ class TestWriteBam:
             alns = list(bam)
         assert len(alns) == 2
         assert alns[0].is_read1
+        # Both mates carry the same bare query_name (mate flag stripped).
+        assert alns[0].query_name == alns[1].query_name == "r1"
         assert alns[1].is_read2
         assert alns[0].is_paired
         assert alns[1].is_paired
